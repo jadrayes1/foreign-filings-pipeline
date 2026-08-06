@@ -189,15 +189,29 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
   });
 }
 
+// A margin or growth rate beyond +/-1000% is essentially always a near-zero-
+// denominator artifact (verified live: Denison Mines/DNN's FY'23 profit
+// margin computes to +4870%, Cardiol/CRDL's FY'21 to -40,170% — both tiny/
+// early-stage companies where a normal-sized net loss or FCF figure divided
+// by a near-zero revenue produces a mathematically "correct" but meaningless
+// number), not a real, useful signal — same reasoning as the sanity guards
+// already applied to the DCF fair-value estimate elsewhere in this project.
+// Dropped (null) rather than published, same as any other uncomputable point.
+const MAX_ABS_RATIO = 10; // 1000%
+function clampImplausible(value) {
+  return value != null && Math.abs(value) <= MAX_ABS_RATIO ? value : null;
+}
+
 function buildRatioTrend(numeratorQuarters, denominatorQuarters, combine) {
   const denomByEnd = new Map(denominatorQuarters.map((q) => [q.end, q]));
   const standalone = numeratorQuarters.filter((q) => denomByEnd.has(q.end)).map((q) => ({ ...q, other: denomByEnd.get(q.end).value }));
 
   return buildTrailingWindows(standalone, 4)
     .map(({ quarters, anchor, partial }) => {
-      const value = combine(quarters, anchor);
+      const value = clampImplausible(combine(quarters, anchor));
       return { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length };
     })
+    .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
 }
 
@@ -220,10 +234,51 @@ function buildRevenueGrowthTrend(revenueQuarterly) {
       }
     }
     const withinTolerance = bestDiff <= 30 * 24 * 60 * 60 * 1000;
-    const value = withinTolerance && best && best.value ? (curr.value - best.value) / best.value : null;
+    const value = clampImplausible(withinTolerance && best && best.value ? (curr.value - best.value) / best.value : null);
     if (value != null) points.push({ label: quarterLabelFromDate(curr.end), value, partial: false, quartersUsed: 1 });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+// ---------------------------------------------------------------------------
+// ANNUAL-cadence fallback — some filers (verified live: IAMGOLD/IAG,
+// Nordicus/CNEY, Denison Mines/DNN, Cardiol/CRDL) tag few or zero
+// standalone-QUARTER facts in their SEC XBRL at all, but do have real
+// ANNUAL facts. Rather than show nothing for these, fall back to a
+// once-a-year trend — clearly labeled "FY 'YY" (not "Q# 'YY") so it's never
+// confused with a quarterly figure downstream (the app's own gap-detection/
+// label-parsing code only recognizes the "Q# 'YY" shape, so an annual label
+// safely no-ops through that logic rather than being misread as a weird
+// quarterly gap). No TTM windowing needed here — each annual fact is
+// already a complete, self-contained full-year figure.
+// ---------------------------------------------------------------------------
+
+function annualLabelFromDate(dateStr) {
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return null;
+  return `FY '${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
+function buildAnnualRevenueGrowthTrend(revenueAnnual) {
+  const points = [];
+  for (let i = 1; i < revenueAnnual.length; i++) {
+    const curr = revenueAnnual[i];
+    const prev = revenueAnnual[i - 1];
+    const gapDays = daysBetween(prev.end, curr.end);
+    if (gapDays < 350 || gapDays > 380) continue; // not genuinely consecutive fiscal years
+    const value = clampImplausible(prev.value ? (curr.value - prev.value) / prev.value : null);
+    if (value != null) points.push({ label: annualLabelFromDate(curr.end), value, partial: false });
+  }
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildAnnualRatioTrend(numeratorAnnual, denominatorAnnual, combine) {
+  const denomByEnd = new Map(denominatorAnnual.map((q) => [q.end, q.value]));
+  return numeratorAnnual
+    .filter((q) => denomByEnd.has(q.end))
+    .map((q) => ({ label: annualLabelFromDate(q.end), value: clampImplausible(combine(q.value, denomByEnd.get(q.end))), partial: false }))
+    .filter((p) => p.value != null)
+    .slice(-QUARTERS_OF_HISTORY);
 }
 
 // A fresh attempt can come back empty or narrower on a day where SEC has a
@@ -265,9 +320,14 @@ async function processTicker(symbol, cik) {
   const netIncome = dedupeAndClassify(netIncomeRaw);
 
   const result = {};
+
   if (revenue.quarterly.length) {
     result.revenueGrowth = buildRevenueGrowthTrend(revenue.quarterly);
   }
+  if (!result.revenueGrowth?.length && revenue.annual.length) {
+    result.revenueGrowth = buildAnnualRevenueGrowthTrend(revenue.annual);
+  }
+
   if (netIncome.quarterly.length && revenue.quarterly.length) {
     result.profitMargin = buildRatioTrend(netIncome.quarterly, revenue.quarterly, (quarters) => {
       const income = quarters.reduce((sum, q) => sum + q.value, 0);
@@ -275,6 +335,10 @@ async function processTicker(symbol, cik) {
       return rev ? income / rev : null;
     });
   }
+  if (!result.profitMargin?.length && netIncome.annual.length && revenue.annual.length) {
+    result.profitMargin = buildAnnualRatioTrend(netIncome.annual, revenue.annual, (income, rev) => (rev ? income / rev : null));
+  }
+
   if (ocf.quarterly.length && capex.quarterly.length && revenue.quarterly.length) {
     const capexByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
     const ocfWithCapex = ocf.quarterly.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
@@ -284,7 +348,15 @@ async function processTicker(symbol, cik) {
       return rev ? fcf / rev : null;
     });
   }
+  if (!result.fcfMargin?.length && ocf.annual.length && capex.annual.length && revenue.annual.length) {
+    const capexByEnd = new Map(capex.annual.map((q) => [q.end, q.value]));
+    const ocfWithCapexAnnual = ocf.annual.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
+    result.fcfMargin = buildAnnualRatioTrend(ocfWithCapexAnnual, revenue.annual, (fcf, rev) => (rev ? fcf / rev : null));
+  }
 
+  for (const key of Object.keys(result)) {
+    if (!result[key]?.length) delete result[key];
+  }
   return Object.keys(result).length ? result : null;
 }
 
@@ -339,7 +411,19 @@ async function main() {
   console.log(`Done. Processed ${processed} tickers, ${resolved} resolved to at least one trend. Cache now covers ${Object.keys(trends).length} tickers total.`);
 }
 
-module.exports = { extractFactSeries, dedupeAndClassify, buildTrailingWindows, buildRatioTrend, buildRevenueGrowthTrend, isAdjacent, quarterLabelFromDate };
+module.exports = {
+  extractFactSeries,
+  dedupeAndClassify,
+  buildTrailingWindows,
+  buildRatioTrend,
+  buildRevenueGrowthTrend,
+  buildAnnualRevenueGrowthTrend,
+  buildAnnualRatioTrend,
+  isAdjacent,
+  quarterLabelFromDate,
+  annualLabelFromDate,
+  processTicker,
+};
 
 if (require.main === module) {
   main().catch((err) => {
