@@ -319,16 +319,26 @@ async function processTicker(symbol, cik) {
   const capex = dedupeAndClassify(capexRaw);
   const netIncome = dedupeAndClassify(netIncomeRaw);
 
+  // Quarterly is preferred (finer-grained), but only when it's actually
+  // MORE CURRENT than the annual alternative — verified live this matters:
+  // IAMGOLD/IAG has a couple of standalone-quarter facts, but they're from
+  // 2016-2017 and nothing since, while its annual facts run all the way to
+  // FY'25. A non-empty-but-stale quarterly series would otherwise always
+  // win by the old "quarterly if it exists at all" rule, permanently
+  // hiding much better annual data. Recency is judged by each source's own
+  // latest REVENUE end-date (the input revenue and ocf/capex/netIncome
+  // series are usually similarly current for a given filer, so this is a
+  // reasonable single proxy rather than comparing every input separately).
+  const latestEnd = (arr) => (arr.length ? new Date(arr[arr.length - 1].end).getTime() : -Infinity);
+  const preferQuarterly = latestEnd(revenue.quarterly) >= latestEnd(revenue.annual);
+
   const result = {};
 
-  if (revenue.quarterly.length) {
-    result.revenueGrowth = buildRevenueGrowthTrend(revenue.quarterly);
-  }
-  if (!result.revenueGrowth?.length && revenue.annual.length) {
-    result.revenueGrowth = buildAnnualRevenueGrowthTrend(revenue.annual);
-  }
+  if (preferQuarterly && revenue.quarterly.length) result.revenueGrowth = buildRevenueGrowthTrend(revenue.quarterly);
+  if (!result.revenueGrowth?.length && revenue.annual.length) result.revenueGrowth = buildAnnualRevenueGrowthTrend(revenue.annual);
+  if (!result.revenueGrowth?.length && revenue.quarterly.length) result.revenueGrowth = buildRevenueGrowthTrend(revenue.quarterly);
 
-  if (netIncome.quarterly.length && revenue.quarterly.length) {
+  if (preferQuarterly && netIncome.quarterly.length && revenue.quarterly.length) {
     result.profitMargin = buildRatioTrend(netIncome.quarterly, revenue.quarterly, (quarters) => {
       const income = quarters.reduce((sum, q) => sum + q.value, 0);
       const rev = quarters.reduce((sum, q) => sum + q.other, 0);
@@ -338,8 +348,15 @@ async function processTicker(symbol, cik) {
   if (!result.profitMargin?.length && netIncome.annual.length && revenue.annual.length) {
     result.profitMargin = buildAnnualRatioTrend(netIncome.annual, revenue.annual, (income, rev) => (rev ? income / rev : null));
   }
+  if (!result.profitMargin?.length && netIncome.quarterly.length && revenue.quarterly.length) {
+    result.profitMargin = buildRatioTrend(netIncome.quarterly, revenue.quarterly, (quarters) => {
+      const income = quarters.reduce((sum, q) => sum + q.value, 0);
+      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
+      return rev ? income / rev : null;
+    });
+  }
 
-  if (ocf.quarterly.length && capex.quarterly.length && revenue.quarterly.length) {
+  if (preferQuarterly && ocf.quarterly.length && capex.quarterly.length && revenue.quarterly.length) {
     const capexByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
     const ocfWithCapex = ocf.quarterly.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
     result.fcfMargin = buildRatioTrend(ocfWithCapex, revenue.quarterly, (quarters) => {
@@ -352,6 +369,15 @@ async function processTicker(symbol, cik) {
     const capexByEnd = new Map(capex.annual.map((q) => [q.end, q.value]));
     const ocfWithCapexAnnual = ocf.annual.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
     result.fcfMargin = buildAnnualRatioTrend(ocfWithCapexAnnual, revenue.annual, (fcf, rev) => (rev ? fcf / rev : null));
+  }
+  if (!result.fcfMargin?.length && ocf.quarterly.length && capex.quarterly.length && revenue.quarterly.length) {
+    const capexByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
+    const ocfWithCapex = ocf.quarterly.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
+    result.fcfMargin = buildRatioTrend(ocfWithCapex, revenue.quarterly, (quarters) => {
+      const fcf = quarters.reduce((sum, q) => sum + q.value, 0);
+      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
+      return rev ? fcf / rev : null;
+    });
   }
 
   for (const key of Object.keys(result)) {
