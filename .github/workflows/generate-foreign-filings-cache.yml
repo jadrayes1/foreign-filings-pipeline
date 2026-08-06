@@ -1,0 +1,114 @@
+# Pre-fetches revenue-growth/profit-margin/FCF-margin trends for foreign-
+# filer tickers (Canadian banks/miners, UK pharma, etc.) from SEC EDGAR's
+# free companyfacts API, published to the SAME public Gist stock-metrics-
+# pipeline already publishes to (see scripts/generateForeignFilingsCache.js
+# for the full rationale and design). This is a separate repo/pipeline from
+# stock-metrics-pipeline because it talks to a completely different data
+# source (SEC EDGAR, not Finnhub/Twelve Data) for a narrow, distinct
+# purpose — foreign private issuers that Finnhub's financials-reported
+# endpoint has no data for at all.
+#
+# Scheduled at a time that doesn't collide with stock-metrics-pipeline's
+# three jobs (02:00 UTC main pipeline, 09:00 P/FCF trend cache, 16:00 news
+# cache) — this job talks only to SEC, not Finnhub/Twelve Data, so there's
+# no shared rate-limit budget to protect; the gap is purely to avoid
+# concurrent writes to the same Gist.
+#
+# One-time setup required (this workflow can't do these for you):
+#   1. Add a repository secret named GIST_ID — the SAME Gist ID
+#      stock-metrics-pipeline already publishes marketMetrics.json/
+#      newsCache.json/pfcfTrendCache.json to.
+#   2. Add a repository secret named GIST_TOKEN — the SAME kind of
+#      Personal Access Token stock-metrics-pipeline uses (CLASSIC type,
+#      scoped to ONLY "gist").
+# No Finnhub or Twelve Data key needed — this pipeline only calls SEC's
+# free, keyless EDGAR API.
+
+name: Generate foreign filings cache
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate foreign filings cache
+        run: node scripts/generateForeignFilingsCache.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename foreignFilingsCache.json foreignFilingsCache.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add foreignFilingsCache.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Foreign filings pipeline failed',
+                body: `The daily generation run failed.\n\nRun: ${runUrl}\n\nCheck the GIST_TOKEN and GIST_ID secrets, and SEC EDGAR's API status.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

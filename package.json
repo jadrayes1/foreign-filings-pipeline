@@ -1,0 +1,12 @@
+{
+  "name": "foreign-filings-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reconstructs revenue-growth/profit-margin/FCF-margin trends for foreign-filer tickers from SEC EDGAR's free companyfacts API, for stock-analyzer",
+  "scripts": {
+    "generate": "node scripts/generateForeignFilingsCache.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
