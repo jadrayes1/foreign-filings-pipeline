@@ -9,10 +9,13 @@
 # endpoint has no data for at all.
 #
 # Scheduled at a time that doesn't collide with stock-metrics-pipeline's
-# three jobs (02:00 UTC main pipeline, 09:00 P/FCF trend cache, 16:00 news
-# cache) — this job talks only to SEC, not Finnhub/Twelve Data, so there's
-# no shared rate-limit budget to protect; the gap is purely to avoid
-# concurrent writes to the same Gist.
+# three jobs (00:00 UTC main pipeline — moved earlier and grown to
+# ~6.5-7.5hrs after adding full Quarterly/Yearly/TTM trend caching there,
+# worst-case finish ~11:00 UTC with GitHub's observed scheduling delay;
+# 12:00 UTC P/FCF trend cache — also pushed later for the same reason;
+# 16:00 UTC news cache) — this job talks only to SEC, not Finnhub/Twelve
+# Data, so there's no shared rate-limit budget to protect; the gap is
+# purely to avoid concurrent writes to the same Gist.
 #
 # One-time setup required (this workflow can't do these for you):
 #   1. Add a repository secret named GIST_ID — the SAME Gist ID
@@ -28,7 +31,7 @@ name: Generate foreign filings cache
 
 on:
   schedule:
-    - cron: '0 12 * * *'
+    - cron: '0 14 * * *'
   workflow_dispatch: {}
 
 permissions:

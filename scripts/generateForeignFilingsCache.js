@@ -215,6 +215,20 @@ function buildRatioTrend(numeratorQuarters, denominatorQuarters, combine) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
+// Single STANDALONE quarter (no trailing window) — the Quarterly-cadence
+// counterpart to buildRatioTrend's TTM windowing above. Mirrors the main
+// app's buildBankProfitMarginSeries/buildFcfMarginQuarterlyFromFilings
+// (src/utils/metrics.js): each quarter's own numerator divided by that same
+// quarter's own denominator, joined by end-date.
+function buildQuarterlyRatioTrend(numeratorQuarters, denominatorQuarters, combine) {
+  const denomByEnd = new Map(denominatorQuarters.map((q) => [q.end, q.value]));
+  return numeratorQuarters
+    .filter((q) => denomByEnd.has(q.end))
+    .map((q) => ({ label: quarterLabelFromDate(q.end), value: clampImplausible(combine(q.value, denomByEnd.get(q.end))) }))
+    .filter((p) => p.value != null)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
 function buildRevenueGrowthTrend(revenueQuarterly) {
   // YoY vs. the standalone quarter ~1 year prior (closest match within a
   // ~30-day tolerance around the 1-year mark, since fiscal quarter-ends can
@@ -240,17 +254,48 @@ function buildRevenueGrowthTrend(revenueQuarterly) {
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 
+// TTM-cadence revenue growth — YoY on a trailing-4-quarter-SUMMED revenue
+// figure rather than a single standalone quarter, mirroring the main app's
+// buildRevenueGrowthTTMFromFilings (src/utils/metrics.js). Only non-partial
+// (a full 4 consecutive quarters) windows are used — a partial TTM sum isn't
+// meaningfully comparable YoY against another partial sum.
+function buildRevenueGrowthTTMTrend(revenueQuarterly) {
+  const windows = buildTrailingWindows(revenueQuarterly, 4).filter((w) => !w.partial);
+  const ttmPoints = windows.map((w) => ({ end: w.anchor.end, value: w.quarters.reduce((sum, q) => sum + q.value, 0) }));
+
+  const points = [];
+  for (const curr of ttmPoints) {
+    const targetPriorEnd = new Date(curr.end);
+    targetPriorEnd.setUTCFullYear(targetPriorEnd.getUTCFullYear() - 1);
+    let best = null;
+    let bestDiff = Infinity;
+    for (const cand of ttmPoints) {
+      const diff = Math.abs(new Date(cand.end) - targetPriorEnd);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = cand;
+      }
+    }
+    const withinTolerance = bestDiff <= 30 * 24 * 60 * 60 * 1000;
+    const value = clampImplausible(withinTolerance && best && best.value ? (curr.value - best.value) / best.value : null);
+    if (value != null) points.push({ label: quarterLabelFromDate(curr.end), value });
+  }
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
 // ---------------------------------------------------------------------------
-// ANNUAL-cadence fallback — some filers (verified live: IAMGOLD/IAG,
-// Nordicus/CNEY, Denison Mines/DNN, Cardiol/CRDL) tag few or zero
-// standalone-QUARTER facts in their SEC XBRL at all, but do have real
-// ANNUAL facts. Rather than show nothing for these, fall back to a
-// once-a-year trend — clearly labeled "FY 'YY" (not "Q# 'YY") so it's never
-// confused with a quarterly figure downstream (the app's own gap-detection/
-// label-parsing code only recognizes the "Q# 'YY" shape, so an annual label
-// safely no-ops through that logic rather than being misread as a weird
-// quarterly gap). No TTM windowing needed here — each annual fact is
-// already a complete, self-contained full-year figure.
+// ANNUAL-cadence builder — powers the Yearly tab directly, and also serves
+// as the effective fallback for filers that tag few or zero standalone-
+// QUARTER facts in their SEC XBRL at all (verified live: IAMGOLD/IAG,
+// Nordicus/CNEY, Denison Mines/DNN, Cardiol/CRDL) but do have real ANNUAL
+// facts — those tickers simply end up with only a `yearly` entry and no
+// `quarterly`/`ttm` ones, same principle as any other cadence with
+// insufficient underlying data. Labeled "FY 'YY" (not "Q# 'YY") so it's
+// never confused with a quarterly figure downstream (the app's own gap-
+// detection/label-parsing code only recognizes the "Q# 'YY" shape, so an
+// annual label safely no-ops through that logic rather than being misread
+// as a weird quarterly gap). No TTM windowing needed here — each annual
+// fact is already a complete, self-contained full-year figure.
 // ---------------------------------------------------------------------------
 
 function annualLabelFromDate(dateStr) {
@@ -292,6 +337,52 @@ function pickTrendToPublish(existingPoints, freshPoints) {
   return hasNewQuarter ? freshPoints : existingPoints;
 }
 
+// Migrates a pre-cadence-caching entry (flat { revenueGrowth, profitMargin,
+// fcfMargin } arrays, published before Quarterly/Yearly/TTM were tracked
+// separately) into the new { quarterly, yearly, ttm } shape, so the
+// transitional run doesn't look like data vanished. revenueGrowth's old
+// computation (buildRevenueGrowthTrend) was always a single standalone
+// quarter — maps to `quarterly`. profitMargin/fcfMargin's old computation
+// (buildRatioTrend) was always a trailing-4-quarter window — maps to `ttm`.
+// Mirrors the equivalent migration in the main pipeline's
+// generateSectorMetrics.js. A no-op on an entry that's already the new
+// shape (detected by the presence of any of the three cadence keys, which
+// never appear on a legacy entry).
+function migrateLegacyEntry(entry) {
+  if (!entry) return {};
+  if (entry.quarterly || entry.yearly || entry.ttm) return entry;
+  const migrated = {};
+  if (Array.isArray(entry.revenueGrowth) && entry.revenueGrowth.length) {
+    migrated.quarterly = { revenueGrowth: entry.revenueGrowth };
+  }
+  if (Array.isArray(entry.profitMargin) && entry.profitMargin.length) {
+    migrated.ttm = { ...(migrated.ttm || {}), profitMargin: entry.profitMargin };
+  }
+  if (Array.isArray(entry.fcfMargin) && entry.fcfMargin.length) {
+    migrated.ttm = { ...(migrated.ttm || {}), fcfMargin: entry.fcfMargin };
+  }
+  return migrated;
+}
+
+// Per-(cadence, metric) merge-protection — a fresh run that comes back
+// empty or narrower for one specific cadence/metric combo (a transient SEC
+// hiccup for this filer) never overwrites a previously-published better
+// result for that same combo, mirroring pickCadenceTrendsToPublish in the
+// main pipeline's generatePfcfTrendCache.js.
+function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
+  const existing = migrateLegacyEntry(existingEntry);
+  const out = {};
+  for (const cadence of ['quarterly', 'yearly', 'ttm']) {
+    const merged = {};
+    for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin']) {
+      const picked = pickTrendToPublish(existing[cadence]?.[key], freshEntry?.[cadence]?.[key]);
+      if (picked.length) merged[key] = picked;
+    }
+    if (Object.keys(merged).length) out[cadence] = merged;
+  }
+  return out;
+}
+
 async function fetchPreviouslyPublished() {
   try {
     const data = await fetchJson(GIST_FOREIGN_FILINGS_URL);
@@ -305,7 +396,16 @@ function isFinancialIndustry(industry) {
   return !!industry && ['Banking', 'Insurance', 'Financial Services'].includes(industry);
 }
 
-async function processTicker(symbol, cik) {
+// Returns { quarterly, yearly, ttm }, each an object keyed by
+// revenueGrowth/profitMargin/fcfMargin (only the ones with enough
+// underlying data to compute) — each cadence stands on its own, computed
+// independently from the same already-fetched facts, rather than the old
+// single "best" series picked by a preferQuarterly flag. A filer like
+// IAMGOLD/IAG (stale 2016-17 quarterly facts, current annual facts all the
+// way to FY'25) simply ends up with a real `yearly` entry and empty
+// `quarterly`/`ttm` ones — no special-casing needed, since a builder with
+// insufficient input data naturally returns no points.
+async function processTicker(symbol, cik, isBank) {
   const companyFacts = await fetchJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
   if (!companyFacts) return null;
 
@@ -319,70 +419,64 @@ async function processTicker(symbol, cik) {
   const capex = dedupeAndClassify(capexRaw);
   const netIncome = dedupeAndClassify(netIncomeRaw);
 
-  // Quarterly is preferred (finer-grained), but only when it's actually
-  // MORE CURRENT than the annual alternative — verified live this matters:
-  // IAMGOLD/IAG has a couple of standalone-quarter facts, but they're from
-  // 2016-2017 and nothing since, while its annual facts run all the way to
-  // FY'25. A non-empty-but-stale quarterly series would otherwise always
-  // win by the old "quarterly if it exists at all" rule, permanently
-  // hiding much better annual data. Recency is judged by each source's own
-  // latest REVENUE end-date (the input revenue and ocf/capex/netIncome
-  // series are usually similarly current for a given filer, so this is a
-  // reasonable single proxy rather than comparing every input separately).
-  const latestEnd = (arr) => (arr.length ? new Date(arr[arr.length - 1].end).getTime() : -Infinity);
-  const preferQuarterly = latestEnd(revenue.quarterly) >= latestEnd(revenue.annual);
+  const capexQByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
+  const ocfWithCapexQuarterly = ocf.quarterly.filter((q) => capexQByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexQByEnd.get(q.end) }));
+  const capexAByEnd = new Map(capex.annual.map((q) => [q.end, q.value]));
+  const ocfWithCapexAnnual = ocf.annual.filter((q) => capexAByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexAByEnd.get(q.end) }));
+
+  const quarterly = {};
+  const yearly = {};
+  const ttm = {};
+
+  if (revenue.quarterly.length) {
+    const rgQ = buildRevenueGrowthTrend(revenue.quarterly);
+    if (rgQ.length) quarterly.revenueGrowth = rgQ;
+    const rgTtm = buildRevenueGrowthTTMTrend(revenue.quarterly);
+    if (rgTtm.length) ttm.revenueGrowth = rgTtm;
+  }
+  if (revenue.annual.length) {
+    const rgY = buildAnnualRevenueGrowthTrend(revenue.annual);
+    if (rgY.length) yearly.revenueGrowth = rgY;
+  }
+
+  if (netIncome.quarterly.length && revenue.quarterly.length) {
+    const pmQ = buildQuarterlyRatioTrend(netIncome.quarterly, revenue.quarterly, (income, rev) => (rev ? income / rev : null));
+    if (pmQ.length) quarterly.profitMargin = pmQ;
+    const pmTtm = buildRatioTrend(netIncome.quarterly, revenue.quarterly, (quarters) => {
+      const income = quarters.reduce((sum, q) => sum + q.value, 0);
+      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
+      return rev ? income / rev : null;
+    });
+    if (pmTtm.length) ttm.profitMargin = pmTtm;
+  }
+  if (netIncome.annual.length && revenue.annual.length) {
+    const pmY = buildAnnualRatioTrend(netIncome.annual, revenue.annual, (income, rev) => (rev ? income / rev : null));
+    if (pmY.length) yearly.profitMargin = pmY;
+  }
+
+  // Not a meaningful concept for banks (see isFinancialIndustry) — skipped
+  // for all 3 cadences there, same as the main pipeline's fcfMargin handling.
+  if (!isBank) {
+    if (ocfWithCapexQuarterly.length && revenue.quarterly.length) {
+      const fmQ = buildQuarterlyRatioTrend(ocfWithCapexQuarterly, revenue.quarterly, (fcf, rev) => (rev ? fcf / rev : null));
+      if (fmQ.length) quarterly.fcfMargin = fmQ;
+      const fmTtm = buildRatioTrend(ocfWithCapexQuarterly, revenue.quarterly, (quarters) => {
+        const fcf = quarters.reduce((sum, q) => sum + q.value, 0);
+        const rev = quarters.reduce((sum, q) => sum + q.other, 0);
+        return rev ? fcf / rev : null;
+      });
+      if (fmTtm.length) ttm.fcfMargin = fmTtm;
+    }
+    if (ocfWithCapexAnnual.length && revenue.annual.length) {
+      const fmY = buildAnnualRatioTrend(ocfWithCapexAnnual, revenue.annual, (fcf, rev) => (rev ? fcf / rev : null));
+      if (fmY.length) yearly.fcfMargin = fmY;
+    }
+  }
 
   const result = {};
-
-  if (preferQuarterly && revenue.quarterly.length) result.revenueGrowth = buildRevenueGrowthTrend(revenue.quarterly);
-  if (!result.revenueGrowth?.length && revenue.annual.length) result.revenueGrowth = buildAnnualRevenueGrowthTrend(revenue.annual);
-  if (!result.revenueGrowth?.length && revenue.quarterly.length) result.revenueGrowth = buildRevenueGrowthTrend(revenue.quarterly);
-
-  if (preferQuarterly && netIncome.quarterly.length && revenue.quarterly.length) {
-    result.profitMargin = buildRatioTrend(netIncome.quarterly, revenue.quarterly, (quarters) => {
-      const income = quarters.reduce((sum, q) => sum + q.value, 0);
-      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
-      return rev ? income / rev : null;
-    });
-  }
-  if (!result.profitMargin?.length && netIncome.annual.length && revenue.annual.length) {
-    result.profitMargin = buildAnnualRatioTrend(netIncome.annual, revenue.annual, (income, rev) => (rev ? income / rev : null));
-  }
-  if (!result.profitMargin?.length && netIncome.quarterly.length && revenue.quarterly.length) {
-    result.profitMargin = buildRatioTrend(netIncome.quarterly, revenue.quarterly, (quarters) => {
-      const income = quarters.reduce((sum, q) => sum + q.value, 0);
-      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
-      return rev ? income / rev : null;
-    });
-  }
-
-  if (preferQuarterly && ocf.quarterly.length && capex.quarterly.length && revenue.quarterly.length) {
-    const capexByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
-    const ocfWithCapex = ocf.quarterly.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
-    result.fcfMargin = buildRatioTrend(ocfWithCapex, revenue.quarterly, (quarters) => {
-      const fcf = quarters.reduce((sum, q) => sum + q.value, 0);
-      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
-      return rev ? fcf / rev : null;
-    });
-  }
-  if (!result.fcfMargin?.length && ocf.annual.length && capex.annual.length && revenue.annual.length) {
-    const capexByEnd = new Map(capex.annual.map((q) => [q.end, q.value]));
-    const ocfWithCapexAnnual = ocf.annual.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
-    result.fcfMargin = buildAnnualRatioTrend(ocfWithCapexAnnual, revenue.annual, (fcf, rev) => (rev ? fcf / rev : null));
-  }
-  if (!result.fcfMargin?.length && ocf.quarterly.length && capex.quarterly.length && revenue.quarterly.length) {
-    const capexByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
-    const ocfWithCapex = ocf.quarterly.filter((q) => capexByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexByEnd.get(q.end) }));
-    result.fcfMargin = buildRatioTrend(ocfWithCapex, revenue.quarterly, (quarters) => {
-      const fcf = quarters.reduce((sum, q) => sum + q.value, 0);
-      const rev = quarters.reduce((sum, q) => sum + q.other, 0);
-      return rev ? fcf / rev : null;
-    });
-  }
-
-  for (const key of Object.keys(result)) {
-    if (!result[key]?.length) delete result[key];
-  }
+  if (Object.keys(quarterly).length) result.quarterly = quarterly;
+  if (Object.keys(yearly).length) result.yearly = yearly;
+  if (Object.keys(ttm).length) result.ttm = ttm;
   return Object.keys(result).length ? result : null;
 }
 
@@ -411,22 +505,16 @@ async function main() {
   for (const { symbol, cik, industry } of withCik) {
     let fresh = null;
     try {
-      fresh = await processTicker(symbol, cik);
+      fresh = await processTicker(symbol, cik, isFinancialIndustry(industry));
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
     }
     await sleep(REQUEST_SPACING_MS);
 
-    if (fresh) {
-      const merged = { ...(trends[symbol] || {}) };
-      for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin']) {
-        if (key === 'fcfMargin' && isFinancialIndustry(industry)) continue; // not a meaningful concept for banks
-        if (fresh[key]) merged[key] = pickTrendToPublish(merged[key], fresh[key]);
-      }
-      if (Object.keys(merged).length) {
-        trends[symbol] = merged;
-        resolved++;
-      }
+    const merged = pickCadenceTrendsToPublish(trends[symbol], fresh || {});
+    if (Object.keys(merged).length) {
+      trends[symbol] = merged;
+      resolved++;
     }
 
     processed++;
@@ -442,9 +530,13 @@ module.exports = {
   dedupeAndClassify,
   buildTrailingWindows,
   buildRatioTrend,
+  buildQuarterlyRatioTrend,
   buildRevenueGrowthTrend,
+  buildRevenueGrowthTTMTrend,
   buildAnnualRevenueGrowthTrend,
   buildAnnualRatioTrend,
+  migrateLegacyEntry,
+  pickCadenceTrendsToPublish,
   isAdjacent,
   quarterLabelFromDate,
   annualLabelFromDate,
