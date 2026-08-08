@@ -542,6 +542,23 @@ async function processTicker(symbol, cik, isBank) {
   const companyFacts = await fetchJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
   if (!companyFacts) return null;
 
+  // Only genuine IFRS filers — a domestic US-GAAP filer's SEC companyfacts
+  // ALSO has real data (every US public company files US-GAAP XBRL with
+  // SEC too, foreign or not), so without this check extractFactSeries's
+  // us-gaap fallback would happily reconstruct trends for literally every
+  // SEC-registered company, duplicating what the main stock-metrics-
+  // pipeline repo already does via Finnhub — this pipeline exists
+  // specifically for the foreign-filer gap Finnhub's own financials-
+  // reported endpoint has, not as a general SEC-based alternative to it.
+  // Checked here (before any concept extraction) rather than via a
+  // candidate-list prefilter in main() — see that function's own comment
+  // for why card-value nullness turned out to be the wrong signal
+  // (verified live: Scorpio Tankers/STNG is a genuine IFRS filer whose
+  // Finnhub NATIVE data happens to be fully populated, so it was never
+  // flagged as a "gap" ticker despite having zero Quarterly/Yearly
+  // reconstruction available from either pipeline).
+  if (!companyFacts.facts?.['ifrs-full'] || !Object.keys(companyFacts.facts['ifrs-full']).length) return null;
+
   const revenueRaw = extractFactSeries(companyFacts, REVENUE_CONCEPTS);
   const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
   const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
@@ -644,14 +661,23 @@ async function main() {
     fetchPreviouslyPublished(),
   ]);
 
-  const candidates = Object.entries(metricsDataset.metrics || {})
-    .filter(([, data]) => data.revenueGrowth == null || data.profitMargin == null)
-    .map(([symbol, data]) => ({ symbol, industry: data.industry }));
+  // The FULL covered universe, not just tickers with a null revenueGrowth/
+  // profitMargin card value — that used to be the candidate filter, but
+  // it's the wrong signal: a genuine IFRS filer whose Finnhub NATIVE data
+  // happens to be populated (verified live: Scorpio Tankers/STNG) would
+  // never get flagged as a "gap," permanently missing out on Quarterly/
+  // Yearly reconstruction even though it needs exactly the same SEC-based
+  // approach as BMO/IAG. processTicker's own ifrs-full check (see its
+  // comment) is what actually filters out the ~5,000 domestic tickers that
+  // don't belong here — cheap since SEC's API is free/unlimited, and it's
+  // the authoritative signal instead of a heuristic proxy.
+  const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol, data]) => ({ symbol, industry: data.industry }));
 
   const withCik = candidates.map((c) => ({ ...c, cik: tickerToCik.get(c.symbol) })).filter((c) => c.cik);
   console.log(
-    `${candidates.length} tickers missing revenueGrowth or profitMargin; ${withCik.length} of those have a matching SEC CIK ` +
-      `(the rest are either genuinely too new, or not SEC-registered at all).`
+    `${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK ` +
+      `(the rest are either genuinely too new, or not SEC-registered at all). Each is checked for real IFRS data ` +
+      `before any concept extraction — most will resolve quickly to "not a foreign filer, skip."`
   );
 
   const trends = { ...previouslyPublished };

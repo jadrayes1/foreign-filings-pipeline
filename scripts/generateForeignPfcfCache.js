@@ -289,17 +289,23 @@ async function main() {
 
   const cache = existingCache?.trends || {};
 
-  // Same gap definition as stock-metrics-pipeline's generatePfcfTrendCache.js
-  // (data.pfcfRatio == null) — this pipeline exists specifically to fill
-  // that gap for foreign filers, the same way generateForeignFilingsCache.js
-  // fills the equivalent revenueGrowth/profitMargin/fcfMargin/roic gap.
-  const candidates = Object.entries(metricsDataset.metrics || {})
-    .filter(([, data]) => data.pfcfRatio == null)
-    .map(([symbol]) => symbol);
+  // The FULL covered universe, not just tickers with a null pfcfRatio card
+  // value — that's the wrong signal. A genuine IFRS filer's Finnhub NATIVE
+  // pfcfTTM series can be fully populated (verified live: Scorpio Tankers/
+  // STNG, Bank of Montreal/BMO both have real native pfcfRatio despite
+  // being IFRS filers with zero Quarterly/Yearly reconstruction available
+  // from anywhere) — a null card value only catches the subset with NO
+  // native coverage at all, missing every filer whose current-value ratio
+  // happens to be fine while its cadence-tab history isn't. The ifrs-full
+  // check below (before any Twelve Data spend) is what actually filters
+  // out the ~5,000 domestic tickers — cheap since it happens on the SEC
+  // fetch alone, before any Twelve Data budget is touched.
+  const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol]) => symbol);
   const withCik = candidates.map((symbol) => ({ symbol, cik: tickerToCik.get(symbol) })).filter((c) => c.cik);
   console.log(
-    `${candidates.length} tickers missing pfcfRatio; ${withCik.length} of those have a matching SEC CIK ` +
-      `(the rest are either genuinely too new, or not SEC-registered at all).`
+    `${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK ` +
+      `(the rest are either genuinely too new, or not SEC-registered at all). Each is checked for real IFRS data ` +
+      `before spending any Twelve Data budget — most will resolve quickly to "not a foreign filer, skip."`
   );
 
   let processed = 0;
@@ -312,7 +318,17 @@ async function main() {
       const companyFacts = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
       await sleep(SEC_REQUEST_SPACING_MS);
 
-      if (companyFacts) {
+      // Only genuine IFRS filers — see generateForeignFilingsCache.js's
+      // identical check for the full rationale (a domestic filer's SEC
+      // companyfacts also has real us-gaap data, so without this gate
+      // extractFactSeries's us-gaap fallback would happily compute P/FCF
+      // for every SEC-registered company, duplicating stock-metrics-
+      // pipeline's own Finnhub-based reconstruction). Checked BEFORE any
+      // Twelve Data call, so scanning the ~5,000 non-IFRS tickers in the
+      // full candidate list above costs nothing but SEC requests.
+      const isIfrsFiler = !!(companyFacts?.facts?.['ifrs-full'] && Object.keys(companyFacts.facts['ifrs-full']).length);
+
+      if (isIfrsFiler) {
         const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
         const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
