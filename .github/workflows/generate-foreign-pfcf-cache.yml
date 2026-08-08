@@ -1,0 +1,118 @@
+# Pre-fetches a P/FCF trend (Quarterly/Yearly/TTM) for FOREIGN-FILER
+# tickers — see scripts/generateForeignPfcfCache.js for the full rationale
+# (why this needs its own script/workflow separate from
+# generate-foreign-filings-cache.yml: it needs Twelve Data historical
+# prices on top of SEC filings, a separate provider with its own
+# rate-limit budget, the same reason stock-metrics-pipeline splits its own
+# P/FCF job from its main daily one).
+#
+# Scheduled after the other 4 jobs sharing this Gist (00:00 UTC main
+# pipeline, ~12:00 UTC stock-metrics-pipeline's own P/FCF job, 14:00 UTC
+# this repo's foreign-filings-cache job, 16:00 UTC news cache) — this job
+# talks to SEC + Twelve Data, not Finnhub, so there's no shared rate-limit
+# budget with any of them to protect (a SEPARATE Twelve Data key from
+# stock-metrics-pipeline's own P/FCF job — see below), the gap is purely to
+# avoid concurrent writes to the same Gist. Estimate, not yet measured
+# against a real run — re-tune if needed once real data comes in, same
+# caveat every other workflow in this project already carries.
+#
+# One-time setup required (this workflow can't do these for you):
+#   1. Sign up for a free Twelve Data account (a DIFFERENT one from
+#      whichever you used for stock-metrics-pipeline's own P/FCF job, or
+#      the app proxy's live-fallback key) and add its key as a repository
+#      secret named TWELVEDATA_FOREIGN_PIPELINE_API_KEY.
+#   2. Reuses the SAME GIST_ID/GIST_TOKEN secrets already set up for this
+#      repo's generate-foreign-filings-cache.yml — no changes needed there.
+# No SEC key needed — that half of this pipeline only calls SEC's free,
+# keyless EDGAR API.
+
+name: Generate foreign P/FCF cache
+
+on:
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate foreign P/FCF cache
+        env:
+          TWELVEDATA_FOREIGN_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_FOREIGN_PIPELINE_API_KEY }}
+        run: node scripts/generateForeignPfcfCache.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename foreignPfcfCache.json foreignPfcfCache.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add foreignPfcfCache.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'foreign-pfcf-pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Foreign P/FCF cache pipeline failed',
+                body: `The daily generation run failed.\n\nRun: ${runUrl}\n\nCheck the TWELVEDATA_FOREIGN_PIPELINE_API_KEY, GIST_TOKEN, and GIST_ID secrets, and SEC EDGAR's/Twelve Data's API status. Note: this is separate from generate-foreign-filings-cache.yml — that job is unaffected.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'foreign-pfcf-pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Foreign P/FCF cache pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }
