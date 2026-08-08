@@ -165,9 +165,23 @@ function quarterLabelFromDate(dateStr) {
 // Dedupes by (start, end) — preferring the most-recently-`filed` value, since
 // the same period is often re-reported as a comparative column in a later
 // filing (verified live for both BMO and IAG) — then classifies each
-// surviving fact as a standalone quarter (~80-100 day span) or annual
-// (~350-380 days); anything else (semi-annual, odd stub periods) is
-// dropped rather than guessed at.
+// surviving fact as a standalone quarter (~80-100 day span), 6-month/9-month
+// YTD-cumulative, or annual (~350-380 days).
+//
+// The 6mo/9mo facts are then DE-CUMULATED into standalone quarters wherever
+// a genuine standalone fact isn't already tagged for that period — verified
+// live: more than half of this pipeline's covered universe (AstraZeneca/AZN,
+// Deutsche Bank/DB, Royal Bank of Canada/RY, Toronto-Dominion/TD, Total/TTE,
+// Stellantis/STLA, and more) reports interim results as YTD-cumulative
+// rather than tagging each standalone quarter directly, unlike BMO (which
+// tags standalone quarters outright — see the file header). Matched by
+// shared START date, since a YTD figure and the standalone quarters that
+// make it up always begin at the same fiscal-year start. Mirrors
+// decumulateYtdByYear in the main pipeline's generateSectorMetrics.js
+// (US-GAAP, {year,quarter}-keyed) — same principle, adapted to this file's
+// date-keyed fact shape. Only fills a GAP (no existing point for that
+// end-date) — never overwrites a genuinely-tagged standalone fact, which is
+// always preferred when both exist.
 function dedupeAndClassify(rawFacts) {
   const byPeriod = new Map();
   for (const fact of rawFacts) {
@@ -182,12 +196,34 @@ function dedupeAndClassify(rawFacts) {
   }
 
   const quarterly = [];
+  const h1 = [];
+  const q3ytd = [];
   const annual = [];
   for (const fact of byPeriod.values()) {
     const days = daysBetween(fact.start, fact.end);
     const point = { start: fact.start, end: fact.end, value: fact.val };
     if (days >= 80 && days <= 100) quarterly.push(point);
+    else if (days >= 170 && days <= 200) h1.push(point);
+    else if (days >= 260 && days <= 300) q3ytd.push(point);
     else if (days >= 350 && days <= 380) annual.push(point);
+  }
+
+  const hasEnd = (end) => quarterly.some((q) => q.end === end);
+  const q1ByStart = new Map(quarterly.map((q) => [q.start, q]));
+  const h1ByStart = new Map(h1.map((h) => [h.start, h]));
+  const q3ByStart = new Map(q3ytd.map((q) => [q.start, q]));
+
+  for (const h of h1) {
+    const q1 = q1ByStart.get(h.start);
+    if (q1 && !hasEnd(h.end)) quarterly.push({ start: q1.end, end: h.end, value: h.value - q1.value });
+  }
+  for (const q3 of q3ytd) {
+    const half = h1ByStart.get(q3.start);
+    if (half && !hasEnd(q3.end)) quarterly.push({ start: half.end, end: q3.end, value: q3.value - half.value });
+  }
+  for (const fy of annual) {
+    const q3 = q3ByStart.get(fy.start);
+    if (q3 && !hasEnd(fy.end)) quarterly.push({ start: q3.end, end: fy.end, value: fy.value - q3.value });
   }
 
   quarterly.sort((a, b) => new Date(a.end) - new Date(b.end));

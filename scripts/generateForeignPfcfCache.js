@@ -125,11 +125,15 @@ function annualLabelFromDate(dateStr) {
   return `FY '${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
-// Same dedupe-by-(start,end)-then-classify-by-duration logic as
-// generateForeignFilingsCache.js's dedupeAndClassify — kept as its own copy
-// (CommonJS, not part of the app's ES module bundle, same reasoning
-// generateForeignFilingsCache.js's own header gives) rather than requiring
-// across the two scripts.
+// Same dedupe-by-(start,end)-then-classify-by-duration-then-de-cumulate
+// logic as generateForeignFilingsCache.js's dedupeAndClassify — see that
+// file's own comment for the full rationale (more than half of this
+// pipeline's covered universe reports interim results as YTD-cumulative
+// 6-month/9-month figures rather than tagging standalone quarters
+// directly; de-cumulating those recovers real Quarterly/TTM coverage that
+// was previously silently dropped). Kept as its own copy (CommonJS, not
+// part of the app's ES module bundle) rather than requiring across the
+// two scripts.
 function dedupeAndClassify(rawFacts) {
   const byPeriod = new Map();
   for (const fact of rawFacts) {
@@ -143,12 +147,34 @@ function dedupeAndClassify(rawFacts) {
   }
 
   const quarterly = [];
+  const h1 = [];
+  const q3ytd = [];
   const annual = [];
   for (const fact of byPeriod.values()) {
     const days = daysBetween(fact.start, fact.end);
     const point = { start: fact.start, end: fact.end, value: fact.val };
     if (days >= 80 && days <= 100) quarterly.push(point);
+    else if (days >= 170 && days <= 200) h1.push(point);
+    else if (days >= 260 && days <= 300) q3ytd.push(point);
     else if (days >= 350 && days <= 380) annual.push(point);
+  }
+
+  const hasEnd = (end) => quarterly.some((q) => q.end === end);
+  const q1ByStart = new Map(quarterly.map((q) => [q.start, q]));
+  const h1ByStart = new Map(h1.map((h) => [h.start, h]));
+  const q3ByStart = new Map(q3ytd.map((q) => [q.start, q]));
+
+  for (const h of h1) {
+    const q1 = q1ByStart.get(h.start);
+    if (q1 && !hasEnd(h.end)) quarterly.push({ start: q1.end, end: h.end, value: h.value - q1.value });
+  }
+  for (const q3 of q3ytd) {
+    const half = h1ByStart.get(q3.start);
+    if (half && !hasEnd(q3.end)) quarterly.push({ start: half.end, end: q3.end, value: q3.value - half.value });
+  }
+  for (const fy of annual) {
+    const q3 = q3ByStart.get(fy.start);
+    if (q3 && !hasEnd(fy.end)) quarterly.push({ start: q3.end, end: fy.end, value: fy.value - q3.value });
   }
 
   quarterly.sort((a, b) => new Date(a.end) - new Date(b.end));
