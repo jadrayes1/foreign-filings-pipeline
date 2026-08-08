@@ -1,14 +1,21 @@
 // scripts/generateForeignFilingsCache.js
 //
-// Reconstructs revenue-growth, profit-margin, and FCF-margin trends for
-// FOREIGN-FILER tickers (Canadian banks/miners, UK pharma, etc.) that have
-// no data at all from stock-analyzer's existing Finnhub-financials-reported-
-// based reconstruction (see buildBankRevenueGrowthSeries/
-// buildBankProfitMarginSeries/buildFcfMarginFromFilings in the main app's
-// src/utils/metrics.js) — that endpoint only carries US-GAAP XBRL from
-// 10-K/10-Q filings. Foreign private issuers file 40-F/20-F + 6-K instead,
-// and Finnhub simply doesn't crawl those forms (verified live: zero entries
-// for Bank of Montreal/BMO and IAMGOLD/IAG on that endpoint).
+// Reconstructs revenue-growth, profit-margin, FCF-margin, and ROIC trends
+// for FOREIGN-FILER tickers (Canadian banks/miners, UK pharma, etc.) that
+// have no data at all from stock-analyzer's existing Finnhub-financials-
+// reported-based reconstruction (see buildBankRevenueGrowthSeries/
+// buildBankProfitMarginSeries/buildFcfMarginFromFilings/
+// buildRoicTrendFromFilings in the main app's src/utils/metrics.js) — that
+// endpoint only carries US-GAAP XBRL from 10-K/10-Q filings. Foreign
+// private issuers file 40-F/20-F + 6-K instead, and Finnhub simply doesn't
+// crawl those forms (verified live: zero entries for Bank of Montreal/BMO
+// and IAMGOLD/IAG on that endpoint).
+//
+// P/FCF is NOT included here — see generateForeignPfcfCache.js, a separate
+// script/workflow in this same repo, since that one needs Twelve Data
+// price history on top of SEC data (its own rate-limit budget), the same
+// reason generatePfcfTrendCache.js is split from generateSectorMetrics.js
+// in the stock-metrics-pipeline repo.
 //
 // The data genuinely exists for free on SEC's OWN public EDGAR API
 // (data.sec.gov/api/xbrl/companyfacts) — foreign issuers reporting under
@@ -92,6 +99,33 @@ const CAPEX_CONCEPTS = [
 const NET_INCOME_CONCEPTS = ['ProfitLoss'];
 const SHARES_CONCEPTS = ['WeightedAverageShares'];
 
+// ROIC's inputs — verified live for two independent filers (BMO - Canadian
+// bank, IAG - Canadian mining):
+//   - EBIT: try genuine operating income first (ProfitLossFromOperating
+//     Activities — present for IAG, a non-bank), fall back to pre-tax
+//     income (ProfitLossBeforeTax — BMO has no operating-income concept at
+//     all, same reason banks lack us-gaap_OperatingIncomeLoss under
+//     US-GAAP: interest income/expense are core banking operations for a
+//     bank, not a separate financing layer below an operating-income line
+//     — see findReportedEBIT's identical fallback in the main app's
+//     src/utils/metrics.js). A simple 2-concept candidate list suffices
+//     here (no label-regex matching needed like the US-GAAP version) since
+//     IFRS concept naming is far more standardized than US-GAAP's
+//     per-filer extension concepts — both BMO and IAG use these exact
+//     concept names, unlike BNY's company-specific bk_* extension.
+//   - Equity/Cash/Debt: balance-sheet concepts, all INSTANT facts (a single
+//     "as of" date, not a start/end period) — see dedupeInstantFacts below
+//     for why these need different handling than the period-flow concepts
+//     above. Deposits are deliberately NOT in DEBT_CONCEPTS, same principle
+//     as the main pipeline's sumDebt: they fund the loan book as a normal
+//     operating liability for a bank, not a financing choice, so bank
+//     filers like BMO naturally get debt=0 without any special-casing.
+const EBIT_CONCEPTS = ['ProfitLossFromOperatingActivities', 'ProfitLossBeforeTax'];
+const EQUITY_CONCEPTS = ['Equity'];
+const CASH_CONCEPTS = ['CashAndCashEquivalents'];
+const DEBT_CONCEPTS = ['Borrowings', 'LongtermBorrowings', 'CurrentPortionOfLongtermBorrowings'];
+const ROIC_ASSUMED_TAX_RATE = 0.21; // matches the main pipeline's own default simplification
+
 // Searches ifrs-full first (what every foreign filer verified so far uses),
 // then us-gaap as a defensive fallback in case a filer mixes taxonomies —
 // returns the raw fact array (list of {start,end,val,filed,accn,form,fp,fy})
@@ -159,6 +193,29 @@ function dedupeAndClassify(rawFacts) {
   quarterly.sort((a, b) => new Date(a.end) - new Date(b.end));
   annual.sort((a, b) => new Date(a.end) - new Date(b.end));
   return { quarterly, annual };
+}
+
+// Balance-sheet concepts (Equity, Cash, Borrowings) are INSTANT facts — a
+// single "as of" date, not a start/end period (verified live: no `start`
+// field on any of these in BMO's or IAG's raw data). dedupeAndClassify
+// above assumes period-flow facts and would silently drop every instant
+// fact if reused as-is (daysBetween needs both a start and end). Dedupes
+// by end date only, same most-recently-`filed` conflict-resolution rule as
+// dedupeAndClassify — no quarterly/annual split needed, since joining by
+// end-date against an EBIT quarterly or annual point naturally picks out
+// the right one either way.
+function dedupeInstantFacts(rawFacts) {
+  const byDate = new Map();
+  for (const fact of rawFacts) {
+    if (fact.val == null || !fact.end) continue;
+    const existing = byDate.get(fact.end);
+    if (!existing || new Date(fact.filed) > new Date(existing.filed)) {
+      byDate.set(fact.end, fact);
+    }
+  }
+  return Array.from(byDate.values())
+    .map((f) => ({ end: f.end, value: f.val }))
+    .sort((a, b) => new Date(a.end) - new Date(b.end));
 }
 
 // Two standalone quarters are "adjacent" if the next one's start is within a
@@ -326,6 +383,82 @@ function buildAnnualRatioTrend(numeratorAnnual, denominatorAnnual, combine) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
+// ---------------------------------------------------------------------------
+// ROIC — NOPAT / (debt + equity - cash). Mirrors buildRoicQuarterlyFromFilings/
+// buildRoicYearlyFromFilings/buildRoicTTMFromFilings in the main pipeline's
+// generateSectorMetrics.js exactly (same annualization/windowing logic),
+// adapted to this file's end-date-keyed point shape instead of {year,quarter}
+// report objects. Invested capital is computed ONCE, keyed by end-date,
+// from the flat (not quarterly/annual-split) equity/cash/debt instant
+// series — an EBIT quarterly point and an EBIT annual point naturally pick
+// out the right balance-sheet snapshot just by matching end-date, no
+// separate quarterly/annual invested-capital computation needed.
+// ---------------------------------------------------------------------------
+
+function investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank) {
+  const cashByEnd = new Map(cashInstant.map((f) => [f.end, f.value]));
+  const debtByEnd = new Map(debtInstant.map((f) => [f.end, f.value]));
+  const map = new Map();
+  for (const e of equityInstant) {
+    // Cash isn't netted out for bank filers — verified live: BMO's IFRS
+    // CashAndCashEquivalents ($67.4B) includes central-bank reserves and
+    // interbank deposits, a bank's core OPERATING assets, not idle/excess
+    // cash the way it is for an industrial company. Subtracting it
+    // collapsed invested capital to ~$20.7B against $88.1B of real equity,
+    // inflating ROIC to 34-57% for a company whose real ROIC is ~3%. Debt
+    // is untouched (already effectively 0 for banks — see DEBT_CONCEPTS'
+    // deliberate exclusion of deposits above).
+    const cash = isBank ? 0 : cashByEnd.get(e.end) || 0;
+    const debt = debtByEnd.get(e.end) || 0;
+    const investedCapital = debt + e.value - cash;
+    if (investedCapital > 0) map.set(e.end, investedCapital);
+  }
+  return map;
+}
+
+function buildRoicQuarterlyTrend(ebitQuarterly, investedCapitalMap) {
+  return ebitQuarterly
+    .filter((q) => investedCapitalMap.has(q.end))
+    .map((q) => {
+      // Annualized (x4) — EBIT/NOPAT is a flow figure that shrinks to ~1/4
+      // at quarterly granularity, but invested capital is a point-in-time
+      // balance-sheet snapshot that doesn't shrink with it; see the
+      // identical note in the main pipeline's buildRoicQuarterlyFromFilings.
+      const annualizedNopat = q.value * (1 - ROIC_ASSUMED_TAX_RATE) * 4;
+      const value = clampImplausible(annualizedNopat / investedCapitalMap.get(q.end));
+      return value != null ? { label: quarterLabelFromDate(q.end), value } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildRoicYearlyTrend(ebitAnnual, investedCapitalMap) {
+  return ebitAnnual
+    .filter((a) => investedCapitalMap.has(a.end))
+    .map((a) => {
+      const nopat = a.value * (1 - ROIC_ASSUMED_TAX_RATE);
+      const value = clampImplausible(nopat / investedCapitalMap.get(a.end));
+      return value != null ? { label: annualLabelFromDate(a.end), value } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildRoicTTMTrend(ebitQuarterly, investedCapitalMap) {
+  const standalone = ebitQuarterly
+    .filter((q) => investedCapitalMap.has(q.end))
+    .map((q) => ({ start: q.start, end: q.end, nopat: q.value * (1 - ROIC_ASSUMED_TAX_RATE), investedCapital: investedCapitalMap.get(q.end) }));
+
+  return buildTrailingWindows(standalone, 4)
+    .map(({ quarters, anchor, partial }) => {
+      const ttmNopat = quarters.reduce((sum, q) => sum + q.nopat, 0);
+      const value = clampImplausible(ttmNopat / anchor.investedCapital);
+      return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
 // A fresh attempt can come back empty or narrower on a day where SEC has a
 // transient hiccup for this specific filer — mirrors pickTrendToPublish in
 // the main pipeline's generateSectorMetrics.js.
@@ -374,7 +507,7 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   const out = {};
   for (const cadence of ['quarterly', 'yearly', 'ttm']) {
     const merged = {};
-    for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin']) {
+    for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin', 'roic']) {
       const picked = pickTrendToPublish(existing[cadence]?.[key], freshEntry?.[cadence]?.[key]);
       if (picked.length) merged[key] = picked;
     }
@@ -413,11 +546,20 @@ async function processTicker(symbol, cik, isBank) {
   const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
   const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
   const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS);
+  const ebitRaw = extractFactSeries(companyFacts, EBIT_CONCEPTS);
+  const equityRaw = extractFactSeries(companyFacts, EQUITY_CONCEPTS);
+  const cashRaw = extractFactSeries(companyFacts, CASH_CONCEPTS);
+  const debtRaw = extractFactSeries(companyFacts, DEBT_CONCEPTS);
 
   const revenue = dedupeAndClassify(revenueRaw);
   const ocf = dedupeAndClassify(ocfRaw);
   const capex = dedupeAndClassify(capexRaw);
   const netIncome = dedupeAndClassify(netIncomeRaw);
+  const ebit = dedupeAndClassify(ebitRaw);
+  const equityInstant = dedupeInstantFacts(equityRaw);
+  const cashInstant = dedupeInstantFacts(cashRaw);
+  const debtInstant = dedupeInstantFacts(debtRaw);
+  const investedCapitalMap = investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank);
 
   const capexQByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
   const ocfWithCapexQuarterly = ocf.quarterly.filter((q) => capexQByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexQByEnd.get(q.end) }));
@@ -471,6 +613,20 @@ async function processTicker(symbol, cik, isBank) {
       const fmY = buildAnnualRatioTrend(ocfWithCapexAnnual, revenue.annual, (fcf, rev) => (rev ? fcf / rev : null));
       if (fmY.length) yearly.fcfMargin = fmY;
     }
+  }
+
+  // Not bank-gated, unlike fcfMargin above — verified live via the main
+  // pipeline's identical BNY fix that ROIC (with the pre-tax-income EBIT
+  // fallback) works fine for bank filers too.
+  if (ebit.quarterly.length && investedCapitalMap.size) {
+    const roicQ = buildRoicQuarterlyTrend(ebit.quarterly, investedCapitalMap);
+    if (roicQ.length) quarterly.roic = roicQ;
+    const roicTtm = buildRoicTTMTrend(ebit.quarterly, investedCapitalMap);
+    if (roicTtm.length) ttm.roic = roicTtm;
+  }
+  if (ebit.annual.length && investedCapitalMap.size) {
+    const roicY = buildRoicYearlyTrend(ebit.annual, investedCapitalMap);
+    if (roicY.length) yearly.roic = roicY;
   }
 
   const result = {};
@@ -528,6 +684,7 @@ async function main() {
 module.exports = {
   extractFactSeries,
   dedupeAndClassify,
+  dedupeInstantFacts,
   buildTrailingWindows,
   buildRatioTrend,
   buildQuarterlyRatioTrend,
@@ -535,6 +692,10 @@ module.exports = {
   buildRevenueGrowthTTMTrend,
   buildAnnualRevenueGrowthTrend,
   buildAnnualRatioTrend,
+  investedCapitalByEnd,
+  buildRoicQuarterlyTrend,
+  buildRoicYearlyTrend,
+  buildRoicTTMTrend,
   migrateLegacyEntry,
   pickCadenceTrendsToPublish,
   isAdjacent,
