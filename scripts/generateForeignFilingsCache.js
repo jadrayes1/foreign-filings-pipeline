@@ -487,7 +487,19 @@ function buildRoicTTMTrend(ebitQuarterly, investedCapitalMap) {
 
   return buildTrailingWindows(standalone, 4)
     .map(({ quarters, anchor, partial }) => {
-      const ttmNopat = quarters.reduce((sum, q) => sum + q.nopat, 0);
+      const rawNopat = quarters.reduce((sum, q) => sum + q.nopat, 0);
+      // A partial window (< 4 quarters) sums fewer than a full year of
+      // NOPAT, but investedCapital is still a full-year-scale balance-sheet
+      // snapshot — left unannualized, a 1-quarter partial window understates
+      // ROIC ~4x relative to a genuine trailing-twelve-month figure (same
+      // reasoning buildRoicQuarterlyTrend already applies to a single
+      // quarter). Verified live: PLG's sole Q4'19 quarter produced ttm.roic
+      // of 284% (raw, unannualized) that slipped under the +/-1000% sanity
+      // clamp, while the SAME quarter's properly-annualized quarterly.roic
+      // (1137%) was correctly clamped as implausible — an inconsistency
+      // that let a misleadingly-labeled "TTM" figure survive as the only
+      // cadence with data for that ticker.
+      const ttmNopat = partial ? rawNopat * (4 / quarters.length) : rawNopat;
       const value = clampImplausible(ttmNopat / anchor.investedCapital);
       return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
     })
@@ -517,20 +529,47 @@ function pickTrendToPublish(existingPoints, freshPoints) {
 // generateSectorMetrics.js. A no-op on an entry that's already the new
 // shape (detected by the presence of any of the three cadence keys, which
 // never appear on a legacy entry).
+//
+// EXCEPT: a brief window of legacy entries (published between bd077cd and
+// 25bd637) could ALSO hold the annual-cadence fallback that bd077cd added —
+// same flat field names, but labeled "FY 'YY" (via annualLabelFromDate),
+// deliberately distinguishable from the quarterly-shaped "Q# 'YY" labels
+// this function otherwise assumes. Blindly mapping those into
+// `quarterly`/`ttm` mislabels annual figures as quarterly/TTM ones —
+// verified live: 279 (ticker, cadence, metric) combos in the published
+// cache carried nothing but "FY 'YY"-labeled points inside `ttm`/`quarterly`
+// this way. Those points are dropped here rather than relabeled into
+// `yearly`, since processTicker already computes a real `yearly` entry
+// fresh from current annual facts every run — no data is lost, only the
+// mislabeled duplicate is discarded.
 function migrateLegacyEntry(entry) {
   if (!entry) return {};
   if (entry.quarterly || entry.yearly || entry.ttm) return entry;
+  const isQuarterlyShaped = (points) => Array.isArray(points) && points.length && points.every((p) => !p.label || !p.label.startsWith("FY '"));
   const migrated = {};
-  if (Array.isArray(entry.revenueGrowth) && entry.revenueGrowth.length) {
+  if (isQuarterlyShaped(entry.revenueGrowth)) {
     migrated.quarterly = { revenueGrowth: entry.revenueGrowth };
   }
-  if (Array.isArray(entry.profitMargin) && entry.profitMargin.length) {
+  if (isQuarterlyShaped(entry.profitMargin)) {
     migrated.ttm = { ...(migrated.ttm || {}), profitMargin: entry.profitMargin };
   }
-  if (Array.isArray(entry.fcfMargin) && entry.fcfMargin.length) {
+  if (isQuarterlyShaped(entry.fcfMargin)) {
     migrated.ttm = { ...(migrated.ttm || {}), fcfMargin: entry.fcfMargin };
   }
   return migrated;
+}
+
+// Strips any "FY 'YY"-labeled point out of a quarterly/ttm points array.
+// Guards against a one-time migration bug (see migrateLegacyEntry's comment)
+// whose mislabeled output already "graduated" into the new { quarterly,
+// yearly, ttm } shape in a past run — once there, migrateLegacyEntry's own
+// early-return (`if (entry.quarterly || ...) return entry`) never sees it
+// again, so merge-protection alone would otherwise preserve the mislabeled
+// points forever. yearly is untouched — "FY 'YY" is the correct label
+// there.
+function sanitizeCadencePoints(cadence, points) {
+  if (cadence === 'yearly' || !Array.isArray(points)) return points;
+  return points.filter((p) => !p.label || !p.label.startsWith("FY '"));
 }
 
 // Per-(cadence, metric) merge-protection — a fresh run that comes back
@@ -544,7 +583,8 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   for (const cadence of ['quarterly', 'yearly', 'ttm']) {
     const merged = {};
     for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin', 'roic']) {
-      const picked = pickTrendToPublish(existing[cadence]?.[key], freshEntry?.[cadence]?.[key]);
+      const existingPoints = sanitizeCadencePoints(cadence, existing[cadence]?.[key]);
+      const picked = pickTrendToPublish(existingPoints, freshEntry?.[cadence]?.[key]);
       if (picked.length) merged[key] = picked;
     }
     if (Object.keys(merged).length) out[cadence] = merged;
@@ -759,6 +799,7 @@ module.exports = {
   buildRoicYearlyTrend,
   buildRoicTTMTrend,
   migrateLegacyEntry,
+  sanitizeCadencePoints,
   pickCadenceTrendsToPublish,
   isAdjacent,
   quarterLabelFromDate,
