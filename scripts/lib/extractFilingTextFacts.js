@@ -48,36 +48,67 @@ const RECONCILE_TOLERANCE = 0.02; // 2%
 // OCI reconciliation items — no revenue line at all. Matching both is safe
 // since extractStatement already tries every heading match in a document
 // in order and moves on if a match yields no line-item hits.
+// Tolerant of CONDENSED/INTERIM/UNAUDITED inserted between CONSOLIDATED and
+// the statement phrase (in any combination/order) - verified live: Baytex
+// (BTE) titles its real cash-flow statement "Condensed Consolidated
+// Interim Statements of Cash Flows", where "Interim" sits between
+// "Consolidated" and "Statements" and broke the old rigid adjacency
+// requirement. Words BEFORE "Consolidated" (e.g. GFR's "Condensed Interim
+// Consolidated...") already matched fine since the regex isn't anchored.
 const STATEMENT_HEADINGS = {
-  income: /CONSOLIDATED (STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?)/i,
-  cashflow: /CONSOLIDATED STATEMENTS? OF CASH ?FLOWS/i,
+  income: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?)/i,
+  cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS? OF CASH ?FLOWS/i,
 };
 
-// Text-label aliases, matched against a data row's leading (non-numeric)
-// cell text. Deliberately conservative — IFRS/press-release line-item
-// naming varies far more than XBRL concept names do, so ambiguous matches
-// are skipped rather than guessed (see findLineItem below).
+// A real statement title is always short - verified live this matters:
+// Baytex's MD&A exhibit has multi-thousand-character prose paragraphs that
+// happen to mention "consolidated statements of cash flows" deep inside
+// running narrative text (e.g. a footnote about an accounting-standard
+// change), and with no length check the heading-search below would treat
+// the ENTIRE paragraph as "the heading" and grab whatever table follows it
+// - almost never the real statement. A genuine title comfortably fits
+// under this even with "(Unaudited)"/currency suffixes.
+const MAX_HEADING_TEXT_LENGTH = 200;
+
+// Text-label matching, per concept: a broad INCLUDE keyword pattern plus an
+// EXCLUDE pattern that disqualifies an otherwise-matching row. Chosen over
+// a growing list of hand-anchored per-filer regexes (the original shape
+// here, which needed a fresh tweak almost every time a new filer's exact
+// wording showed up — "Revenues from mining operations" (AEM), "Oil sales,
+// net of royalties" (GFR), "Petroleum and natural gas sales" (BTE), etc.)
+// — a broad keyword net catches unforeseen wording automatically, and the
+// exclude list generalizes across filers too (a real statement's sibling
+// sub-lines follow a small, recurring set of patterns — "per share",
+// "attributable to non-controlling interests", "from discontinued
+// operations" — regardless of which company or industry is filing).
+// Still deliberately conservative: the caller (extractFromTable) drops a
+// concept as AMBIGUOUS the moment 2+ rows in the same table match, so a
+// keyword net that's slightly too wide fails safe (nothing published)
+// rather than guessing between candidates.
 const LABEL_ALIASES = {
-  // Prefix match (not anchored with $) — verified live AEM labels its top
-  // revenue line "Revenues from mining operations" (a descriptive suffix
-  // after "Revenues", not a sub-total line), unlike net income, which
-  // commonly has a genuinely DIFFERENT, wrong sub-line ("...attributable
-  // to non-controlling interests") that a loose match would wrongly grab —
-  // kept exact-match there instead. A stray revenue sub-line with a similar
-  // prefix elsewhere in the same statement would still resolve as
-  // AMBIGUOUS (see extractStatement) and get dropped, not guessed.
-  revenue: /^(total |net |operating |vessel )?revenues?\b/i,
-  // Broadened for the optional trailing "and comprehensive income (loss)"
-  // clause — verified live: GreenFire Resources (GFR, IFRS oil & gas
-  // issuer) combines net income and OCI into one line, "Net income (loss)
-  // and comprehensive income (loss)", when it has no separate OCI
-  // reclassification items to report — a common IFRS presentation choice,
-  // not GFR-specific wording. Still anchored end-to-end ($), so it won't
-  // start matching an unrelated sub-total.
-  netIncome: /^net (income|earnings)(\s*\(loss\))?(\s+and comprehensive income(\s*\(loss\))?)?$/i,
-  ocf: /^net cash (from|provided by|generated from)( \(used in\))? operating activities/i,
-  capex: /^(capital expenditures|purchase(s)? of property,? plant)/i,
+  revenue: {
+    include: /revenues?\b|\bsales\b/i,
+    exclude: /cost of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance/i,
+  },
+  netIncome: {
+    include: /net (income|earnings|loss)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b/i,
+    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b/i,
+  },
+  ocf: {
+    include: /cash (flows? )?(from|provided by|generated (from|by)|used in) operating/i,
+    exclude: /investing|financing|discontinued/i,
+  },
+  capex: {
+    include: /capital expenditures?|purchase(s)? of property|additions to (property|oil and gas|exploration)/i,
+    exclude: /proceeds|disposal|\bsale of\b/i,
+  },
 };
+
+function matchesConcept(label, concept) {
+  const rule = LABEL_ALIASES[concept];
+  if (!rule) return false;
+  return rule.include.test(label) && !rule.exclude.test(label);
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -125,8 +156,24 @@ function parseNumericCell(text) {
   return negative ? -num : num;
 }
 
+// Tolerant of a trailing restatement annotation - verified live: Baytex
+// (BTE) labels its prior-year comparative columns "2025 Revised (1)" (a
+// footnote marker for a post-close restatement), which an exact whole-cell
+// match silently drops as "not a year cell" at all, collapsing the header
+// row down to only its current-year columns and losing every comparative
+// period. The negative lookahead still rejects a longer, unrelated number
+// like "20259" (not followed by a non-digit), so this only ever matches a
+// real 4-digit year at the start of the cell.
 function isYearCell(text) {
-  return /^(19|20)\d{2}$/.test(text.trim());
+  return /^(19|20)\d{2}(?!\d)/.test(text.trim());
+}
+
+// isYearCell only gates the match; callers need just the 4-digit year, not
+// "2025 Revised (1)" wholesale (that string would never equal a plain
+// "2025" in the downstream year === targetEndYear comparisons).
+function extractYear(text) {
+  const m = text.trim().match(/^((?:19|20)\d{2})(?!\d)/);
+  return m ? m[1] : text.trim();
 }
 
 function nonEmptyCells($, row) {
@@ -158,7 +205,7 @@ function parsePeriodPhrase(text) {
 // Returns null for neither shape, so a genuinely unrelated cell (e.g. a
 // stray "Notes" or "(In millions...)" label) is correctly ignored.
 function parseDateHeaderCell(text) {
-  if (isYearCell(text)) return { year: text, monthDay: null };
+  if (isYearCell(text)) return { year: extractYear(text), monthDay: null };
   const compound = text.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})$/);
   if (compound) return { year: compound[3], monthDay: `${compound[1]} ${compound[2]}` };
   return null;
@@ -196,7 +243,7 @@ function parseTableColumns($, table) {
       const bareDateCell = cells.find((c) => /(period|quarter) ended\s+[A-Za-z]+\s+\d{1,2}/i.test(c.text) && !/months? ended/i.test(c.text));
       if (bareDateCell) {
         const dateMatch = bareDateCell.text.match(/ended\s+([A-Za-z]+\s+\d{1,2})/i);
-        const yearCellsInSameRow = cells.filter((c) => isYearCell(c.text)).map((c) => c.text);
+        const yearCellsInSameRow = cells.filter((c) => isYearCell(c.text)).map((c) => extractYear(c.text));
         if (dateMatch && yearCellsInSameRow.length >= 2) {
           const columns = yearCellsInSameRow.map((year) => ({ months: 3, endMonthDay: dateMatch[1], year }));
           return { columns, dataStartRowIdx: i + 1 };
@@ -297,8 +344,8 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
     if (!cells.length) continue;
     const row = parseDataRow(cells, columns.length);
     if (!row) continue;
-    for (const [concept, aliasRegex] of Object.entries(aliasMap)) {
-      if (!aliasRegex.test(row.label)) continue;
+    for (const concept of Object.keys(aliasMap)) {
+      if (!matchesConcept(row.label, concept)) continue;
       if (results[concept]) {
         // Ambiguous — a second line in the same statement also matches this
         // concept's alias. Never guess which is right; drop the concept
@@ -325,7 +372,8 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
   const allEls = $('body *').toArray();
   const headingIdxs = [];
   for (let i = 0; i < allEls.length; i++) {
-    if ($(allEls[i]).children().length === 0 && headingRegex.test($(allEls[i]).text())) headingIdxs.push(i);
+    const text = $(allEls[i]).text();
+    if ($(allEls[i]).children().length === 0 && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
   }
   // A heading can appear more than once (verified live: IAG's financial-
   // statements exhibit has a table-of-contents entry using the exact same
