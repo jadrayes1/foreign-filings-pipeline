@@ -49,6 +49,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { extractQuarterlyFactsFromFilings } = require('./lib/extractFilingTextFacts');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilingsCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
@@ -66,8 +67,24 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// A network interruption mid-request can leave a bare `fetch()` (no
+// default timeout) hanging forever rather than erroring — verified live
+// this session in the sibling smart-money-pipeline repo (a run stalled at
+// 0% CPU for 5+ hours after an apparent connectivity blip). 30s is
+// generous for any single SEC request; a real timeout surfaces as a
+// normal caught error instead of an indefinite hang that could burn a
+// scheduled workflow's entire timeout budget on one stuck ticker.
+const FETCH_TIMEOUT_MS = 30000;
+
 async function fetchJson(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' } });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' }, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     if (res.status === 404) return null; // no CIK match / no facts filed — a normal outcome, not an error
     throw new Error(`HTTP ${res.status} fetching ${url}`);
@@ -644,11 +661,67 @@ async function processTicker(symbol, cik, isBank) {
   const cashRaw = extractFactSeries(companyFacts, CASH_CONCEPTS);
   const debtRaw = extractFactSeries(companyFacts, DEBT_CONCEPTS);
 
-  const revenue = dedupeAndClassify(revenueRaw);
-  const ocf = dedupeAndClassify(ocfRaw);
-  const capex = dedupeAndClassify(capexRaw);
-  const netIncome = dedupeAndClassify(netIncomeRaw);
+  let revenue = dedupeAndClassify(revenueRaw);
+  let ocf = dedupeAndClassify(ocfRaw);
+  let capex = dedupeAndClassify(capexRaw);
+  let netIncome = dedupeAndClassify(netIncomeRaw);
   const ebit = dedupeAndClassify(ebitRaw);
+
+  // Fallback: for tickers whose SEC XBRL genuinely has zero standalone-
+  // quarter facts (foreign private issuers are exempt from 10-Q filing —
+  // verified live this is ~252 of 356 currently-published tickers), fill
+  // the gap from the same company's SEC 6-K earnings-release exhibits —
+  // real numbers, free, just prose/HTML instead of tagged XBRL. See
+  // scripts/lib/extractFilingTextFacts.js for the full extraction/
+  // reconciliation design. STRICTLY additive and gated:
+  //   - opt-in via ENABLE_FILING_TEXT_FALLBACK (unset in the daily
+  //     scheduled workflow — this is a heavier, higher-risk data source
+  //     than structured XBRL, staged behind manual workflow_dispatch runs
+  //     against a small sample first, per the rollout plan)
+  //   - only attempted per-concept when XBRL quarterly is confirmed empty
+  //     AND annual has real data (a verification anchor); a concept with
+  //     working XBRL quarterly data is never touched
+  //   - the extractor itself never returns an unverified point (see its
+  //     own reconciliation checks) — this integration only decides WHEN
+  //     to ask, not whether to trust what comes back
+  if (process.env.ENABLE_FILING_TEXT_FALLBACK) {
+    const allowlist = process.env.FILING_TEXT_FALLBACK_TICKERS
+      ? new Set(process.env.FILING_TEXT_FALLBACK_TICKERS.split(',').map((s) => s.trim().toUpperCase()))
+      : null;
+    if (!allowlist || allowlist.has(symbol.toUpperCase())) {
+      const needed = [];
+      if (!revenue.quarterly.length && revenue.annual.length) needed.push('revenue');
+      if (!netIncome.quarterly.length && netIncome.annual.length) needed.push('netIncome');
+      if (!ocf.quarterly.length && ocf.annual.length) needed.push('ocf');
+      if (!capex.quarterly.length && capex.annual.length) needed.push('capex');
+
+      if (needed.length) {
+        const annualByEnd = {
+          revenue: new Map(revenue.annual.map((a) => [a.end, a])),
+          netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
+          ocf: new Map(ocf.annual.map((a) => [a.end, a])),
+          capex: new Map(capex.annual.map((a) => [a.end, a])),
+        };
+        let filingTextFacts = {};
+        try {
+          filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT);
+        } catch (err) {
+          console.warn(`  filing-text fallback failed for ${symbol}: ${err.message}`);
+        }
+        if (filingTextFacts.revenue?.length) revenue = dedupeAndClassify([...revenueRaw, ...filingTextFacts.revenue]);
+        if (filingTextFacts.netIncome?.length) netIncome = dedupeAndClassify([...netIncomeRaw, ...filingTextFacts.netIncome]);
+        if (filingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...filingTextFacts.ocf]);
+        // XBRL's capex concept is a positive magnitude (verified live:
+        // IAG's FY2025 capex = 293,500,000) but the press-release table
+        // reports it parenthesized/negative (a cash outflow) — negated
+        // here to match XBRL's sign convention before merging, since
+        // downstream fcfMargin math (ocf.value - capex.value) assumes it.
+        if (filingTextFacts.capex?.length) {
+          capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+        }
+      }
+    }
+  }
   const equityInstant = dedupeInstantFacts(equityRaw);
   const cashInstant = dedupeInstantFacts(cashRaw);
   const debtInstant = dedupeInstantFacts(debtRaw);
