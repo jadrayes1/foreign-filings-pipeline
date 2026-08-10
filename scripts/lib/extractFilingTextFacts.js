@@ -67,7 +67,14 @@ const LABEL_ALIASES = {
   // prefix elsewhere in the same statement would still resolve as
   // AMBIGUOUS (see extractStatement) and get dropped, not guessed.
   revenue: /^(total |net |operating |vessel )?revenues?\b/i,
-  netIncome: /^net (income|earnings)(\s*\(loss\))?$/i,
+  // Broadened for the optional trailing "and comprehensive income (loss)"
+  // clause — verified live: GreenFire Resources (GFR, IFRS oil & gas
+  // issuer) combines net income and OCI into one line, "Net income (loss)
+  // and comprehensive income (loss)", when it has no separate OCI
+  // reclassification items to report — a common IFRS presentation choice,
+  // not GFR-specific wording. Still anchored end-to-end ($), so it won't
+  // start matching an unrelated sub-total.
+  netIncome: /^net (income|earnings)(\s*\(loss\))?(\s+and comprehensive income(\s*\(loss\))?)?$/i,
   ocf: /^net cash (from|provided by|generated from)( \(used in\))? operating activities/i,
   capex: /^(capital expenditures|purchase(s)? of property,? plant)/i,
 };
@@ -261,12 +268,59 @@ function parseDataRow(cells, columnCount) {
   return { label: labelParts.join(' '), values: values.map((v) => v.val) };
 }
 
-// Locates a statement's heading + immediately-following <table>, parses its
-// columns, and extracts every matched line item — returning both the
-// TARGET 3-month column's value per concept AND, when present, that same
-// row's own 6-month/9-month column value for the SAME fiscal year (used
-// for within-filing reconciliation by the caller — no separate lookup
-// needed since it's the same row, just a different column).
+// Parses a single already-located <table> for the target quarter's line
+// items — shared by both discovery paths: extractStatement (heading-search,
+// for press-release/formal-statement documents) and extractFromRFile
+// (FilingSummary.xml-directed, for SEC's auto-rendered Inline XBRL viewer
+// fragments — see extractFromRFile's own comment for why that path never
+// needs a heading search at all). Returns both the TARGET 3-month column's
+// value per concept AND, when present, that same row's own 6-month/9-month
+// column value for the SAME fiscal year (used for within-filing
+// reconciliation by the caller — no separate lookup needed since it's the
+// same row, just a different column).
+function extractFromTable($, table, targetEndYear, aliasMap) {
+  const parsed = parseTableColumns($, table);
+  if (!parsed) return null;
+  const { columns, dataStartRowIdx } = parsed;
+
+  const targetIdx3mo = columns.findIndex((c) => c.months === 3 && c.year === targetEndYear);
+  if (targetIdx3mo === -1) return null; // this filing doesn't cover the quarter we're after
+  const targetPeriod = columns[targetIdx3mo];
+  // Same fiscal year's cumulative (6mo/9mo) column, if this table has one —
+  // used for the within-filing reconciliation check.
+  const cumulativeIdx = columns.findIndex((c) => c.months > 3 && c.year === targetEndYear);
+
+  const rows = $(table).find('tr').toArray();
+  const results = {};
+  for (let i = dataStartRowIdx; i < rows.length; i++) {
+    const cells = nonEmptyCells($, rows[i]);
+    if (!cells.length) continue;
+    const row = parseDataRow(cells, columns.length);
+    if (!row) continue;
+    for (const [concept, aliasRegex] of Object.entries(aliasMap)) {
+      if (!aliasRegex.test(row.label)) continue;
+      if (results[concept]) {
+        // Ambiguous — a second line in the same statement also matches this
+        // concept's alias. Never guess which is right; drop the concept
+        // for this filing entirely.
+        results[concept] = 'AMBIGUOUS';
+        continue;
+      }
+      results[concept] = {
+        value3mo: row.values[targetIdx3mo],
+        valueCumulative: cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null,
+      };
+    }
+  }
+  for (const key of Object.keys(results)) {
+    if (results[key] === 'AMBIGUOUS') delete results[key];
+  }
+  return Object.keys(results).length ? { period: targetPeriod, facts: results } : null;
+}
+
+// Locates a statement's heading + immediately-following <table> in a big
+// combined document (press release or formal financial-statements exhibit
+// — STNG/IAG/CNQ/AEM style), then delegates to extractFromTable.
 function extractStatement($, headingRegex, targetEndYear, aliasMap) {
   const allEls = $('body *').toArray();
   const headingIdxs = [];
@@ -287,44 +341,33 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
       }
     }
     if (!table) continue;
+    const result = extractFromTable($, table, targetEndYear, aliasMap);
+    if (result) return result;
+  }
+  return null;
+}
 
-    const parsed = parseTableColumns($, table);
-    if (!parsed) continue;
-    const { columns, dataStartRowIdx } = parsed;
-
-    const targetIdx3mo = columns.findIndex((c) => c.months === 3 && c.year === targetEndYear);
-    if (targetIdx3mo === -1) continue; // this filing doesn't cover the quarter we're after
-    const targetPeriod = columns[targetIdx3mo];
-    // Same fiscal year's cumulative (6mo/9mo) column, if this table has one —
-    // used for the within-filing reconciliation check.
-    const cumulativeIdx = columns.findIndex((c) => c.months > 3 && c.year === targetEndYear);
-
-    const rows = $(table).find('tr').toArray();
-    const results = {};
-    for (let i = dataStartRowIdx; i < rows.length; i++) {
-      const cells = nonEmptyCells($, rows[i]);
-      if (!cells.length) continue;
-      const row = parseDataRow(cells, columns.length);
-      if (!row) continue;
-      for (const [concept, aliasRegex] of Object.entries(aliasMap)) {
-        if (!aliasRegex.test(row.label)) continue;
-        if (results[concept]) {
-          // Ambiguous — a second line in the same statement also matches this
-          // concept's alias. Never guess which is right; drop the concept
-          // for this filing entirely.
-          results[concept] = 'AMBIGUOUS';
-          continue;
-        }
-        results[concept] = {
-          value3mo: row.values[targetIdx3mo],
-          valueCumulative: cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null,
-        };
-      }
-    }
-    for (const key of Object.keys(results)) {
-      if (results[key] === 'AMBIGUOUS') delete results[key];
-    }
-    if (Object.keys(results).length) return { period: targetPeriod, facts: results };
+// SEC auto-renders each individual XBRL-tagged statement of an Inline XBRL
+// filing into its own small standalone page (R2.htm, R3.htm, ... — one per
+// statement/note), listed with real statement names in the filing's own
+// FilingSummary.xml manifest (see fetchFilingSummaryReports). Verified
+// live: GreenFire Resources/GFR's R3.htm is literally titled "Condensed
+// Interim Consolidated Statements of Comprehensive Income (Loss)
+// (Unaudited)" with the identical "Three months ended/Six months ended"
+// column structure extractFromTable already parses — just packaged as its
+// OWN page rather than embedded in one large combined document. No heading
+// search needed here at all (FilingSummary.xml already told the caller
+// which R-file is which statement) — but the page has many small auxiliary
+// tables (verified live: 51 <table> elements on GFR's R3.htm, mostly
+// tiny/formatting), so this picks the first one that's substantial enough
+// to plausibly be the real statement (more than a few rows) rather than
+// just grabbing the literal first <table>.
+function extractFromRFile($, targetEndYear, aliasMap) {
+  const tables = $('table').toArray();
+  for (const table of tables) {
+    if ($(table).find('tr').length < 5) continue;
+    const result = extractFromTable($, table, targetEndYear, aliasMap);
+    if (result) return result;
   }
   return null;
 }
@@ -364,6 +407,31 @@ async function fetchExhibitCandidates(cik, filing, userAgent) {
   return candidates;
 }
 
+// SEC's own manifest for an Inline XBRL filing — lists every auto-rendered
+// per-statement page (R2.htm, R3.htm, ...) with its real statement name.
+// Verified live: 404s cleanly for filings that aren't Inline XBRL-tagged
+// (STNG's press-release-style 6-Ks have no FilingSummary.xml at all), so
+// callers can try this first and fall back to the exhibit-scan path
+// without any special-casing. Simple regex extraction (not cheerio/XML-
+// mode) — the same lightweight-parsing choice already made for the 13F
+// info table in the sibling smart-money-pipeline repo, since the shape is
+// this consistent and SEC-generated.
+async function fetchFilingSummaryReports(cik, accessionNumber, userAgent) {
+  const accessionNoDashes = accessionNumber.replace(/-/g, '');
+  const url = `${SEC_ARCHIVES_BASE}/${Number(cik)}/${accessionNoDashes}/FilingSummary.xml`;
+  const xml = await fetchText(url, userAgent);
+  if (!xml) return [];
+  const reports = [];
+  const blocks = xml.match(/<Report[\s\S]*?<\/Report>/gi) || [];
+  for (const block of blocks) {
+    const htmlFileName = block.match(/<HtmlFileName>([^<]+)<\/HtmlFileName>/i)?.[1]?.trim();
+    const shortName = block.match(/<ShortName>([^<]+)<\/ShortName>/i)?.[1]?.trim();
+    const longName = block.match(/<LongName>([^<]+)<\/LongName>/i)?.[1]?.trim();
+    if (htmlFileName && (shortName || longName)) reports.push({ htmlFileName, shortName: shortName || '', longName: longName || '' });
+  }
+  return reports;
+}
+
 /**
  * Extracts standalone-quarter facts for `neededConcepts` (subset of
  * ['revenue','netIncome','ocf','capex']) by scanning a ticker's recent 6-K
@@ -399,7 +467,70 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // during the staged manual rollout (see the plan's "Rollout" section).
   const debug = !!process.env.DEBUG_FILING_EXTRACT;
 
+  // Records an extraction result into `collected`, shared by both the
+  // R-file path and the exhibit-scan path below.
+  function recordExtracted(extracted, filingDate) {
+    if (!extracted) return;
+    const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
+    if (!endIso) return;
+    const startIso = subtractThreeMonths(endIso);
+    for (const [concept, fact] of Object.entries(extracted.facts)) {
+      if (!collected[concept].has(endIso)) {
+        collected[concept].set(endIso, { start: startIso, end: endIso, val: fact.value3mo, valueCumulative: fact.valueCumulative, filed: filingDate });
+      }
+    }
+  }
+
   for (const filing of filings) {
+    // FilingSummary.xml path first — SEC's own manifest for Inline XBRL
+    // filings, pointing directly at the exact page for each statement
+    // (verified live: GreenFire Resources/GFR's R3.htm is authoritatively
+    // named "...Statements of Comprehensive Income..." in this manifest).
+    // Far cheaper and more targeted than the exhibit-scan below (1 manifest
+    // fetch + only the 1-2 R-files that actually match, vs. blindly
+    // fetching up to 6 large documents per filing) — tried first, and
+    // skips the exhibit-scan entirely for this filing when it succeeds.
+    // 404s cleanly (empty array) for non-Inline-XBRL filers (verified live
+    // for STNG), so this never interferes with the existing path.
+    let usedFilingSummary = false;
+    try {
+      const reports = await fetchFilingSummaryReports(cik, filing.accessionNumber, userAgent);
+      await sleep(150);
+      if (reports.length) {
+        const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
+        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome }).filter(([, v]) => v));
+        const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+        const matches = [
+          ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases })) : []),
+          ...(Object.keys(cashflowAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.cashflow.test(rep.shortName) || STATEMENT_HEADINGS.cashflow.test(rep.longName)).map((rep) => ({ rep, aliases: cashflowAliases })) : []),
+        ];
+        if (matches.length) usedFilingSummary = true;
+        for (const { rep, aliases } of matches) {
+          const accessionNoDashes = filing.accessionNumber.replace(/-/g, '');
+          const rUrl = `${SEC_ARCHIVES_BASE}/${Number(cik)}/${accessionNoDashes}/${rep.htmlFileName}`;
+          const html = await fetchText(rUrl, userAgent);
+          await sleep(150);
+          if (debug) console.error('DEBUG R-file', rUrl, rep.shortName || rep.longName);
+          if (!html) continue;
+          const $ = cheerio.load(html);
+          for (const year of candidateYears) {
+            let extracted;
+            try {
+              extracted = extractFromRFile($, year, aliases);
+            } catch (e) {
+              if (debug) console.error('DEBUG extractFromRFile threw', rUrl, year, e.message);
+              continue;
+            }
+            if (debug) console.error('DEBUG extractFromRFile result', rUrl, year, JSON.stringify(extracted));
+            recordExtracted(extracted, filing.filingDate);
+          }
+        }
+      }
+    } catch (e) {
+      if (debug) console.error('DEBUG fetchFilingSummaryReports threw', filing.accessionNumber, e.message);
+    }
+    if (usedFilingSummary) continue;
+
     let exhibitUrls;
     try {
       exhibitUrls = await fetchExhibitCandidates(cik, filing, userAgent);
@@ -447,21 +578,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
             continue;
           }
           if (debug) console.error('DEBUG extractStatement result', url, year, JSON.stringify(extracted));
-          if (!extracted) continue;
-          const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
-          if (!endIso) continue;
-          const startIso = subtractThreeMonths(endIso);
-          for (const [concept, fact] of Object.entries(extracted.facts)) {
-            if (!collected[concept].has(endIso)) {
-              collected[concept].set(endIso, {
-                start: startIso,
-                end: endIso,
-                val: fact.value3mo,
-                valueCumulative: fact.valueCumulative,
-                filed: filing.filingDate,
-              });
-            }
-          }
+          recordExtracted(extracted, filing.filingDate);
         }
       }
     }
