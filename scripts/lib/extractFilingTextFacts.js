@@ -233,6 +233,23 @@ function parseBareMonthDayCell(text) {
   return m ? `${m[1]} ${m[2]}` : null;
 }
 
+const MONTH_ABBR_INDEX = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+// "Jan. 1 - Mar. 31, 2026" -> 3 (a whole-quarter span). Buckets the actual
+// day gap between the two dates to the nearest of 3/6/9 months rather than
+// assuming a fiscal-quarter-aligned start, with the same generous tolerance
+// used everywhere else in this file for date-ish matching.
+function monthSpanToQuarterMonths(startMonth, startDay, endMonth, endDay, year) {
+  const si = MONTH_ABBR_INDEX[startMonth.slice(0, 3).toLowerCase()];
+  const ei = MONTH_ABBR_INDEX[endMonth.slice(0, 3).toLowerCase()];
+  if (si == null || ei == null) return null;
+  const days = (Date.UTC(Number(year), ei, Number(endDay)) - Date.UTC(Number(year), si, Number(startDay))) / (1000 * 60 * 60 * 24);
+  if (Math.abs(days - 90) <= 10) return 3;
+  if (Math.abs(days - 181) <= 10) return 6;
+  if (Math.abs(days - 273) <= 10) return 9;
+  return null;
+}
+
 function parseTableColumns($, table) {
   const rows = $(table).find('tr').toArray();
   let periodPhrases = null;
@@ -292,6 +309,25 @@ function parseTableColumns($, table) {
         .filter(Boolean);
       if (fullDateCells.length >= 1) {
         return { columns: fullDateCells, dataStartRowIdx: i + 1 };
+      }
+    }
+
+    // A SEVENTH header shape, verified live: CMBT states each column as an
+    // explicit date RANGE rather than a "months ended" phrase at all -
+    // "Jan. 1 - Mar. 31, 2026" / "Jan. 1 - Mar. 31, 2025" - fully self-
+    // contained per cell, with a separate bare-year row above it that's
+    // purely decorative (the year already lives inside the range itself).
+    if (!periodPhrases) {
+      const dateRangeCells = cells
+        .map((c) => {
+          const m = c.text.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*-\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})$/);
+          if (!m) return null;
+          const months = monthSpanToQuarterMonths(m[1], m[2], m[3], m[4], m[5]);
+          return months ? { months, endMonthDay: `${m[3]} ${m[4]}`, year: m[5] } : null;
+        })
+        .filter(Boolean);
+      if (dateRangeCells.length >= 1) {
+        return { columns: dateRangeCells, dataStartRowIdx: i + 1 };
       }
     }
 
