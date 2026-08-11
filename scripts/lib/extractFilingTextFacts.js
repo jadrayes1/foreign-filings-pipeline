@@ -223,9 +223,25 @@ function parseDateHeaderCell(text) {
 // the period phrases evenly across the date cells in order — holds across
 // every real format seen so far (2 period phrases x 2 years each = 4 date
 // cells, in "3mo-2026, 3mo-2025, 6mo-2026, 6mo-2025" order every time).
+function parseBareMonthDayCell(text) {
+  const m = text.trim().match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?$/);
+  return m ? `${m[1]} ${m[2]}` : null;
+}
+
 function parseTableColumns($, table) {
   const rows = $(table).find('tr').toArray();
   let periodPhrases = null;
+  // A FOURTH header shape, verified live: Eldorado Gold (EGO) splits the
+  // date across its OWN separate row - a bare "June 30," with no year at
+  // all - sitting between the period-length row ("Three months ended")
+  // and a further row with just bare years ("2026 2025 2026 2025").
+  // Neither existing shape captures this (parseDateHeaderCell's compound
+  // match requires the year in the SAME cell as the month/day; a bare
+  // year cell alone carries no month/day of its own). Captured here, one
+  // entry per PERIOD PHRASE (mirroring how `phrase.endMonthDay` already
+  // pairs 1:1 with periodPhrases, not with the later, more numerous date
+  // cells), and merged in below once the bare-year row is reached.
+  let pendingMonthDays = null;
   for (let i = 0; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
 
@@ -251,6 +267,29 @@ function parseTableColumns($, table) {
       }
     }
 
+    // A SIXTH header shape, verified live: Eldorado Gold's (EGO) own Q1
+    // filing has no comparative 6mo column at all (nothing to compare a
+    // first quarter against yet — same reasoning as the BCE case just
+    // above), and rather than splitting period/date/year across separate
+    // cells or rows, each column is fully self-contained in ONE cell:
+    // "Three months ended March 31, 2026". Checked before the
+    // "months? ended" phrase-only match just below, which would otherwise
+    // partially match this same text and treat it as a period-phrase-only
+    // row with no year anywhere to combine it with.
+    if (!periodPhrases) {
+      const fullDateCells = cells
+        .map((c) => {
+          const m = c.text.match(/^(three|six|nine)\s+months?\s+ended\s+([A-Za-z]+\s+\d{1,2}),?\s*((?:19|20)\d{2})$/i);
+          if (!m) return null;
+          const months = { three: 3, six: 6, nine: 9 }[m[1].toLowerCase()];
+          return { months, endMonthDay: m[2], year: m[3] };
+        })
+        .filter(Boolean);
+      if (fullDateCells.length >= 1) {
+        return { columns: fullDateCells, dataStartRowIdx: i + 1 };
+      }
+    }
+
     if (!periodPhrases) {
       const phraseCells = cells.filter((c) => /months? ended/i.test(c.text));
       if (phraseCells.length) {
@@ -259,13 +298,22 @@ function parseTableColumns($, table) {
       }
       continue;
     }
+    if (!pendingMonthDays) {
+      const monthDayCells = cells.map((c) => parseBareMonthDayCell(c.text)).filter(Boolean);
+      if (monthDayCells.length === periodPhrases.length) {
+        pendingMonthDays = monthDayCells;
+        continue;
+      }
+    }
+
     const dateCells = cells.map((c) => parseDateHeaderCell(c.text)).filter(Boolean);
     if (dateCells.length >= 2) {
       if (dateCells.length % periodPhrases.length !== 0) continue; // malformed — try a later row rather than guess
       const yearsPerPeriod = dateCells.length / periodPhrases.length;
       const columns = dateCells.map((date, idx) => {
         const phrase = periodPhrases[Math.floor(idx / yearsPerPeriod)];
-        const endMonthDay = date.monthDay || phrase.endMonthDay;
+        const pendingMonthDay = pendingMonthDays ? pendingMonthDays[Math.floor(idx / yearsPerPeriod)] : null;
+        const endMonthDay = date.monthDay || pendingMonthDay || phrase.endMonthDay;
         return endMonthDay ? { months: phrase.months, endMonthDay, year: date.year } : null;
       });
       if (columns.some((c) => !c)) continue; // neither row carries a date for some column — bail on this row, try the next
@@ -346,17 +394,26 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
     if (!row) continue;
     for (const concept of Object.keys(aliasMap)) {
       if (!matchesConcept(row.label, concept)) continue;
-      if (results[concept]) {
-        // Ambiguous — a second line in the same statement also matches this
-        // concept's alias. Never guess which is right; drop the concept
-        // for this filing entirely.
+      const value3mo = row.values[targetIdx3mo];
+      const valueCumulative = cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null;
+      const existing = results[concept];
+      if (existing === 'AMBIGUOUS') continue; // already a confirmed genuine conflict - a further match can't un-conflict it
+      if (existing) {
+        // A second matching row is only a genuine conflict if its value
+        // actually DIFFERS from the first match — verified live: Eldorado
+        // Gold (EGO) repeats "Net earnings for the period" verbatim, once
+        // as the statement's own subtotal and again after the
+        // shareholders/non-controlling-interest attribution breakdown,
+        // both carrying the IDENTICAL real figure. Treating any second
+        // label match as automatically ambiguous was silently dropping a
+        // large share of real, unambiguous matches whenever a filer's
+        // presentation repeats a subtotal this way (a common pattern, not
+        // specific to EGO).
+        if (existing.value3mo === value3mo) continue; // same real number restated elsewhere in the statement - not a conflict
         results[concept] = 'AMBIGUOUS';
         continue;
       }
-      results[concept] = {
-        value3mo: row.values[targetIdx3mo],
-        valueCumulative: cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null,
-      };
+      results[concept] = { value3mo, valueCumulative };
     }
   }
   for (const key of Object.keys(results)) {
