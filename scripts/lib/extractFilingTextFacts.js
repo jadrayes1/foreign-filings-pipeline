@@ -391,7 +391,7 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
   const cumulativeIdx = columns.findIndex((c) => c.months > 3 && c.year === targetEndYear);
 
   const rows = $(table).find('tr').toArray();
-  const results = {};
+  const candidates = {}; // concept -> [{label, value3mo, valueCumulative}]
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
@@ -401,28 +401,55 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
       if (!matchesConcept(row.label, concept)) continue;
       const value3mo = row.values[targetIdx3mo];
       const valueCumulative = cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null;
-      const existing = results[concept];
-      if (existing === 'AMBIGUOUS') continue; // already a confirmed genuine conflict - a further match can't un-conflict it
-      if (existing) {
-        // A second matching row is only a genuine conflict if its value
-        // actually DIFFERS from the first match — verified live: Eldorado
-        // Gold (EGO) repeats "Net earnings for the period" verbatim, once
-        // as the statement's own subtotal and again after the
-        // shareholders/non-controlling-interest attribution breakdown,
-        // both carrying the IDENTICAL real figure. Treating any second
-        // label match as automatically ambiguous was silently dropping a
-        // large share of real, unambiguous matches whenever a filer's
-        // presentation repeats a subtotal this way (a common pattern, not
-        // specific to EGO).
-        if (existing.value3mo === value3mo) continue; // same real number restated elsewhere in the statement - not a conflict
-        results[concept] = 'AMBIGUOUS';
-        continue;
-      }
-      results[concept] = { value3mo, valueCumulative };
+      (candidates[concept] = candidates[concept] || []).push({ label: row.label, value3mo, valueCumulative });
     }
   }
-  for (const key of Object.keys(results)) {
-    if (results[key] === 'AMBIGUOUS') delete results[key];
+
+  const results = {};
+  for (const [concept, list] of Object.entries(candidates)) {
+    // A repeat match is only a genuine conflict if its value actually
+    // DIFFERS from an earlier one — verified live: Eldorado Gold (EGO)
+    // repeats "Net earnings for the period" verbatim, once as the
+    // statement's own subtotal and again after the shareholders/non-
+    // controlling-interest attribution breakdown, both carrying the
+    // IDENTICAL real figure. Treating any second label match as
+    // automatically ambiguous was silently dropping a large share of real,
+    // unambiguous matches whenever a filer's presentation repeats a
+    // subtotal this way (a common pattern, not specific to EGO).
+    const distinct = [];
+    for (const c of list) if (!distinct.some((d) => d.value3mo === c.value3mo)) distinct.push(c);
+    if (distinct.length === 1) {
+      results[concept] = distinct[0];
+      continue;
+    }
+    // Multiple genuinely different values for the same concept — verified
+    // live: DEFT breaks revenue into several real sub-lines ("Other
+    // revenue", "Revenues excluding realized and net change in unrealized
+    // gains (losses)", "Revenues from realized and net change in
+    // unrealized gains (losses)") that all match the broad revenue keyword
+    // alongside the statement's own "Total revenues" line — a universal
+    // accounting-statement convention (sub-items roll up into one "Total"
+    // row). When exactly one candidate is unambiguously a total line,
+    // prefer it over the sub-items rather than dropping the concept
+    // entirely.
+    const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
+    if (totalMatches.length === 1) { results[concept] = totalMatches[0]; continue; }
+    // Still tied — for netIncome specifically, DEFT also discloses a
+    // separate "Net income for the period after taxes" alongside "Net
+    // income and comprehensive income for the period" (the latter folds in
+    // OCI items like currency translation, a genuinely different figure).
+    // A PREFERENCE, not an exclude: GreenFire Resources (GFR) has no
+    // separate net-income line at all — its only bottom-line total is
+    // literally named "Net income (loss) and comprehensive income (loss)"
+    // — so this only narrows the set when a non-comprehensive alternative
+    // actually exists; GFR's single-candidate case never reaches this
+    // branch at all (already returned above).
+    if (concept === 'netIncome') {
+      const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
+      if (nonComprehensive.length === 1) results[concept] = nonComprehensive[0];
+    }
+    // Any other shape (0 or 2+ candidates after every tiebreak) stays
+    // genuinely ambiguous and is dropped, same as before.
   }
   return Object.keys(results).length ? { period: targetPeriod, facts: results } : null;
 }
