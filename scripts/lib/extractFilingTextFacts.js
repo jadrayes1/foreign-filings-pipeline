@@ -55,8 +55,13 @@ const RECONCILE_TOLERANCE = 0.02; // 2%
 // "Consolidated" and "Statements" and broke the old rigid adjacency
 // requirement. Words BEFORE "Consolidated" (e.g. GFR's "Condensed Interim
 // Consolidated...") already matched fine since the regex isn't anchored.
+// "Statements of Profit or Loss (and Other Comprehensive Income/Loss)" —
+// verified live: GDTC and FGL (both IFRS filers) title their real income
+// statement this way, a standard IFRS convention distinct from the
+// US-GAAP-style "Statement of Operations/Income/Earnings" phrasings below.
+// Neither company's income statement was found at all without this.
 const STATEMENT_HEADINGS = {
-  income: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?)/i,
+  income: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
   cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS? OF CASH ?FLOWS/i,
 };
 
@@ -438,9 +443,15 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
   // and use the first one that actually yields a parseable table, rather
   // than assuming the first match is the real statement.
   for (const headingIdx of headingIdxs) {
+    // The table immediately after a real heading is sometimes a formatting/
+    // spacer table, not the actual statement — verified live: GDTC's real
+    // "Statements of Cash Flows" heading is followed by a genuine 1-row
+    // spacer table before the real (40+ row) data table further down. Skip
+    // trivial tables and keep scanning, same guard extractFromRFile already
+    // uses for its own (much noisier) per-page table search.
     let table = null;
     for (let i = headingIdx; i < allEls.length; i++) {
-      if (allEls[i].tagName === 'table') {
+      if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5) {
         table = allEls[i];
         break;
       }
