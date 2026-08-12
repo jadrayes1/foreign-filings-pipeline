@@ -62,13 +62,19 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    # Bumped from 120 after enabling ENABLE_FILING_TEXT_FALLBACK above for
-    # every gap ticker (not a curated allowlist) - verified live this run
-    # takes meaningfully longer than the pre-fallback ~40min baseline, since
-    # the fallback does a real, much heavier SEC scan per ticker (up to
-    # 25+ filings, cross-filing corroboration checks) across the full
-    # ~250+ ticker foreign-filer gap population.
-    timeout-minutes: 180
+    # Bumped from 120, then from 180 - verified live: with
+    # ENABLE_FILING_TEXT_FALLBACK on for every gap ticker (not a curated
+    # allowlist), a real run (31626078351) only reached 2050/5070 tickers
+    # (40%) in the full 120 minutes before being cancelled, since main()
+    # checks every ticker in the covered universe for genuine IFRS status
+    # first, and the fallback does a real, much heavier SEC scan (up to
+    # 25+ filings, cross-filing corroboration checks) for each one that
+    # qualifies. Pace wasn't linear (later batches sped up as more non-
+    # foreign-filers got quickly skipped), but a conservative extrapolation
+    # from the observed average put a full run around ~5 hours - set just
+    # under GitHub Actions' own 360-minute hard cap for a single job on
+    # standard runners, which this can't exceed regardless.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
