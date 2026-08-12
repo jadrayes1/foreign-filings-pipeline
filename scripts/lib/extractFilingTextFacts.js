@@ -111,7 +111,15 @@ const MAX_HEADING_TEXT_LENGTH = 200;
 const LABEL_ALIASES = {
   revenue: {
     include: /revenues?\b|\bsales\b/i,
-    exclude: /cost of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance/i,
+    // "gain on" excluded - verified live: STNG (a tanker company) has a
+    // real income-statement line "Gain on sales of vessels" (an asset-
+    // disposal gain, unrelated to operating revenue) that matched the
+    // broad \bsales\b keyword and conflicted with the real "Vessel
+    // revenue" line's different value, dropping revenue entirely via the
+    // AMBIGUOUS guard. Any company that periodically disposes of assets
+    // (ships, mines, real estate, equipment) can have this exact same
+    // "Gain on sale(s) of X" phrasing - not specific to STNG.
+    exclude: /cost of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on/i,
   },
   netIncome: {
     include: /net (income|earnings|loss)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b/i,
