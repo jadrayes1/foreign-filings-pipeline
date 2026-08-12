@@ -50,6 +50,7 @@
 const fs = require('fs');
 const path = require('path');
 const { extractQuarterlyFactsFromFilings } = require('./lib/extractFilingTextFacts');
+const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilingsCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
@@ -719,6 +720,51 @@ async function processTicker(symbol, cik, isBank) {
         if (filingTextFacts.capex?.length) {
           capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
         }
+      }
+    }
+  }
+
+  // Last-resort standalone-quarter fallback via the BusinessQuant
+  // fundamentals API — only for concepts STILL empty after both SEC XBRL
+  // AND the 6-K filing-text fallback above (re-checked here since either
+  // could have already filled a concept in). See lib/businessQuantFallback.js
+  // for the full design rationale and the live cross-validation against EGO
+  // this was built from (revenue/netIncome/ocf/capex all matched our own
+  // independently-extracted values exactly for well-covered quarters; older
+  // netIncome quarters for the same ticker were found to have real data-
+  // quality problems on BusinessQuant's own side and were correctly rejected
+  // by the same annual-reconciliation gate, not a false negative in our code).
+  if (process.env.ENABLE_BUSINESSQUANT_FALLBACK && process.env.BUSINESSQUANT_API_KEY) {
+    const allowlist = process.env.FILING_TEXT_FALLBACK_TICKERS
+      ? new Set(process.env.FILING_TEXT_FALLBACK_TICKERS.split(',').map((s) => s.trim().toUpperCase()))
+      : null;
+    if (!allowlist || allowlist.has(symbol.toUpperCase())) {
+      const stillNeeded = [];
+      if (!revenue.quarterly.length && revenue.annual.length) stillNeeded.push('revenue');
+      if (!netIncome.quarterly.length && netIncome.annual.length) stillNeeded.push('netIncome');
+      if (!ocf.quarterly.length && ocf.annual.length) stillNeeded.push('ocf');
+      if (!capex.quarterly.length && capex.annual.length) stillNeeded.push('capex');
+
+      if (stillNeeded.length) {
+        const annualByEnd = {
+          revenue: new Map(revenue.annual.map((a) => [a.end, a])),
+          netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
+          ocf: new Map(ocf.annual.map((a) => [a.end, a])),
+          capex: new Map(capex.annual.map((a) => [a.end, a])),
+        };
+        let bqFacts = {};
+        try {
+          bqFacts = await fetchBusinessQuantFacts(symbol, stillNeeded, annualByEnd, process.env.BUSINESSQUANT_API_KEY);
+        } catch (err) {
+          console.warn(`  BusinessQuant fallback failed for ${symbol}: ${err.message}`);
+        }
+        if (bqFacts.revenue?.length) revenue = dedupeAndClassify([...revenueRaw, ...bqFacts.revenue]);
+        if (bqFacts.netIncome?.length) netIncome = dedupeAndClassify([...netIncomeRaw, ...bqFacts.netIncome]);
+        if (bqFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...bqFacts.ocf]);
+        // BusinessQuant's own capex sign already matches XBRL's convention
+        // (negative = cash outflow) — verified live against EGO — no
+        // negation needed here, unlike the 6-K text fallback above.
+        if (bqFacts.capex?.length) capex = dedupeAndClassify([...capexRaw, ...bqFacts.capex]);
       }
     }
   }

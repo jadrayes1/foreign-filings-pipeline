@@ -26,6 +26,16 @@
 #      scoped to ONLY "gist").
 # No Finnhub or Twelve Data key needed — this pipeline only calls SEC's
 # free, keyless EDGAR API.
+#
+# Optional, NOT enabled in this scheduled run by default (same staged-
+# rollout precedent as ENABLE_FILING_TEXT_FALLBACK below): a last-resort
+# BusinessQuant fundamentals fallback (scripts/lib/businessQuantFallback.js)
+# for tickers/concepts still empty after both SEC XBRL and the 6-K filing-
+# text fallback. To try it on a manual workflow_dispatch run, add a
+# BUSINESSQUANT_API_KEY repository secret and set ENABLE_BUSINESSQUANT_FALLBACK=1
+# (and optionally FILING_TEXT_FALLBACK_TICKERS to a comma-separated allowlist,
+# shared with the filing-text fallback's own allowlist) as env vars on the
+# "Generate foreign filings cache" step.
 
 name: Generate foreign filings cache
 

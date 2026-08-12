@@ -38,7 +38,25 @@ const cheerio = require('cheerio');
 
 const SEC_SUBMISSIONS_BASE = 'https://data.sec.gov/submissions';
 const SEC_ARCHIVES_BASE = 'https://www.sec.gov/Archives/edgar/data';
-const MAX_FILINGS_TO_SCAN = 25; // ~2 years of quarters
+const MAX_FILINGS_TO_SCAN = 25; // ~2 years of quarters for a normal quarterly filer
+// High-frequency filers (DEFT, CMBT and others verified live: 90+ 6-Ks/year,
+// mostly routine press releases/NAV updates) blow through MAX_FILINGS_TO_SCAN
+// within a few months when just taking the N most recent 6-Ks regardless of
+// size - the prior-year comparative filing (needed for cross-filing
+// corroboration, see Check C below) falls completely outside the window.
+// submissions.json already carries each filing's total byte size for free
+// (no extra fetch) - a real earnings-release 6-K is verified live to be
+// well above a routine one's size, though the exact gap varies by filer
+// (DEFT's real Q1 2026 exhibit-bearing filing: 2,578,754 bytes vs.
+// 27,019-47,261 bytes for its routine filings the same month; CMBT's real
+// Q1 2026 filing: 409,230 bytes vs. a 149,098-byte routine-filing ceiling)
+// - so filtering by size before counting against MAX_FILINGS_TO_SCAN lets
+// the same fetch budget reach much further back in time by skipping the
+// routine noise entirely. Set comfortably below the smaller real filer
+// (CMBT) while still well above every filer's routine-filing ceiling seen
+// so far.
+const MIN_SUBSTANTIVE_FILING_BYTES = 200000;
+const FILING_LOOKBACK_ENTRIES = 400; // how far into submissions.json's 'recent' list to look for size-qualifying candidates
 const MIN_EXHIBIT_BYTES = 20000; // cover-page heuristic — verified live: STNG's 6-K cover page was 11,450 bytes, its real earnings exhibit 733,171 bytes
 const RECONCILE_TOLERANCE = 0.02; // 2%
 
@@ -630,13 +648,26 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
 
   const r = submissions.filings.recent;
   const filings = [];
-  for (let i = 0; i < r.form.length && filings.length < MAX_FILINGS_TO_SCAN; i++) {
-    if (r.form[i] === '6-K') {
+  for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN; i++) {
+    const size = r.size?.[i];
+    if (r.form[i] === '6-K' && (size == null || size >= MIN_SUBSTANTIVE_FILING_BYTES)) {
       filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
     }
   }
 
-  // concept -> Map(end -> {value3mo, valueCumulative, start, filed})
+  // concept -> Map(end -> Array<{val, valueCumulative, start, filed, accessionNumber}>)
+  // An array, not a single overwrite-once slot — verified live this matters:
+  // many foreign filers (DEFT, CMBT, and likely most of this bucket) only
+  // ever disclose ONE standalone quarter per fiscal year, with no same-
+  // document cumulative column at all, so neither of reconcilePoints' two
+  // existing checks (adjacent-quarter-vs-cumulative, or 2+-quarters-vs-
+  // annual) can ever verify them - not a parsing gap, a structural
+  // reconciliation-coverage gap. Keeping every independent filing's own
+  // value for the same real period (instead of discarding repeats) enables
+  // a third, arithmetic-free check: the SAME quarter's value disclosed
+  // identically in the filing that reports it AND, a year later, in the
+  // filing that shows it as the prior-year comparative column - literal
+  // agreement between two independent real documents.
   const collected = { revenue: new Map(), netIncome: new Map(), ocf: new Map(), capex: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
@@ -647,16 +678,21 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   const debug = !!process.env.DEBUG_FILING_EXTRACT;
 
   // Records an extraction result into `collected`, shared by both the
-  // R-file path and the exhibit-scan path below.
-  function recordExtracted(extracted, filingDate) {
+  // R-file path and the exhibit-scan path below. `filings` array is built
+  // from `r.form[i] === '6-K'` exactly (never '6-K/A'), so any two entries
+  // here are genuinely independent original filings, not a filing and its
+  // own amendment.
+  function recordExtracted(extracted, filing) {
     if (!extracted) return;
     const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
     if (!endIso) return;
     const startIso = subtractThreeMonths(endIso);
     for (const [concept, fact] of Object.entries(extracted.facts)) {
-      if (!collected[concept].has(endIso)) {
-        collected[concept].set(endIso, { start: startIso, end: endIso, val: fact.value3mo, valueCumulative: fact.valueCumulative, filed: filingDate });
+      const list = collected[concept].get(endIso) || [];
+      if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
+        list.push({ start: startIso, end: endIso, val: fact.value3mo, valueCumulative: fact.valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
       }
+      collected[concept].set(endIso, list);
     }
   }
 
@@ -701,7 +737,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
               continue;
             }
             if (debug) console.error('DEBUG extractFromRFile result', rUrl, year, JSON.stringify(extracted));
-            recordExtracted(extracted, filing.filingDate);
+            recordExtracted(extracted, filing);
           }
         }
       }
@@ -757,7 +793,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
             continue;
           }
           if (debug) console.error('DEBUG extractStatement result', url, year, JSON.stringify(extracted));
-          recordExtracted(extracted, filing.filingDate);
+          recordExtracted(extracted, filing);
         }
       }
     }
@@ -781,7 +817,27 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // not just an order-insensitive sum.
   const result = {};
   for (const concept of neededConcepts) {
-    const points = Array.from(collected[concept]?.values() || []).sort((a, b) => new Date(a.end) - new Date(b.end));
+    const grouped = collected[concept] || new Map();
+    const points = [];
+    for (const list of grouped.values()) {
+      if (!list.length) continue;
+      // Group this end-date's occurrences (one per independent filing) by
+      // their disclosed value, and pick the value with the most independent
+      // corroborations (ties broken by most-recently-filed) as the
+      // representative point — feeds Check C below.
+      const byValue = new Map();
+      for (const l of list) {
+        if (!byValue.has(l.val)) byValue.set(l.val, []);
+        byValue.get(l.val).push(l);
+      }
+      let best = null;
+      for (const occurrences of byValue.values()) {
+        if (!best || occurrences.length > best.length) best = occurrences;
+      }
+      const rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+      points.push({ ...rep, corroborations: new Set(best.map((o) => o.accessionNumber)).size });
+    }
+    points.sort((a, b) => new Date(a.end) - new Date(b.end));
     if (!points.length) continue;
     const verified = reconcilePoints(points, annualByEnd?.[concept] || new Map());
     if (verified.length) {
@@ -799,16 +855,45 @@ function isAdjacentDate(dateA, dateB) {
 function reconcilePoints(points, annualByEnd) {
   const verified = new Set();
 
-  // Check A — consecutive pair vs. this point's own disclosed cumulative.
+  // Check C — cross-filing corroboration: the SAME real value for this
+  // exact period was independently disclosed in 2+ separate 6-K filings
+  // (e.g. as this year's own current-quarter figure, and again a year
+  // later as the prior-year comparative column). No arithmetic assumption
+  // at all — just literal agreement between independent real documents.
+  // Verified live this is necessary, not just nice-to-have: DEFT and CMBT
+  // (and most of this bucket) only ever disclose ONE standalone quarter per
+  // fiscal year with no same-document cumulative column, so Check A (needs
+  // a cumulative column) and Check B (needs 2+ quarters in the SAME fiscal
+  // year) can never verify them, no matter how correct the extraction is.
+  for (const p of points) if (p.corroborations >= 2) verified.add(p);
+
+  // Check A — this point's own disclosed cumulative vs. the sum of
+  // consecutive real quarters within the same fiscal year up to and
+  // including this point. Walks back as many adjacent quarters as are
+  // actually collected (not hardcoded to exactly one prior quarter) —
+  // verified live: ALM's "three months ended Sept 30" column discloses a
+  // NINE-month YTD cumulative (Jan-Sep), not a six-month one, so it only
+  // reconciles against Q1+Q2+Q3 summed, not just the immediately-preceding
+  // quarter. A filer whose cumulative column is a genuine six-month figure
+  // still resolves in one step (chain length 2), unchanged from before.
   for (const p of points) {
     if (p.valueCumulative == null) continue;
-    const prior = points.find((q) => q !== p && isAdjacentDate(q.end, p.start));
-    if (!prior || !p.valueCumulative) continue;
-    const sum = prior.val + p.val;
-    const diff = Math.abs(sum - p.valueCumulative) / Math.abs(p.valueCumulative);
-    if (diff <= RECONCILE_TOLERANCE) {
-      verified.add(p);
-      verified.add(prior);
+    const chain = [p];
+    let cursor = p;
+    for (;;) {
+      const prior = points.find((q) => !chain.includes(q) && isAdjacentDate(q.end, cursor.start));
+      if (!prior) break;
+      chain.push(prior);
+      cursor = prior;
+    }
+    for (let take = 2; take <= chain.length; take++) {
+      const subset = chain.slice(0, take);
+      const sum = subset.reduce((s, x) => s + x.val, 0);
+      const diff = Math.abs(sum - p.valueCumulative) / Math.abs(p.valueCumulative);
+      if (diff <= RECONCILE_TOLERANCE) {
+        subset.forEach((x) => verified.add(x));
+        break;
+      }
     }
   }
 
@@ -823,7 +908,19 @@ function reconcilePoints(points, annualByEnd) {
     for (const annual of annualByEnd.values()) {
       if (!annual.value) continue;
       const fyEndYear = annual.end.slice(0, 4);
-      const candidates = (byYear.get(fyEndYear) || []).filter((p) => p.end <= annual.end && p.start >= annual.start);
+      // p.start is a SYNTHETIC approximation (subtractThreeMonths from the
+      // real disclosed end date), not itself a disclosed fact - verified
+      // live this matters: a Q1 quarter ending March 31 synthesizes a start
+      // of December 31 (calendar-month subtraction, correct arithmetic),
+      // exactly one day before a real annual fact's clean January 1 start.
+      // An exact p.start >= annual.start comparison wrongly excluded a real
+      // Q1 quarter from its own fiscal year's reconciliation candidates
+      // over that single day. A small tolerance ONLY on the lower bound
+      // (not a full adjacency match, which would also wrongly constrain
+      // Q2/Q3/Q4's much-later starts) fixes this while still requiring
+      // every candidate to fall within the fiscal year.
+      const startToleranceMs = 5 * 24 * 60 * 60 * 1000;
+      const candidates = (byYear.get(fyEndYear) || []).filter((p) => p.end <= annual.end && new Date(p.start).getTime() >= new Date(annual.start).getTime() - startToleranceMs);
       if (candidates.length < 2) continue; // too little to meaningfully reconcile
       const sum = candidates.reduce((s, p) => s + p.val, 0);
       const diff = Math.abs(sum - annual.value) / Math.abs(annual.value);
