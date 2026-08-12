@@ -34,7 +34,14 @@ const { subtractThreeMonths, reconcilePoints } = require('./extractFilingTextFac
 
 const BQ_BASE = 'https://data.businessquant.com/statements';
 const FETCH_TIMEOUT_MS = 30000;
-const REQUEST_SLEEP_MS = 300; // polite pacing against the free-tier rate limit (verified live: hit a RATE_LIMIT warning on a different Massive-hosted API under rapid-fire calls this session)
+// BusinessQuant's free tier is rate-limited to 50 requests/minute (per the
+// docs) - 60000/50 = 1200ms is the bare minimum spacing to never exceed
+// that; padded to 1300ms for safety margin. Applied AFTER every request
+// (including the last one in a ticker's loop), so this also guarantees a
+// minimum gap between the last request for one ticker and the first
+// request for the next, regardless of how fast/slow the caller's own
+// per-ticker work is.
+const REQUEST_SLEEP_MS = 1300;
 
 // One statement + section name per concept - verified live against EGO's
 // real IS/CF statements. "Revenue (Quarter)" is a broad match (a company
