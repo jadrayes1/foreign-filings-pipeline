@@ -1,0 +1,55 @@
+# Periodic (weekly), classification-only pass across the full ~5,070-ticker
+# universe — publishes foreignFilerList.json, which generate-foreign-filings-
+# cache.yml's DAILY run then reads directly instead of re-deriving the same
+# list from a full classification scan every single day. See
+# scripts/discoverForeignFilers.js for the full rationale (why this is a
+# separate periodic job rather than folded into the daily run, and why a
+# cached/heuristic candidate list isn't the same risk as this real,
+# periodically-refreshed check).
+#
+# Estimated runtime ~25-40 minutes (measured from the classification-only
+# portion of a real generate-foreign-filings-cache.yml run this session) —
+# comfortably under the timeout below even with real margin.
+#
+# Scheduled well clear of every other job writing to the same Gist
+# (00:00 UTC main stock-metrics-pipeline run, ~12:00 UTC P/FCF trend cache,
+# 14:00 UTC daily foreign-filings-cache run, 16:00 UTC news cache) — Sundays
+# only, since the foreign-filer population changes slowly (new IPOs/
+# reclassifications are rare week to week).
+#
+# Same one-time secret setup as generate-foreign-filings-cache.yml
+# (GIST_ID, GIST_TOKEN) — no additional secrets needed.
+
+name: Discover foreign filers
+
+on:
+  schedule:
+    - cron: '0 10 * * 0'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Discover foreign filers
+        run: node scripts/discoverForeignFilers.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename foreignFilerList.json foreignFilerList.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add foreignFilerList.json

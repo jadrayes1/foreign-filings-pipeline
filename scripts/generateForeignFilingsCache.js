@@ -55,6 +55,11 @@ const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilingsCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
 const GIST_FOREIGN_FILINGS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/foreignFilingsCache.json';
+// Published weekly by the separate discoverForeignFilers.js job/workflow —
+// see that file's header for the full rationale. Read here so this DAILY
+// job skips straight to extraction for a known list instead of re-deriving
+// it from a full ~5,070-ticker classification scan every single day.
+const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/foreignFilerList.json';
 const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
 const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 // SEC's fair-use policy asks for a descriptive User-Agent identifying the
@@ -849,31 +854,39 @@ async function processTicker(symbol, cik, isBank) {
 }
 
 async function main() {
-  console.log('Fetching ticker universe from the published sector-metrics feed and SEC ticker->CIK map...');
-  const [metricsDataset, tickerToCik, previouslyPublished] = await Promise.all([
+  console.log('Fetching known foreign-filer list, sector-metrics feed, and SEC ticker->CIK map...');
+  const [foreignFilerList, metricsDataset, tickerToCik, previouslyPublished] = await Promise.all([
+    fetchJson(GIST_FOREIGN_FILER_LIST_URL).catch(() => null),
     fetchJson(GIST_METRICS_URL),
     fetchTickerToCikMap(),
     fetchPreviouslyPublished(),
   ]);
 
-  // The FULL covered universe, not just tickers with a null revenueGrowth/
-  // profitMargin card value — that used to be the candidate filter, but
-  // it's the wrong signal: a genuine IFRS filer whose Finnhub NATIVE data
-  // happens to be populated (verified live: Scorpio Tankers/STNG) would
-  // never get flagged as a "gap," permanently missing out on Quarterly/
-  // Yearly reconstruction even though it needs exactly the same SEC-based
-  // approach as BMO/IAG. processTicker's own ifrs-full check (see its
-  // comment) is what actually filters out the ~5,000 domestic tickers that
-  // don't belong here — cheap since SEC's API is free/unlimited, and it's
-  // the authoritative signal instead of a heuristic proxy.
-  const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol, data]) => ({ symbol, industry: data.industry }));
-
-  const withCik = candidates.map((c) => ({ ...c, cik: tickerToCik.get(c.symbol) })).filter((c) => c.cik);
-  console.log(
-    `${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK ` +
-      `(the rest are either genuinely too new, or not SEC-registered at all). Each is checked for real IFRS data ` +
-      `before any concept extraction — most will resolve quickly to "not a foreign filer, skip."`
-  );
+  let withCik;
+  if (foreignFilerList?.foreignFilers?.length) {
+    // Fast path: discoverForeignFilers.js (weekly) already did the
+    // authoritative ifrs-full check across the full universe and published
+    // the result — skip straight to extraction for that known list. This
+    // is what actually cut the daily run's time down; see that script's
+    // header for the full rationale, including why a STATIC/heuristic list
+    // was previously rejected (a genuine IFRS filer whose Finnhub NATIVE
+    // data happens to be populated, e.g. Scorpio Tankers/STNG, would never
+    // get flagged as a "gap") — this list isn't heuristic, it's the same
+    // real check, just run on a slower cadence than every day.
+    withCik = foreignFilerList.foreignFilers;
+    console.log(`Using the published foreign-filer list (generated ${foreignFilerList.generatedAt}): ${withCik.length} known foreign filers.`);
+  } else {
+    // Graceful bootstrap fallback — the discovery job hasn't published a
+    // list yet (first-ever run, or a transient fetch failure). Falls back
+    // to the original full-universe classification scan rather than
+    // failing outright; every candidate is still checked via
+    // processTicker's own authoritative ifrs-full gate below, so this is
+    // slower but never wrong.
+    console.log('No foreign-filer list available yet — falling back to a full-universe classification scan for this run.');
+    const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol, data]) => ({ symbol, industry: data.industry }));
+    withCik = candidates.map((c) => ({ ...c, cik: tickerToCik.get(c.symbol) })).filter((c) => c.cik);
+    console.log(`${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK.`);
+  }
 
   const trends = { ...previouslyPublished };
   let processed = 0;
