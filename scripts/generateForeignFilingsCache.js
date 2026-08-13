@@ -988,27 +988,55 @@ async function main() {
   let processed = 0;
   let resolved = 0;
 
-  for (const { symbol, cik, industry } of withCik) {
-    let fresh = null;
-    try {
-      fresh = await processTicker(symbol, cik, isFinancialIndustry(industry));
-    } catch (err) {
-      console.log(`  skip ${symbol}: ${err.message}`);
-    }
-    await sleep(REQUEST_SPACING_MS);
+  // Verified live: a full run can hit a rare Node/undici runtime bug
+  // (`assert(!this.paused)` in undici's H1 client, thrown from inside
+  // Node's own socket/parser event handling when a fetch is aborted right
+  // as its response is being read — undici issue, not this file's own
+  // logic) as an UNCAUGHT exception outside the try/catch below entirely,
+  // since it fires asynchronously from a callback the awaited
+  // processTicker() call has already returned from by the time it throws.
+  // A run that hit this after successfully processing 350/374 tickers over
+  // ~6.5 hours lost all of it, because `trends` only ever got written to
+  // disk ONCE, at the very end of the loop. globalStop lets the loop exit
+  // cleanly and still write/return whatever WAS collected instead of
+  // crashing the whole process — scoped narrowly (only set by this one
+  // handler, only checked here), so an ordinary per-ticker error (already
+  // handled by the try/catch immediately below) never trips it.
+  let globalStop = null;
+  const onUncaught = (err) => {
+    console.error(`  Uncaught exception mid-run (likely a transient Node/undici bug, not this script's own logic) — stopping further processing and writing what's collected so far: ${err.message}`);
+    globalStop = err;
+  };
+  process.on('uncaughtException', onUncaught);
 
-    const merged = pickCadenceTrendsToPublish(trends[symbol], fresh || {});
-    if (Object.keys(merged).length) {
-      trends[symbol] = merged;
-      resolved++;
-    }
+  try {
+    for (const { symbol, cik, industry } of withCik) {
+      if (globalStop) break;
+      let fresh = null;
+      try {
+        fresh = await processTicker(symbol, cik, isFinancialIndustry(industry));
+      } catch (err) {
+        console.log(`  skip ${symbol}: ${err.message}`);
+      }
+      await sleep(REQUEST_SPACING_MS);
+      if (globalStop) break;
 
-    processed++;
-    if (processed % 50 === 0) console.log(`  ${processed}/${withCik.length} processed (${resolved} resolved so far)`);
+      const merged = pickCadenceTrendsToPublish(trends[symbol], fresh || {});
+      if (Object.keys(merged).length) {
+        trends[symbol] = merged;
+        resolved++;
+      }
+
+      processed++;
+      if (processed % 50 === 0) console.log(`  ${processed}/${withCik.length} processed (${resolved} resolved so far)`);
+    }
+  } finally {
+    process.off('uncaughtException', onUncaught);
   }
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends }));
-  console.log(`Done. Processed ${processed} tickers, ${resolved} resolved to at least one trend. Cache now covers ${Object.keys(trends).length} tickers total.`);
+  const stoppedEarly = globalStop ? ` (stopped early after an uncaught exception: ${globalStop.message})` : '';
+  console.log(`Done. Processed ${processed}/${withCik.length} tickers, ${resolved} resolved to at least one trend${stoppedEarly}. Cache now covers ${Object.keys(trends).length} tickers total.`);
 }
 
 module.exports = {
