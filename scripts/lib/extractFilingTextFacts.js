@@ -823,7 +823,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // A permutation bug (e.g. Q1/Q2 swapped) cannot pass check A, since it
   // depends on order-sensitive addition against a real disclosed subtotal,
   // not just an order-insensitive sum.
-  const result = {};
+  const pointsByConcept = new Map();
   for (const concept of neededConcepts) {
     const grouped = collected[concept] || new Map();
     const points = [];
@@ -846,7 +846,43 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       points.push({ ...rep, corroborations: new Set(best.map((o) => o.accessionNumber)).size });
     }
     points.sort((a, b) => new Date(a.end) - new Date(b.end));
-    if (!points.length) continue;
+    if (points.length) pointsByConcept.set(concept, points);
+  }
+
+  // Auto-detect and correct a systematic unit-scale mismatch BEFORE
+  // reconciliation runs — verified live: STNG's and AEM's own earnings-
+  // release tables are denominated "in thousands" (see the Q1'26/Q2'26
+  // comment above, itself written with a "k" suffix), but nothing upstream
+  // ever multiplies the parsed cell value by 1000 to match XBRL's
+  // raw-dollar convention. This stays invisible to Check A above
+  // (self-consistent: a thousands-scale quarter plus a thousands-scale
+  // quarter still equals a thousands-scale cumulative) and to Check C
+  // (also self-consistent, cross-filing agreement) — only Check B, which
+  // compares against the real annual XBRL dollar figure, would ever catch
+  // it, and only for a concept with enough recent real annual data to
+  // check against. Detected ONCE across ALL of this filing's concepts
+  // together, not per concept — verified live: EGO's revenue has a recent
+  // XBRL annual anchor to detect against, but its OCF/capex annual XBRL
+  // data stops at 2019-2020, far too old to anchor 2024-2026 quarterly
+  // points on its own. Every concept here comes from the SAME earnings-
+  // release document, which uses one unit convention throughout (a real
+  // filing never mixes "revenue in millions" with "OCF in thousands" in
+  // the same release) — so whichever concept DOES have a confident recent
+  // anchor (usually revenue) correctly carries the other concepts along
+  // with it, rather than leaving them uncorrected for lack of their own
+  // evidence.
+  const scale = detectScaleMultiplier(pointsByConcept, annualByEnd);
+  if (scale !== 1) {
+    for (const points of pointsByConcept.values()) {
+      for (const p of points) {
+        p.val *= scale;
+        if (p.valueCumulative != null) p.valueCumulative *= scale;
+      }
+    }
+  }
+
+  const result = {};
+  for (const [concept, points] of pointsByConcept) {
     const verified = reconcilePoints(points, annualByEnd?.[concept] || new Map());
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
@@ -858,6 +894,58 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
 function isAdjacentDate(dateA, dateB) {
   const gapDays = Math.abs((new Date(dateB) - new Date(dateA)) / (1000 * 60 * 60 * 24));
   return gapDays <= 5;
+}
+
+// See the call site's own comment for the full rationale — this just picks
+// the multiplier. Candidates cover the two real conventions seen in the
+// wild (thousands, millions) plus their inverses for symmetry, though a
+// table denominated MORE finely than XBRL's raw dollars has never actually
+// been observed.
+const SCALE_CANDIDATES = [1, 1000, 1000000, 0.001, 0.000001];
+
+// pointsByConcept: Map<concept, points[]>. annualByEnd: { [concept]:
+// Map<end, {end, value}> }. Scores each candidate scale against EVERY
+// concept's own evidence and sums the scores together — a concept with no
+// usable recent annual anchor of its own (score 0 for every candidate)
+// simply doesn't vote, rather than dragging the shared result back to "no
+// correction"; see the call site for why sharing one scale across concepts
+// from the same filing is the right model in the first place.
+function detectScaleMultiplier(pointsByConcept, annualByEnd) {
+  let bestScale = 1;
+  let bestScore = -1;
+  for (const scale of SCALE_CANDIDATES) {
+    let score = 0;
+    for (const [concept, points] of pointsByConcept) {
+      const annuals = annualByEnd?.[concept];
+      if (!annuals || !annuals.size) continue;
+
+      const byYear = new Map();
+      for (const p of points) {
+        const year = p.end.slice(0, 4);
+        if (!byYear.has(year)) byYear.set(year, []);
+        byYear.get(year).push(p);
+      }
+
+      for (const annual of annuals.values()) {
+        if (!annual.value) continue;
+        const fyEndYear = annual.end.slice(0, 4);
+        const candidates = byYear.get(fyEndYear) || [];
+        if (candidates.length < 2) continue;
+        const sum = candidates.reduce((s, p) => s + p.val * scale, 0);
+        const ratio = sum / annual.value;
+        // 2-3 real quarters of a real fiscal year should land roughly in
+        // [30%, 105%] of that year's total (generous bounds for
+        // seasonality and the possibility all 4 are present) — not a
+        // sliver of the year (a scale mismatch) and not wildly over it.
+        if (ratio >= 0.3 && ratio <= 1.05) score++;
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestScale = scale;
+    }
+  }
+  return bestScore > 0 ? bestScale : 1;
 }
 
 function reconcilePoints(points, annualByEnd) {
@@ -949,5 +1037,6 @@ module.exports = {
   subtractThreeMonths,
   monthDayYearToIso,
   reconcilePoints,
+  detectScaleMultiplier,
   extractQuarterlyFactsFromFilings,
 };

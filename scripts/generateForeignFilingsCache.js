@@ -286,6 +286,84 @@ function isAdjacent(prevEnd, currStart) {
   return gapDays >= -5 && gapDays <= 5;
 }
 
+// Derives a single missing standalone quarter as (real annual total - the 3
+// other real standalone quarters within that same fiscal year), never
+// fabrication — mirrors deriveMissingQuarterFromAnnual in the main pipeline's
+// generateSectorMetrics.js, adapted to this file's date-keyed fact shape
+// (start/end strings, not (year,quarter) integers) since fiscal year-ends
+// aren't calendar-aligned for every filer.
+//
+// Verified live: STNG's own SEC data has real standalone Q1-Q3 revenue
+// (surfaced via the 6-K filing-text fallback above, since XBRL itself only
+// tags H1/FY periods for STNG) and a real annual total, but no discrete Q4 —
+// foreign private issuers commonly report Q4 only as part of the annual
+// filing, with no separate Q4 earnings release the 6-K fallback could ever
+// find. This closes that exact gap with real arithmetic instead of leaving
+// it permanently empty.
+//
+// Only derives when EXACTLY one quarter-sized gap exists within a fiscal
+// year (3 known quarters tiling the year with a single contiguous hole,
+// anywhere in the year, not just at the end) — a year with 2+ gaps has more
+// unknowns than the one available equation (annual = sum of 4 quarters) can
+// solve without guessing a split, so it's left alone.
+function deriveMissingQuarterFromAnnual(quarterlyPoints, annualPoints) {
+  const derived = [];
+  for (const fy of annualPoints) {
+    // Tolerant containment (via daysBetween, same ±5-day slop as isAdjacent
+    // below), not exact string comparison — verified live: the 6-K
+    // filing-text fallback's own extracted quarters routinely land a day
+    // off a clean calendar boundary (e.g. start '2023-12-31' for what's
+    // really "Q1 2024"), which a strict q.start >= fy.start check silently
+    // excluded, undercounting withinYear and blocking derivation entirely.
+    const withinYear = quarterlyPoints
+      .filter((q) => daysBetween(fy.start, q.start) >= -5 && daysBetween(q.end, fy.end) >= -5)
+      .sort((a, b) => new Date(a.start) - new Date(b.start));
+    if (withinYear.length !== 3) continue;
+
+    let cursor = fy.start;
+    let gapStart = null;
+    let gapEnd = null;
+    let multipleGaps = false;
+    for (const q of withinYear) {
+      if (isAdjacent(cursor, q.start)) {
+        cursor = q.end;
+      } else if (gapStart == null) {
+        gapStart = cursor;
+        gapEnd = q.start;
+        cursor = q.end;
+      } else {
+        multipleGaps = true;
+        break;
+      }
+    }
+    if (multipleGaps) continue;
+    if (gapStart == null) {
+      if (isAdjacent(cursor, fy.end)) continue; // no gap at all — 3 quarters can't fully tile a year on their own
+      gapStart = cursor;
+      gapEnd = fy.end;
+    }
+
+    // Sanity guard against a unit-scale mismatch between the annual XBRL
+    // figure and 6-K-extracted quarters: reconcilePoints' Check A
+    // (cumulative-column agreement) and Check C (cross-filing
+    // corroboration) only validate a quarter's INTERNAL consistency with
+    // other 6-K-disclosed numbers — only Check B cross-checks against the
+    // real annual XBRL dollar scale, and a quarter can pass via A or C
+    // alone. Verified live: STNG's own extracted quarters summed to
+    // roughly 0.08% of its real annual revenue (a units mismatch, not 3
+    // real quarters of a real year), which a naive subtraction would have
+    // turned into a wildly wrong "derived Q4" using almost the ENTIRE
+    // annual total. Three genuine quarters of a real fiscal year should
+    // always be a substantial majority of that year's total, not a sliver
+    // of it — reject anything implausible rather than derive from it.
+    const sumKnown = withinYear.reduce((sum, q) => sum + q.value, 0);
+    const ratio = fy.value !== 0 ? sumKnown / fy.value : null;
+    if (ratio == null || ratio < 0.3 || ratio > 1.5) continue;
+    derived.push({ start: gapStart, end: gapEnd, value: fy.value - sumKnown });
+  }
+  return derived;
+}
+
 // Mirrors buildTrailingWindows in the main app's src/utils/metrics.js — see
 // that file for the full rationale (a full 4-quarter run isn't always
 // available; fall back to a shorter consecutive run rather than emit
@@ -773,6 +851,24 @@ async function processTicker(symbol, cik, isBank) {
       }
     }
   }
+
+  // Cross-cadence derivation — fills a single missing standalone quarter
+  // from (real annual total - the 3 other real standalone quarters), never
+  // fabrication. Runs after both fallbacks above so it can use whatever
+  // real quarters they surfaced (e.g. STNG's Q1-Q3 revenue, only available
+  // via the 6-K fallback since XBRL itself has no standalone-quarter facts
+  // for it at all — see deriveMissingQuarterFromAnnual's own comment).
+  // Flow concepts only (revenue/netIncome/ocf/capex) — equity/cash/debt
+  // below are point-in-time balance-sheet snapshots, not additive across
+  // quarters, same scope boundary the main pipeline's ROIC derivation
+  // draws in generateSectorMetrics.js.
+  for (const flow of [revenue, netIncome, ocf, capex]) {
+    const derivedQuarters = deriveMissingQuarterFromAnnual(flow.quarterly, flow.annual);
+    if (derivedQuarters.length) {
+      flow.quarterly = [...flow.quarterly, ...derivedQuarters].sort((a, b) => new Date(a.start) - new Date(b.start));
+    }
+  }
+
   const equityInstant = dedupeInstantFacts(equityRaw);
   const cashInstant = dedupeInstantFacts(cashRaw);
   const debtInstant = dedupeInstantFacts(debtRaw);
@@ -934,6 +1030,7 @@ module.exports = {
   sanitizeCadencePoints,
   pickCadenceTrendsToPublish,
   isAdjacent,
+  deriveMissingQuarterFromAnnual,
   quarterLabelFromDate,
   annualLabelFromDate,
   processTicker,
