@@ -49,7 +49,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractQuarterlyFactsFromFilings } = require('./lib/extractFilingTextFacts');
+const { extractQuarterlyFactsFromFilings, throttleSecRequest } = require('./lib/extractFilingTextFacts');
 const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilingsCache.json');
@@ -66,12 +66,7 @@ const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 // requester and a real contact — this is NOT an API key, just good-citizen
 // identification; see https://www.sec.gov/os/webmaster-faq#developers
 const SEC_USER_AGENT = 'stock-analyzer-app foreign-filings-pipeline contact:jadrayescpp@gmail.com';
-const REQUEST_SPACING_MS = 200; // well under SEC's documented ~10 req/sec fair-use guidance
 const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 // A network interruption mid-request can leave a bare `fetch()` (no
 // default timeout) hanging forever rather than erroring — verified live
@@ -83,6 +78,15 @@ function sleep(ms) {
 const FETCH_TIMEOUT_MS = 30000;
 
 async function fetchJson(url) {
+  // Shared with extractFilingTextFacts.js's own SEC requests — see that
+  // file's own comment on throttleSecRequest for why this needs to be one
+  // GLOBAL gate now that main() processes several tickers concurrently
+  // (a worker pool), not per-call-site pacing. Harmless for this
+  // function's one-time startup fetches (metrics feed, CIK map, etc.) —
+  // only matters for the per-ticker companyfacts fetch inside
+  // processTicker, which needs to share the same budget as everything
+  // extractQuarterlyFactsFromFilings does for that same ticker.
+  await throttleSecRequest();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   let res;
@@ -1009,17 +1013,35 @@ async function main() {
   };
   process.on('uncaughtException', onUncaught);
 
-  try {
-    for (const { symbol, cik, industry } of withCik) {
-      if (globalStop) break;
+  // Bounded-concurrency worker pool (real per-ticker timing from a
+  // completed run showed a consistent ~40-49s/ticker cost, dominated by
+  // many SERIALIZED SEC requests per ticker with zero overlap between any
+  // two waits — the old fully-sequential loop plus per-call-site
+  // sleep(150)s). Pacing is now centralized in throttleSecRequest
+  // (extractFilingTextFacts.js) as a global token-bucket gate on request
+  // STARTS, so N workers issuing requests concurrently still can't jointly
+  // exceed SEC's ~10 req/sec fair-use guidance — each worker's requests
+  // just interleave through the same shared gate instead of each worker
+  // keeping its own independent pacing. This is what actually lets
+  // concurrency help: workers overlap their WAITING time, not just their
+  // request-issuing time. 4 chosen per user direction (moderate) — no
+  // fixed per-ticker sleep is needed any more since the real pacing now
+  // happens per-request, centrally.
+  const CONCURRENCY = 4;
+  let nextIndex = 0;
+
+  async function worker() {
+    while (!globalStop) {
+      const i = nextIndex++;
+      if (i >= withCik.length) return;
+      const { symbol, cik, industry } = withCik[i];
       let fresh = null;
       try {
         fresh = await processTicker(symbol, cik, isFinancialIndustry(industry));
       } catch (err) {
         console.log(`  skip ${symbol}: ${err.message}`);
       }
-      await sleep(REQUEST_SPACING_MS);
-      if (globalStop) break;
+      if (globalStop) return;
 
       const merged = pickCadenceTrendsToPublish(trends[symbol], fresh || {});
       if (Object.keys(merged).length) {
@@ -1030,6 +1052,10 @@ async function main() {
       processed++;
       if (processed % 50 === 0) console.log(`  ${processed}/${withCik.length} processed (${resolved} resolved so far)`);
     }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
   } finally {
     process.off('uncaughtException', onUncaught);
   }

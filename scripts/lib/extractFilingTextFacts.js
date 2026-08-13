@@ -153,7 +153,49 @@ function sleep(ms) {
 // ceiling. 30s is generous for any single SEC request.
 const FETCH_TIMEOUT_MS = 30000;
 
+// Shared, process-wide gate every SEC request funnels through — both from
+// this file's own extraction loop AND generateForeignFilingsCache.js's own
+// companyfacts fetch (which imports throttleSecRequest for exactly this).
+// Replaces the old model of per-call-site `sleep(150)` calls that only
+// paced ONE sequential chain of requests: main() now processes several
+// tickers CONCURRENTLY (a worker pool, not one-ticker-at-a-time), so
+// pacing needs to cap the AGGREGATE rate across every ticker in flight at
+// once, not just each ticker's own chain independently — otherwise N
+// concurrent tickers each pacing at 150ms would jointly hit N times SEC's
+// intended rate.
+//
+// Verified live this was the real bottleneck, not SEC's own response
+// latency: the OLD fully-sequential design (one ticker, one request at a
+// time, await-then-sleep) averaged ~40-49s/ticker across a real 350-ticker
+// run — with up to 25 filings scanned per ticker and several sequential
+// requests per filing for tickers whose 6-Ks aren't Inline-XBRL-tagged
+// (the exhibit-scan fallback path), that's dozens of round-trips per
+// ticker, NONE of them ever overlapped with another's wait time.
+//
+// Token-bucket style: gates on when a request STARTS, not when the
+// previous one FINISHES — this is what actually allows multiple requests
+// to be in flight simultaneously (a slow response from one ticker's
+// request no longer blocks a totally independent one), while still
+// enforcing a safe minimum spacing between request starts.
+const MIN_REQUEST_INTERVAL_MS = 150; // ~6.7 req/sec aggregate — comfortable margin under SEC's ~10 req/sec fair-use guidance
+let requestChain = Promise.resolve();
+let lastRequestStartedAt = 0;
+
+function throttleSecRequest() {
+  const turn = requestChain.then(async () => {
+    const wait = Math.max(0, lastRequestStartedAt + MIN_REQUEST_INTERVAL_MS - Date.now());
+    if (wait > 0) await sleep(wait);
+    lastRequestStartedAt = Date.now();
+  });
+  // Chain the NEXT request's wait on this one regardless of whether this
+  // one throws later (it won't — this only ever resolves), so one slow
+  // link can never wedge the whole queue.
+  requestChain = turn.catch(() => {});
+  return turn;
+}
+
 async function fetchWithTimeout(url, options) {
+  await throttleSecRequest();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -718,7 +760,6 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     let usedFilingSummary = false;
     try {
       const reports = await fetchFilingSummaryReports(cik, filing.accessionNumber, userAgent);
-      await sleep(150);
       if (reports.length) {
         const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
         const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome }).filter(([, v]) => v));
@@ -732,7 +773,6 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           const accessionNoDashes = filing.accessionNumber.replace(/-/g, '');
           const rUrl = `${SEC_ARCHIVES_BASE}/${Number(cik)}/${accessionNoDashes}/${rep.htmlFileName}`;
           const html = await fetchText(rUrl, userAgent);
-          await sleep(150);
           if (debug) console.error('DEBUG R-file', rUrl, rep.shortName || rep.longName);
           if (!html) continue;
           const $ = cheerio.load(html);
@@ -762,7 +802,6 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       continue;
     }
     if (debug) console.error('DEBUG', filing.accessionNumber, 'candidates:', exhibitUrls);
-    await sleep(150);
 
     for (const url of exhibitUrls) {
       let html;
@@ -772,7 +811,6 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         if (debug) console.error('DEBUG fetchText threw', url, e.message);
         continue;
       }
-      await sleep(150);
       if (!html) { if (debug) console.error('DEBUG empty html', url); continue; }
       const $ = cheerio.load(html);
       const fullText = $('body').text();
@@ -1039,4 +1077,5 @@ module.exports = {
   reconcilePoints,
   detectScaleMultiplier,
   extractQuarterlyFactsFromFilings,
+  throttleSecRequest,
 };
