@@ -710,15 +710,38 @@ function isFinancialIndustry(industry) {
   return !!industry && ['Banking', 'Insurance', 'Financial Services'].includes(industry);
 }
 
+// A concept can have SOME standalone-quarter XBRL facts without being
+// remotely current -- verified live: IAMGOLD/IAG tagged real interim
+// facts for revenue/netIncome/ocf/capex only through Q4 2017, then
+// switched to annual-only XBRL tagging, while its 6-K earnings releases
+// keep filing real quarterly numbers right up to the present (verified:
+// Q2 2026 revenue extractable from its own 6-K exhibit). The filing-text
+// fallback below used to trigger only on a literal empty array, so a
+// ticker in exactly this shape -- some quarterly facts, just 8 years
+// stale -- permanently skipped it forever, even though the fallback can
+// demonstrably pull fresh data for it. Mirrors the domestic pipeline's
+// hasRecentQuarterlyGap fix for the same class of problem.
+const QUARTERLY_STALE_GAP_DAYS = 550; // ~1.5 years -- generous filing-lag tolerance
+function needsFilingTextBackfill(quarterlyPoints, annualPoints) {
+  if (!annualPoints.length) return false; // nothing to backfill against
+  if (!quarterlyPoints.length) return true;
+  const lastQuarterlyEnd = new Date(quarterlyPoints[quarterlyPoints.length - 1].end);
+  const lastAnnualEnd = new Date(annualPoints[annualPoints.length - 1].end);
+  return lastAnnualEnd - lastQuarterlyEnd > QUARTERLY_STALE_GAP_DAYS * 24 * 60 * 60 * 1000;
+}
+
 // Returns { quarterly, yearly, ttm }, each an object keyed by
 // revenueGrowth/profitMargin/fcfMargin (only the ones with enough
 // underlying data to compute) — each cadence stands on its own, computed
 // independently from the same already-fetched facts, rather than the old
 // single "best" series picked by a preferQuarterly flag. A filer like
-// IAMGOLD/IAG (stale 2016-17 quarterly facts, current annual facts all the
-// way to FY'25) simply ends up with a real `yearly` entry and empty
-// `quarterly`/`ttm` ones — no special-casing needed, since a builder with
-// insufficient input data naturally returns no points.
+// IAMGOLD/IAG (stale 2016-17 quarterly XBRL facts, current annual facts
+// all the way to FY'25) used to just end up with a real `yearly` entry
+// and empty `quarterly`/`ttm` ones — turned out NOT to be an inherent
+// data limitation (see needsFilingTextBackfill above): IAG's own 6-K
+// exhibits have real quarterly numbers right up to the present, the
+// fallback just never used to trigger for a ticker with SOME (if
+// ancient) quarterly facts already present.
 async function processTicker(symbol, cik, isBank) {
   const companyFacts = await fetchJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
   if (!companyFacts) return null;
@@ -778,10 +801,10 @@ async function processTicker(symbol, cik, isBank) {
       : null;
     if (!allowlist || allowlist.has(symbol.toUpperCase())) {
       const needed = [];
-      if (!revenue.quarterly.length && revenue.annual.length) needed.push('revenue');
-      if (!netIncome.quarterly.length && netIncome.annual.length) needed.push('netIncome');
-      if (!ocf.quarterly.length && ocf.annual.length) needed.push('ocf');
-      if (!capex.quarterly.length && capex.annual.length) needed.push('capex');
+      if (needsFilingTextBackfill(revenue.quarterly, revenue.annual)) needed.push('revenue');
+      if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) needed.push('netIncome');
+      if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) needed.push('ocf');
+      if (needsFilingTextBackfill(capex.quarterly, capex.annual)) needed.push('capex');
 
       if (needed.length) {
         const annualByEnd = {
@@ -827,10 +850,10 @@ async function processTicker(symbol, cik, isBank) {
       : null;
     if (!allowlist || allowlist.has(symbol.toUpperCase())) {
       const stillNeeded = [];
-      if (!revenue.quarterly.length && revenue.annual.length) stillNeeded.push('revenue');
-      if (!netIncome.quarterly.length && netIncome.annual.length) stillNeeded.push('netIncome');
-      if (!ocf.quarterly.length && ocf.annual.length) stillNeeded.push('ocf');
-      if (!capex.quarterly.length && capex.annual.length) stillNeeded.push('capex');
+      if (needsFilingTextBackfill(revenue.quarterly, revenue.annual)) stillNeeded.push('revenue');
+      if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) stillNeeded.push('netIncome');
+      if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) stillNeeded.push('ocf');
+      if (needsFilingTextBackfill(capex.quarterly, capex.annual)) stillNeeded.push('capex');
 
       if (stillNeeded.length) {
         const annualByEnd = {
