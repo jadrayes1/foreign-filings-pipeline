@@ -126,11 +126,25 @@ const LABEL_ALIASES = {
     exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b/i,
   },
   ocf: {
-    include: /cash (flows? )?(from|provided by|generated (from|by)|used in) operating/i,
+    // "inflow"/"outflow" added -- verified live: Scorpio Tankers (STNG,
+    // Marshall Islands-domiciled) labels this line "Net cash inflow from
+    // operating activities" (IFRS/shipping-industry phrasing), not the
+    // US-GAAP "provided by"/"used in" wording this pattern originally
+    // covered -- didn't match at all, so OCF (and by extension fcfMargin,
+    // which needs it) silently found nothing for a filer whose real cash
+    // flow statement was sitting right there. Likely not STNG-specific;
+    // "inflow"/"outflow" is standard IFRS statement-of-cash-flows wording.
+    include: /cash (flows? )?(from|provided by|generated (from|by)|used in|inflow|outflow).*operating/i,
     exclude: /investing|financing|discontinued/i,
   },
   capex: {
-    include: /capital expenditures?|purchase(s)? of property|additions to (property|oil and gas|exploration)/i,
+    // "acquisition(s) of vessels"/"drydock" added -- verified live: STNG
+    // (a tanker company) has no line labeled anything like "capital
+    // expenditures" at all; its two real capex-equivalent lines are
+    // "Acquisition of vessels and payments for vessels under
+    // construction" and "Drydock and other vessel related payments" (see
+    // the capex-specific summing tiebreak above, which combines the two).
+    include: /capital expenditures?|purchase(s)? of property|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
 };
@@ -551,6 +565,25 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
     if (concept === 'netIncome') {
       const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
       if (nonComprehensive.length === 1) results[concept] = nonComprehensive[0];
+    }
+    // capex specifically: unlike revenue/netIncome (one bottom-line total
+    // rolling up sub-items), a filer can report capex-equivalent outflow
+    // as several genuinely separate, non-overlapping lines with no single
+    // "Total" row at all -- verified live: Scorpio Tankers (STNG) reports
+    // "Acquisition of vessels and payments for vessels under construction"
+    // and "Drydock and other vessel related payments" as two distinct real
+    // cash-flow lines, neither of which is a subtotal of the other. Summed
+    // here as a single synthetic candidate rather than dropped as
+    // ambiguous -- safe to attempt because the sum still has to pass the
+    // SAME downstream reconciliation (reconcilePoints' cumulative-column
+    // and annual-XBRL checks) as any other extracted point before it's
+    // ever trusted; an accidental/wrong sum simply fails to verify and
+    // gets dropped exactly like a bad single-row match would.
+    if (concept === 'capex' && results[concept] === undefined) {
+      const value3mo = distinct.reduce((sum, d) => sum + d.value3mo, 0);
+      const cumulativeParts = distinct.map((d) => d.valueCumulative);
+      const valueCumulative = cumulativeParts.every((v) => v != null) ? cumulativeParts.reduce((sum, v) => sum + v, 0) : null;
+      results[concept] = { label: distinct.map((d) => d.label).join(' + '), value3mo, valueCumulative };
     }
     // Any other shape (0 or 2+ candidates after every tiebreak) stays
     // genuinely ambiguous and is dropped, same as before.
