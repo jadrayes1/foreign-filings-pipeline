@@ -566,6 +566,19 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
       const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
       if (nonComprehensive.length === 1) results[concept] = nonComprehensive[0];
     }
+    // ocf specifically: a filer can show a pre-tax operating cash flow
+    // SUBTOTAL as its own line before subtracting taxes paid down to the
+    // real bottom-line figure -- verified live: IAMGOLD (IAG) shows both
+    // "Cash from operating activities, before income taxes paid" AND
+    // "Net cash from operating activities" as genuinely different real
+    // values in the same statement, neither prefixed "Total". The second
+    // is the actual OCF figure every other source (XBRL, Finnhub) means
+    // by the term -- prefer whichever candidate's label starts with "net
+    // cash" when exactly one does.
+    if (concept === 'ocf') {
+      const netCash = distinct.filter((d) => /^net\s+cash\b/i.test(d.label.trim()));
+      if (netCash.length === 1) results[concept] = netCash[0];
+    }
     // capex specifically: unlike revenue/netIncome (one bottom-line total
     // rolling up sub-items), a filer can report capex-equivalent outflow
     // as several genuinely separate, non-overlapping lines with no single
