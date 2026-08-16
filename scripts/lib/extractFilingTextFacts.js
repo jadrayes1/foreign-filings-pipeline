@@ -1249,19 +1249,38 @@ const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
 //      column, and a year later, the SAME date reappearing as another
 //      filing's prior-year comparative column).
 //   B'. Direct match against a REAL XBRL instant fact at the SAME end
-//      date -- not a sum, just point equality within tolerance. Useful
-//      whenever a filer's balance-sheet comparative column lands on a
-//      date XBRL also happens to have tagged (most commonly a fiscal
-//      year-end, since annual 10-K/40-F-equivalent filings usually DO get
-//      XBRL-tagged even for filers with no interim XBRL at all).
+//      date -- not a sum, just point equality within tolerance, tried
+//      across SCALE_CANDIDATES (not just the raw value) since detectScaleMultiplier
+//      (the flow-concept scale detector, run once per filing above) isn't
+//      safe to reuse here -- its own algorithm sums MULTIPLE periods to
+//      approximate a fraction of an annual total, meaningless for a
+//      point-in-time snapshot, so it never actually detects an instant
+//      concept's own scale; it just lets whatever scale the FLOW concepts
+//      happened to need ride along, which is only correct when a filer's
+//      balance sheet and income statement share one convention. Verified
+//      live this isn't always true: REAX's real XBRL equity for
+//      2023-12-31 is $37,084,000, but the text-extracted value merged in
+//      as bare $37,084 (a genuine "in thousands" balance-sheet table) even
+//      though its flow concepts needed no scaling at all -- corrupted
+//      investedCapitalMap down to an absurd figure, silently breaking ROIC
+//      for periods that used to compute fine. Checking per-point against
+//      its own real anchor, independent of whatever the flow concepts
+//      decided, catches this the way a single borrowed global scale can't.
 function reconcileInstantPoints(points, knownByEnd) {
   const verified = new Set();
   for (const p of points) if (p.corroborations >= 2) verified.add(p);
   for (const p of points) {
     const known = knownByEnd.get(p.end);
     if (known?.value == null) continue;
-    const diff = Math.abs(p.val - known.value) / Math.abs(known.value);
-    if (diff <= RECONCILE_TOLERANCE) verified.add(p);
+    for (const scale of SCALE_CANDIDATES) {
+      const scaledVal = p.val * scale;
+      const diff = Math.abs(scaledVal - known.value) / Math.abs(known.value);
+      if (diff <= RECONCILE_TOLERANCE) {
+        p.val = scaledVal;
+        verified.add(p);
+        break;
+      }
+    }
   }
   return points.filter((p) => verified.has(p));
 }

@@ -248,10 +248,10 @@ function dedupeAndClassify(rawFacts) {
     }
   }
 
-  const quarterly = [];
-  const h1 = [];
-  const q3ytd = [];
-  const annual = [];
+  let quarterly = [];
+  let h1 = [];
+  let q3ytd = [];
+  let annual = [];
   for (const fact of byPeriod.values()) {
     const days = daysBetween(fact.start, fact.end);
     const point = { start: fact.start, end: fact.end, value: fact.val };
@@ -260,6 +260,31 @@ function dedupeAndClassify(rawFacts) {
     else if (days >= 260 && days <= 300) q3ytd.push(point);
     else if (days >= 350 && days <= 380) annual.push(point);
   }
+
+  // A second, narrower dedup pass -- the byPeriod dedup above keys on
+  // EXACT start|end, which two independent sources can legitimately
+  // disagree on for the SAME real quarter: verified live, DHT's real XBRL
+  // Q3 2024 fact discloses start=2024-07-01, while the same quarter
+  // recovered via 6-K text extraction carries a SYNTHETIC start
+  // (subtractThreeMonths(end), landing one day earlier at 2024-06-30) --
+  // same end date, same value, genuinely the same quarter, but the exact
+  // key treated them as two different periods, showing the same quarter
+  // twice in published trends. Deduping by END DATE ALONE would be unsafe
+  // done globally (an annual and a quarterly fact can legitimately share
+  // an end date, e.g. both landing on a fiscal year-end) -- safe here
+  // specifically because it's applied WITHIN each already-duration-
+  // classified bucket, where every member has already passed the same
+  // 80-100/170-200/260-300/350-380-day filter, so two points sharing an
+  // end date inside one bucket are guaranteed to be the same real period.
+  const dedupeByEnd = (points) => {
+    const byEnd = new Map();
+    for (const p of points) if (!byEnd.has(p.end)) byEnd.set(p.end, p);
+    return Array.from(byEnd.values());
+  };
+  quarterly = dedupeByEnd(quarterly);
+  h1 = dedupeByEnd(h1);
+  q3ytd = dedupeByEnd(q3ytd);
+  annual = dedupeByEnd(annual);
 
   const hasEnd = (end) => quarterly.some((q) => q.end === end);
   const q1ByStart = new Map(quarterly.map((q) => [q.start, q]));
@@ -748,12 +773,43 @@ function isFinancialIndustry(industry) {
 // demonstrably pull fresh data for it. Mirrors the domestic pipeline's
 // hasRecentQuarterlyGap fix for the same class of problem.
 const QUARTERLY_STALE_GAP_DAYS = 550; // ~1.5 years -- generous filing-lag tolerance
+
+// Genuinely different failure shape from the stale-tail check above --
+// verified live: DHT Holdings' real SEC XBRL only ever tags a standalone
+// Q3 duration directly (Jul 1 - Sep 30), with Q4 derived via
+// annual-minus-9mo-YTD -- Q1/Q2 have no arithmetic path from what XBRL
+// alone provides, so DHT's quarterly series stays genuinely CURRENT
+// (reaches Q3'25/Q4'25) while permanently missing every Q1/Q2. The
+// stale-tail check above never catches this -- the LAST point isn't
+// stale at all -- so the fallback never even attempted DHT's real 6-K
+// prose, which (same as IAG/STNG) plausibly has the missing standalone
+// quarters even though XBRL doesn't tag them. Mirrors the domestic
+// pipeline's hasRecentQuarterlyGap exactly (same constants, same
+// position-based scan of the most recent N real points for a gap between
+// CONSECUTIVE points, not just checking the tail against "now").
+const RECENT_GAP_SCAN_ENTRIES = 16; // QUARTERS_OF_HISTORY (12) + margin
+const EXPECTED_QUARTERLY_GAP_DAYS = 200;
+function hasRecentQuarterlyGap(quarterlyPoints, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
+  const endDates = (quarterlyPoints || [])
+    .map((p) => (p?.end ? new Date(p.end) : null))
+    .filter((d) => d instanceof Date && !isNaN(d))
+    .sort((a, b) => b - a); // newest first
+  if (!endDates.length) return false; // nothing dated to check -- the empty-array trigger above already covers "no real data at all"
+  const checkpoints = [new Date(), ...endDates.slice(0, scanEntries)];
+  for (let i = 0; i < checkpoints.length - 1; i++) {
+    const gapDays = (checkpoints[i] - checkpoints[i + 1]) / (1000 * 60 * 60 * 24);
+    if (gapDays > EXPECTED_QUARTERLY_GAP_DAYS) return true;
+  }
+  return false;
+}
+
 function needsFilingTextBackfill(quarterlyPoints, annualPoints) {
   if (!annualPoints.length) return false; // nothing to backfill against
   if (!quarterlyPoints.length) return true;
   const lastQuarterlyEnd = new Date(quarterlyPoints[quarterlyPoints.length - 1].end);
   const lastAnnualEnd = new Date(annualPoints[annualPoints.length - 1].end);
-  return lastAnnualEnd - lastQuarterlyEnd > QUARTERLY_STALE_GAP_DAYS * 24 * 60 * 60 * 1000;
+  if (lastAnnualEnd - lastQuarterlyEnd > QUARTERLY_STALE_GAP_DAYS * 24 * 60 * 60 * 1000) return true;
+  return hasRecentQuarterlyGap(quarterlyPoints);
 }
 
 // Returns { quarterly, yearly, ttm }, each an object keyed by
