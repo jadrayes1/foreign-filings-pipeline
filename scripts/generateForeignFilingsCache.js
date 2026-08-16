@@ -117,14 +117,40 @@ async function fetchTickerToCikMap() {
 // IFRS concept extraction — see file header for how these were verified.
 // ---------------------------------------------------------------------------
 
-const REVENUE_CONCEPTS = ['Revenue'];
-const OCF_CONCEPTS = ['CashFlowsFromUsedInOperatingActivities'];
+// Each list below leads with the ifrs-full concept name(s) (what every
+// foreign filer originally verified against this pipeline uses), followed
+// by us-gaap equivalents -- extractFactSeries already searches BOTH
+// taxonomies for whichever concept has real data (see its own comment), so
+// simply adding the us-gaap names here is enough; no separate taxonomy-
+// branching logic needed anywhere else. us-gaap names mirror the domestic
+// pipeline's own SEC_REVENUE_CONCEPTS/NET_INCOME_CONCEPT_CANDIDATES/
+// SEC_EBIT_CONCEPTS/OPERATING_SUBTOTAL_CONCEPTS/findReportedCapexQ in
+// generateSectorMetrics.js -- added to cover genuine foreign private
+// issuers that tag under us-gaap instead of ifrs-full (verified live:
+// Ardmore Shipping/ASC, Teekay Tankers/TNK, Imperial Petroleum/IMPP all
+// exclusively file 20-F/6-K, never 10-K/10-Q, despite using us-gaap -- see
+// isGenuineForeignFiler below, which is what actually lets these through
+// the gate; a domestic 10-K filer also has these us-gaap concepts but
+// never reaches extraction because it fails that check first).
+const REVENUE_CONCEPTS = [
+  'Revenue',
+  'Revenues',
+  'RevenueFromContractWithCustomerExcludingAssessedTax',
+  'RevenueFromContractWithCustomerIncludingAssessedTax',
+  'SalesRevenueNet',
+  'RevenuesNetOfInterestExpense',
+];
+const OCF_CONCEPTS = ['CashFlowsFromUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
 const CAPEX_CONCEPTS = [
   'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
   'PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwillInvestmentPropertyAndOtherNoncurrentAssets',
+  'PaymentsToAcquirePropertyPlantAndEquipment',
+  'PaymentsToAcquireProductiveAssets',
+  'PaymentsForCapitalImprovements',
+  'PaymentsToAcquireOtherPropertyPlantAndEquipment',
 ];
-const NET_INCOME_CONCEPTS = ['ProfitLoss'];
-const SHARES_CONCEPTS = ['WeightedAverageShares'];
+const NET_INCOME_CONCEPTS = ['ProfitLoss', 'NetIncomeLoss'];
+const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfSharesOutstandingBasic', 'WeightedAverageNumberOfDilutedSharesOutstanding'];
 
 // ROIC's inputs — verified live for two independent filers (BMO - Canadian
 // bank, IAG - Canadian mining):
@@ -147,7 +173,7 @@ const SHARES_CONCEPTS = ['WeightedAverageShares'];
 //     as the main pipeline's sumDebt: they fund the loan book as a normal
 //     operating liability for a bank, not a financing choice, so bank
 //     filers like BMO naturally get debt=0 without any special-casing.
-const EBIT_CONCEPTS = ['ProfitLossFromOperatingActivities', 'ProfitLossBeforeTax'];
+const EBIT_CONCEPTS = ['ProfitLossFromOperatingActivities', 'ProfitLossBeforeTax', 'OperatingIncomeLoss'];
 const EQUITY_CONCEPTS = ['Equity'];
 const CASH_CONCEPTS = ['CashAndCashEquivalents'];
 const DEBT_CONCEPTS = ['Borrowings', 'LongtermBorrowings', 'CurrentPortionOfLongtermBorrowings'];
@@ -742,26 +768,64 @@ function needsFilingTextBackfill(quarterlyPoints, annualPoints) {
 // exhibits have real quarterly numbers right up to the present, the
 // fallback just never used to trigger for a ticker with SOME (if
 // ancient) quarterly facts already present.
+// A domestic US-GAAP filer's SEC companyfacts ALSO has real us-gaap data
+// (every US public company files US-GAAP XBRL with SEC, foreign or not),
+// so having us-gaap facts alone can't be the signal — otherwise
+// extractFactSeries would happily reconstruct trends for literally every
+// SEC-registered company, duplicating what stock-metrics-pipeline already
+// does via Finnhub. The real signal is the FORM TYPES a filer actually
+// submits: a genuine foreign private issuer files 20-F/40-F (annual) +
+// 6-K (interim/current) and never 10-K/10-Q, regardless of which XBRL
+// taxonomy it happens to tag under. Verified live: Ardmore Shipping/ASC,
+// Teekay Tankers/TNK, and Imperial Petroleum/IMPP are all genuine 20-F/6-K
+// filers using us-gaap (not ifrs-full) -- discoverForeignFilers.js's
+// original ifrs-full-only check missed this whole population entirely,
+// so these tickers got no data from either pipeline: not from here (failed
+// the ifrs-full gate) and not fully from stock-metrics-pipeline (Finnhub's
+// financials-reported endpoint doesn't crawl 20-F/6-K forms either).
+// Scans the SAME companyFacts payload already fetched here -- no extra
+// request needed.
+const FOREIGN_ONLY_FORM_TYPES = new Set(['20-F', '20-F/A', '40-F', '40-F/A', '6-K', '6-K/A']);
+const DOMESTIC_FORM_TYPES = new Set(['10-K', '10-K/A', '10-Q', '10-Q/A']);
+function isGenuineForeignFormFiler(companyFacts) {
+  let sawForeignForm = false;
+  for (const taxonomyFacts of Object.values(companyFacts?.facts || {})) {
+    for (const concept of Object.values(taxonomyFacts)) {
+      for (const points of Object.values(concept.units || {})) {
+        for (const p of points) {
+          if (!p.form) continue;
+          if (DOMESTIC_FORM_TYPES.has(p.form)) return false; // any real 10-K/10-Q disqualifies immediately
+          if (FOREIGN_ONLY_FORM_TYPES.has(p.form)) sawForeignForm = true;
+        }
+      }
+    }
+  }
+  return sawForeignForm;
+}
+
+// True for either a genuine ifrs-full filer (the original, narrower check)
+// OR a genuine us-gaap-taxonomy foreign private issuer (see
+// isGenuineForeignFormFiler above). Kept in sync with the identically-named
+// check in discoverForeignFilers.js.
+function isGenuineForeignFiler(companyFacts) {
+  if (companyFacts?.facts?.['ifrs-full'] && Object.keys(companyFacts.facts['ifrs-full']).length) return true;
+  if (companyFacts?.facts?.['us-gaap'] && Object.keys(companyFacts.facts['us-gaap']).length && isGenuineForeignFormFiler(companyFacts)) return true;
+  return false;
+}
+
 async function processTicker(symbol, cik, isBank) {
   const companyFacts = await fetchJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
   if (!companyFacts) return null;
 
-  // Only genuine IFRS filers — a domestic US-GAAP filer's SEC companyfacts
-  // ALSO has real data (every US public company files US-GAAP XBRL with
-  // SEC too, foreign or not), so without this check extractFactSeries's
-  // us-gaap fallback would happily reconstruct trends for literally every
-  // SEC-registered company, duplicating what the main stock-metrics-
-  // pipeline repo already does via Finnhub — this pipeline exists
-  // specifically for the foreign-filer gap Finnhub's own financials-
-  // reported endpoint has, not as a general SEC-based alternative to it.
-  // Checked here (before any concept extraction) rather than via a
+  // See isGenuineForeignFiler's own comment for the full rationale —
+  // checked here (before any concept extraction) rather than via a
   // candidate-list prefilter in main() — see that function's own comment
   // for why card-value nullness turned out to be the wrong signal
   // (verified live: Scorpio Tankers/STNG is a genuine IFRS filer whose
   // Finnhub NATIVE data happens to be fully populated, so it was never
   // flagged as a "gap" ticker despite having zero Quarterly/Yearly
   // reconstruction available from either pipeline).
-  if (!companyFacts.facts?.['ifrs-full'] || !Object.keys(companyFacts.facts['ifrs-full']).length) return null;
+  if (!isGenuineForeignFiler(companyFacts)) return null;
 
   const revenueRaw = extractFactSeries(companyFacts, REVENUE_CONCEPTS);
   const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
@@ -1122,6 +1186,8 @@ module.exports = {
   extractFactSeries,
   dedupeAndClassify,
   dedupeInstantFacts,
+  isGenuineForeignFiler,
+  isGenuineForeignFormFiler,
   buildTrailingWindows,
   buildRatioTrend,
   buildQuarterlyRatioTrend,

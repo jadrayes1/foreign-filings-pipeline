@@ -1,11 +1,14 @@
 // scripts/discoverForeignFilers.js
 //
 // Periodic (weekly), CHEAP classification-only pass across the full ticker
-// universe: for each ticker, checks ONLY whether it's a genuine IFRS foreign
-// filer (companyFacts.facts['ifrs-full'] present) - no concept extraction,
-// no 6-K filing-text fallback, none of generateForeignFilingsCache.js's
-// expensive per-ticker work. Publishes the resulting {symbol, cik, industry}
-// list as foreignFilerList.json, which the DAILY generateForeignFilingsCache.js
+// universe: for each ticker, checks ONLY whether it's a genuine foreign
+// filer -- either the original ifrs-full-taxonomy check, or (added later)
+// a us-gaap-taxonomy filer that genuinely files 20-F/40-F/6-K and never
+// 10-K/10-Q (see detectForeignFilerTaxonomy's own comment) -- no concept
+// extraction, no 6-K filing-text fallback, none of
+// generateForeignFilingsCache.js's expensive per-ticker work. Publishes
+// the resulting {symbol, cik, industry, taxonomy} list as
+// foreignFilerList.json, which the DAILY generateForeignFilingsCache.js
 // run then reads directly instead of re-deriving the same list from a full
 // classification scan every single day.
 //
@@ -73,13 +76,47 @@ async function fetchTickerToCikMap() {
   return map;
 }
 
+// A domestic US-GAAP filer's SEC companyfacts ALSO has real us-gaap data
+// (every US public company files US-GAAP XBRL with SEC, foreign or not),
+// so having us-gaap facts alone can't be the signal — the real signal is
+// the FORM TYPES a filer actually submits: a genuine foreign private
+// issuer files 20-F/40-F (annual) + 6-K (interim/current) and never
+// 10-K/10-Q, regardless of which XBRL taxonomy it happens to tag under.
+// Verified live: Ardmore Shipping/ASC, Teekay Tankers/TNK, and Imperial
+// Petroleum/IMPP are all genuine 20-F/6-K filers using us-gaap (not
+// ifrs-full) — the original ifrs-full-only check below missed this whole
+// population. Scans the SAME companyFacts payload already fetched — no
+// extra request needed.
+const FOREIGN_ONLY_FORM_TYPES = new Set(['20-F', '20-F/A', '40-F', '40-F/A', '6-K', '6-K/A']);
+const DOMESTIC_FORM_TYPES = new Set(['10-K', '10-K/A', '10-Q', '10-Q/A']);
+function isGenuineForeignFormFiler(companyFacts) {
+  let sawForeignForm = false;
+  for (const taxonomyFacts of Object.values(companyFacts?.facts || {})) {
+    for (const concept of Object.values(taxonomyFacts)) {
+      for (const points of Object.values(concept.units || {})) {
+        for (const p of points) {
+          if (!p.form) continue;
+          if (DOMESTIC_FORM_TYPES.has(p.form)) return false; // any real 10-K/10-Q disqualifies immediately
+          if (FOREIGN_ONLY_FORM_TYPES.has(p.form)) sawForeignForm = true;
+        }
+      }
+    }
+  }
+  return sawForeignForm;
+}
+
 // The ONLY real check this script does per ticker - deliberately identical
-// to processTicker's own ifrs-full gate in generateForeignFilingsCache.js
-// (kept in sync), just without any of the concept extraction that follows
-// it there.
-async function isGenuineIfrsFiler(cik) {
+// to processTicker's own isGenuineForeignFiler gate in
+// generateForeignFilingsCache.js (kept in sync), just without any of the
+// concept extraction that follows it there. Returns the detected taxonomy
+// (not just a boolean) so foreignFilerList.json can carry it through, even
+// though nothing currently reads it back out — extractFactSeries already
+// searches both taxonomies per concept regardless.
+async function detectForeignFilerTaxonomy(cik) {
   const companyFacts = await fetchJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
-  return !!(companyFacts?.facts?.['ifrs-full'] && Object.keys(companyFacts.facts['ifrs-full']).length);
+  if (companyFacts?.facts?.['ifrs-full'] && Object.keys(companyFacts.facts['ifrs-full']).length) return 'ifrs-full';
+  if (companyFacts?.facts?.['us-gaap'] && Object.keys(companyFacts.facts['us-gaap']).length && isGenuineForeignFormFiler(companyFacts)) return 'us-gaap';
+  return null;
 }
 
 async function main() {
@@ -94,7 +131,8 @@ async function main() {
   let processed = 0;
   for (const { symbol, cik, industry } of withCik) {
     try {
-      if (await isGenuineIfrsFiler(cik)) foreignFilers.push({ symbol, cik, industry });
+      const taxonomy = await detectForeignFilerTaxonomy(cik);
+      if (taxonomy) foreignFilers.push({ symbol, cik, industry, taxonomy });
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
     }
@@ -105,7 +143,8 @@ async function main() {
   }
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), foreignFilers }));
-  console.log(`Done. Processed ${processed} tickers, ${foreignFilers.length} confirmed as genuine IFRS foreign filers.`);
+  const gaapCount = foreignFilers.filter((f) => f.taxonomy === 'us-gaap').length;
+  console.log(`Done. Processed ${processed} tickers, ${foreignFilers.length} confirmed foreign filers (${foreignFilers.length - gaapCount} ifrs-full, ${gaapCount} us-gaap).`);
 }
 
 main().catch((err) => {

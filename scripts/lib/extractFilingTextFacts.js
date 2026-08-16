@@ -326,8 +326,24 @@ function nonEmptyCells($, row) {
 // Months Ended" with the date living in the NEXT row's cells instead (see
 // parseDateHeaderCell below) — endMonthDay is null in that case, filled in
 // from the date row instead.
+// Shared with the phraseCells gate below (parseTableColumns) so the two
+// can't drift out of sync -- verified live this happened once already:
+// Imperial Petroleum (IMPP) titles its standalone-quarter column "Quarters
+// Ended March 31," instead of "Three Months Ended March 31," (same
+// meaning, different wording). Fixing parsePeriodPhrase alone wasn't
+// enough the first time -- the OUTER gate that decides whether to even
+// call it also only recognized literal "month(s) ended", silently
+// discarding this row before parsePeriodPhrase ever ran.
+const PERIOD_PHRASE_INDICATOR = /months? ended|quarters? ended/i;
+
 function parsePeriodPhrase(text) {
-  const months = /nine months|9 months/i.test(text) ? 9 : /six months|6 months/i.test(text) ? 6 : /three months|3 months/i.test(text) ? 3 : null;
+  const months = /nine months|9 months/i.test(text)
+    ? 9
+    : /six months|6 months/i.test(text)
+      ? 6
+      : /three months|3 months|quarters? ended/i.test(text)
+        ? 3
+        : null;
   if (!months) return null;
   const dateMatch = text.match(/ended\s+([A-Za-z]+\s+\d{1,2})/i);
   return { months, endMonthDay: dateMatch ? dateMatch[1] : null };
@@ -409,7 +425,7 @@ function parseTableColumns($, table) {
     // ended" figure IS the standalone quarter by fiscal-calendar
     // definition, not an assumption specific to this filer.
     if (!periodPhrases) {
-      const bareDateCell = cells.find((c) => /(period|quarter) ended\s+[A-Za-z]+\s+\d{1,2}/i.test(c.text) && !/months? ended/i.test(c.text));
+      const bareDateCell = cells.find((c) => /(periods?|quarters?) ended\s+[A-Za-z]+\s+\d{1,2}/i.test(c.text) && !/months? ended/i.test(c.text));
       if (bareDateCell) {
         const dateMatch = bareDateCell.text.match(/ended\s+([A-Za-z]+\s+\d{1,2})/i);
         const yearCellsInSameRow = cells.filter((c) => isYearCell(c.text)).map((c) => extractYear(c.text));
@@ -463,7 +479,7 @@ function parseTableColumns($, table) {
     }
 
     if (!periodPhrases) {
-      const phraseCells = cells.filter((c) => /months? ended/i.test(c.text));
+      const phraseCells = cells.filter((c) => PERIOD_PHRASE_INDICATOR.test(c.text));
       if (phraseCells.length) {
         const parsed = phraseCells.map((c) => parsePeriodPhrase(c.text)).filter(Boolean);
         if (parsed.length) periodPhrases = parsed;
