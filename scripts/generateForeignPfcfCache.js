@@ -31,6 +31,17 @@ const path = require('path');
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
 const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/foreignPfcfCache.json';
+// Published weekly by discoverForeignFilers.js (see that file's header) —
+// read here so this job skips straight to its known ~374 candidates instead
+// of re-checking ifrs-full for the full ~5,067-ticker universe every run.
+// Verified live this matters: without it, this job was hitting its own
+// 60-minute workflow timeout at ~68% through the full-universe scan, every
+// single day for a week straight (confirmed via 7 consecutive "cancelled"
+// runs) — so tickers landing later in iteration order (e.g. DHT) never got
+// reached at all, not even once, since progress isn't persisted/resumed
+// across runs either. Same fast path generateForeignFilingsCache.js already
+// uses, just never carried over here when that fix was built.
+const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/foreignFilerList.json';
 const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
 const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 // SEC's fair-use policy asks for a descriptive User-Agent identifying the
@@ -306,8 +317,9 @@ function pickCadenceTrendsToPublish(existingEntry, fresh) {
 async function main() {
   const twelveDataKey = readTwelveDataApiKey();
 
-  console.log('Fetching ticker universe + P/FCF gap list + SEC ticker->CIK map...');
-  const [metricsDataset, tickerToCik, existingCache] = await Promise.all([
+  console.log('Fetching known foreign-filer list, ticker universe + P/FCF gap list + SEC ticker->CIK map...');
+  const [foreignFilerList, metricsDataset, tickerToCik, existingCache] = await Promise.all([
+    fetchSecJson(GIST_FOREIGN_FILER_LIST_URL).catch(() => null),
     fetchSecJson(GIST_METRICS_URL),
     fetchTickerToCikMap(),
     fetchSecJson(GIST_FOREIGN_PFCF_URL).catch(() => null),
@@ -315,24 +327,25 @@ async function main() {
 
   const cache = existingCache?.trends || {};
 
-  // The FULL covered universe, not just tickers with a null pfcfRatio card
-  // value — that's the wrong signal. A genuine IFRS filer's Finnhub NATIVE
-  // pfcfTTM series can be fully populated (verified live: Scorpio Tankers/
-  // STNG, Bank of Montreal/BMO both have real native pfcfRatio despite
-  // being IFRS filers with zero Quarterly/Yearly reconstruction available
-  // from anywhere) — a null card value only catches the subset with NO
-  // native coverage at all, missing every filer whose current-value ratio
-  // happens to be fine while its cadence-tab history isn't. The ifrs-full
-  // check below (before any Twelve Data spend) is what actually filters
-  // out the ~5,000 domestic tickers — cheap since it happens on the SEC
-  // fetch alone, before any Twelve Data budget is touched.
-  const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol]) => symbol);
-  const withCik = candidates.map((symbol) => ({ symbol, cik: tickerToCik.get(symbol) })).filter((c) => c.cik);
-  console.log(
-    `${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK ` +
-      `(the rest are either genuinely too new, or not SEC-registered at all). Each is checked for real IFRS data ` +
-      `before spending any Twelve Data budget — most will resolve quickly to "not a foreign filer, skip."`
-  );
+  // The ifrs-full check inside the loop below (before any Twelve Data
+  // spend) is what actually filters out non-IFRS tickers — cheap since it
+  // happens on the SEC fetch alone, before any Twelve Data budget is
+  // touched. Still kept as a real gate even on the fast path below (not
+  // just trusting the list blindly), same defense-in-depth
+  // generateForeignFilingsCache.js's own processTicker applies.
+  let withCik;
+  if (foreignFilerList?.foreignFilers?.length) {
+    withCik = foreignFilerList.foreignFilers;
+    console.log(`Using the published foreign-filer list (generated ${foreignFilerList.generatedAt}): ${withCik.length} known foreign filers.`);
+  } else {
+    // Graceful bootstrap fallback — same reasoning as
+    // generateForeignFilingsCache.js's identical fallback: slower, but
+    // never wrong, and only hit if the discovery job's list is unavailable.
+    console.log('No foreign-filer list available yet — falling back to a full-universe classification scan for this run.');
+    const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol]) => symbol);
+    withCik = candidates.map((symbol) => ({ symbol, cik: tickerToCik.get(symbol) })).filter((c) => c.cik);
+    console.log(`${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK.`);
+  }
 
   let processed = 0;
   let resolved = 0;
