@@ -81,6 +81,13 @@ const RECONCILE_TOLERANCE = 0.02; // 2%
 const STATEMENT_HEADINGS = {
   income: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
   cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS? OF CASH ?FLOWS/i,
+  // Not anchored on "CONSOLIDATED" needing to be the very first word — same
+  // reasoning as income/cashflow above (the regex isn't `^`-anchored, so
+  // "Condensed Consolidated Balance Sheets" still matches via the
+  // "Consolidated Balance Sheets" substring). Verified live: STNG uses
+  // "Condensed Consolidated Balance Sheets", IAG uses plain "Consolidated
+  // Balance Sheets" with no extra qualifiers.
+  balanceSheet: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(BALANCE SHEETS?|STATEMENTS? OF FINANCIAL POSITION)/i,
 };
 
 // A real statement title is always short - verified live this matters:
@@ -125,6 +132,15 @@ const LABEL_ALIASES = {
     include: /net (income|earnings|loss)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b/i,
     exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b/i,
   },
+  // ROIC's numerator (mirrors EBIT_CONCEPTS in generateForeignFilingsCache.js
+  // -- ProfitLossFromOperatingActivities/ProfitLossBeforeTax). Verified
+  // live: STNG labels this "Operating income", IAG "Earnings from
+  // operations" -- both single, unambiguous lines on the SAME income
+  // statement table revenue/netIncome are extracted from.
+  ebit: {
+    include: /operating income|operating profit|income from operations|earnings from operations|operating earnings/i,
+    exclude: /per share|margin|growth/i,
+  },
   ocf: {
     // "inflow"/"outflow" added -- verified live: Scorpio Tankers (STNG,
     // Marshall Islands-domiciled) labels this line "Net cash inflow from
@@ -146,6 +162,39 @@ const LABEL_ALIASES = {
     // the capex-specific summing tiebreak above, which combines the two).
     include: /capital expenditures?|purchase(s)? of property|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
+  },
+  // Balance-sheet (instant, not duration) concepts — see
+  // extractFromInstantTable/parseInstantTableColumns below. Mirrors
+  // EQUITY_CONCEPTS/DEBT_CONCEPTS/CASH_CONCEPTS' scope in
+  // generateForeignFilingsCache.js (the XBRL-sourced equivalents) so a
+  // text-extracted instant fact means the same thing as an XBRL one when
+  // the two get merged.
+  equity: {
+    // Verified live: STNG labels this "Total shareholders' equity" —
+    // matches the existing totalMatches tiebreak automatically (starts
+    // with "Total"). IAG's own grand-total equity row, by contrast, has NO
+    // text label at all (a bare subtotal row after "Non-controlling
+    // interests") — a known, accepted gap, not something this pattern can
+    // reach; see the module header notes.
+    include: /total (shareholders|stockholders)('|s)? equity|total equity/i,
+    exclude: /per share/i,
+  },
+  debt: {
+    // Verified live: both STNG and IAG split debt into two real balance-
+    // sheet lines — "Current portion of long-term debt" and "Long-term
+    // debt" — neither a subtotal of the other. Summed via the same
+    // capex-style tiebreak below (extended to cover debt too).
+    include: /long-?term debt|borrowings?|loans? payable|notes payable/i,
+    exclude: /proceeds|repayment|issuance/i,
+  },
+  cash: {
+    include: /cash and cash equivalents/i,
+    // Verified live: IAG's balance sheet has a SEPARATE "Restricted cash"
+    // line under non-current assets — a real, different asset, not part of
+    // the readily-available cash ROIC's invested-capital formula wants
+    // (mirrors investedCapitalByEnd's own XBRL-sourced CASH_CONCEPTS
+    // scope, which also excludes restricted cash).
+    exclude: /restricted/i,
   },
 };
 
@@ -604,6 +653,85 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
   return Object.keys(results).length ? { period: targetPeriod, facts: results } : null;
 }
 
+// ---------------------------------------------------------------------------
+// Balance-sheet (instant) extraction — equity/debt/cash for ROIC's invested-
+// capital side. Deliberately kept as SEPARATE functions from
+// extractFromTable/parseTableColumns above rather than generalizing those to
+// also handle instant columns: a balance sheet's header has no "months
+// ended" phrase at all (just two bare dates — "As of/As at June 30, 2026 /
+// December 31, 2025", each its OWN independent snapshot, not a 3mo-vs-6mo
+// duration pair), so forcing it through the duration-column parser would
+// need special-casing throughout anyway. Keeping this fully additive means
+// zero risk of regressing revenue/netIncome/ocf/capex extraction, which
+// every foreign-filer ticker already published data depends on.
+// ---------------------------------------------------------------------------
+
+// A balance-sheet header row's date cells are the SAME compound "<Month>
+// <Day>, <Year>" shape parseDateHeaderCell already recognizes (reused
+// as-is, unchanged) — just with no preceding period-length phrase to
+// combine with, since each date IS its own complete instant column.
+function parseInstantTableColumns($, table) {
+  const rows = $(table).find('tr').toArray();
+  for (let i = 0; i < rows.length; i++) {
+    const cells = nonEmptyCells($, rows[i]);
+    const dateCells = cells.map((c) => parseDateHeaderCell(c.text)).filter((d) => d && d.monthDay);
+    if (dateCells.length >= 2) {
+      const columns = dateCells.map((d) => ({ endMonthDay: d.monthDay, year: d.year }));
+      return { columns, dataStartRowIdx: i + 1 };
+    }
+  }
+  return null;
+}
+
+// Parses every date column in an already-located balance-sheet <table> —
+// unlike extractFromTable (which targets ONE specific quarter), every
+// column here is independently useful (a filing's own current-period AND
+// prior-year-comparative snapshots are both real, previously-undisclosed-
+// elsewhere data points), so this returns one result per column rather than
+// a single target period.
+function extractFromInstantTable($, table, aliasMap) {
+  const parsed = parseInstantTableColumns($, table);
+  if (!parsed) return [];
+  const { columns, dataStartRowIdx } = parsed;
+
+  const rows = $(table).find('tr').toArray();
+  const candidatesByColumn = columns.map(() => ({})); // concept -> [{label, value}]
+  for (let i = dataStartRowIdx; i < rows.length; i++) {
+    const cells = nonEmptyCells($, rows[i]);
+    if (!cells.length) continue;
+    const row = parseDataRow(cells, columns.length);
+    if (!row) continue;
+    for (const concept of Object.keys(aliasMap)) {
+      if (!matchesConcept(row.label, concept)) continue;
+      for (let c = 0; c < columns.length; c++) {
+        (candidatesByColumn[c][concept] = candidatesByColumn[c][concept] || []).push({ label: row.label, value: row.values[c] });
+      }
+    }
+  }
+
+  const out = [];
+  for (let c = 0; c < columns.length; c++) {
+    const results = {};
+    for (const [concept, list] of Object.entries(candidatesByColumn[c])) {
+      const distinct = [];
+      for (const cand of list) if (!distinct.some((d) => d.value === cand.value)) distinct.push(cand);
+      if (distinct.length === 1) { results[concept] = distinct[0]; continue; }
+      const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
+      if (totalMatches.length === 1) { results[concept] = totalMatches[0]; continue; }
+      // debt specifically: current + non-current portions are two real,
+      // genuinely separate lines with no single "Total debt" row — see
+      // LABEL_ALIASES.debt's own comment. Summed the same way capex's
+      // duration-side equivalent is above; safe because the sum still has
+      // to pass reconcileInstantPoints before it's ever trusted.
+      if (concept === 'debt' && results[concept] === undefined && distinct.length >= 2) {
+        results[concept] = { label: distinct.map((d) => d.label).join(' + '), value: distinct.reduce((sum, d) => sum + d.value, 0) };
+      }
+    }
+    if (Object.keys(results).length) out.push({ period: columns[c], facts: results });
+  }
+  return out;
+}
+
 // Locates a statement's heading + immediately-following <table> in a big
 // combined document (press release or formal financial-statements exhibit
 // — STNG/IAG/CNQ/AEM style), then delegates to extractFromTable.
@@ -638,6 +766,32 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
     if (result) return result;
   }
   return null;
+}
+
+// Same heading-location shape as extractStatement above, but for the
+// balance sheet: every date column is independently useful (see
+// extractFromInstantTable), so this returns an ARRAY of results (one per
+// column found), not a single target-period result.
+function extractInstantStatement($, headingRegex, aliasMap) {
+  const allEls = $('body *').toArray();
+  const headingIdxs = [];
+  for (let i = 0; i < allEls.length; i++) {
+    const text = $(allEls[i]).text();
+    if ($(allEls[i]).children().length === 0 && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
+  }
+  for (const headingIdx of headingIdxs) {
+    let table = null;
+    for (let i = headingIdx; i < allEls.length; i++) {
+      if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5) {
+        table = allEls[i];
+        break;
+      }
+    }
+    if (!table) continue;
+    const result = extractFromInstantTable($, table, aliasMap);
+    if (result.length) return result;
+  }
+  return [];
 }
 
 // SEC auto-renders each individual XBRL-tagged statement of an Inline XBRL
@@ -764,7 +918,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // identically in the filing that reports it AND, a year later, in the
   // filing that shows it as the prior-year comparative column - literal
   // agreement between two independent real documents.
-  const collected = { revenue: new Map(), netIncome: new Map(), ocf: new Map(), capex: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), ocf: new Map(), capex: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -792,6 +946,24 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     }
   }
 
+  // Instant-fact counterpart to recordExtracted above — no start date (a
+  // balance-sheet snapshot has no duration), and extractFromInstantTable
+  // already returns one entry PER DATE COLUMN, so this is called once per
+  // column rather than once per statement.
+  function recordExtractedInstant(extractedList, filing) {
+    for (const extracted of extractedList) {
+      const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
+      if (!endIso) continue;
+      for (const [concept, fact] of Object.entries(extracted.facts)) {
+        const list = collected[concept].get(endIso) || [];
+        if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
+          list.push({ end: endIso, val: fact.value, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
+        }
+        collected[concept].set(endIso, list);
+      }
+    }
+  }
+
   for (const filing of filings) {
     // FilingSummary.xml path first — SEC's own manifest for Inline XBRL
     // filings, pointing directly at the exact page for each statement
@@ -808,7 +980,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const reports = await fetchFilingSummaryReports(cik, filing.accessionNumber, userAgent);
       if (reports.length) {
         const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
-        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome }).filter(([, v]) => v));
+        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit }).filter(([, v]) => v));
         const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
         const matches = [
           ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases })) : []),
@@ -862,15 +1034,16 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const fullText = $('body').text();
       const hasIncome = STATEMENT_HEADINGS.income.test(fullText);
       const hasCashflow = STATEMENT_HEADINGS.cashflow.test(fullText);
-      if (debug) console.error('DEBUG', url, 'hasIncome', hasIncome, 'hasCashflow', hasCashflow);
-      if (!hasIncome && !hasCashflow) continue;
+      const hasBalanceSheet = STATEMENT_HEADINGS.balanceSheet.test(fullText);
+      if (debug) console.error('DEBUG', url, 'hasIncome', hasIncome, 'hasCashflow', hasCashflow, 'hasBalanceSheet', hasBalanceSheet);
+      if (!hasIncome && !hasCashflow && !hasBalanceSheet) continue;
 
       // Try every year we might plausibly need (this filing's own filing
       // year and the one prior) rather than assuming which quarter it covers.
       const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
 
       for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow]) {
-        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome };
+        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit };
         const cashflowAliases = { ocf: aliasMap.ocf, capex: aliasMap.capex };
         const relevantAliases = heading === STATEMENT_HEADINGS.income ? incomeAliases : cashflowAliases;
         const filtered = Object.fromEntries(Object.entries(relevantAliases).filter(([, v]) => v));
@@ -887,6 +1060,19 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           if (debug) console.error('DEBUG extractStatement result', url, year, JSON.stringify(extracted));
           recordExtracted(extracted, filing);
         }
+      }
+
+      const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
+      if (Object.keys(balanceSheetAliases).length) {
+        let extractedList;
+        try {
+          extractedList = extractInstantStatement($, STATEMENT_HEADINGS.balanceSheet, balanceSheetAliases);
+        } catch (e) {
+          if (debug) console.error('DEBUG extractInstantStatement threw', url, e.message);
+          extractedList = [];
+        }
+        if (debug) console.error('DEBUG extractInstantStatement result', url, JSON.stringify(extractedList));
+        recordExtractedInstant(extractedList, filing);
       }
     }
   }
@@ -967,7 +1153,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
 
   const result = {};
   for (const [concept, points] of pointsByConcept) {
-    const verified = reconcilePoints(points, annualByEnd?.[concept] || new Map());
+    const verified = INSTANT_CONCEPTS.has(concept) ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map()) : reconcilePoints(points, annualByEnd?.[concept] || new Map());
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
@@ -1030,6 +1216,38 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
     }
   }
   return bestScore > 0 ? bestScale : 1;
+}
+
+const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
+
+// Instant-fact counterpart to reconcilePoints below. Deliberately NOT the
+// same function with a branch inside it: reconcilePoints' Check A/B are
+// both flow-specific (summing MULTIPLE periods together to match a
+// cumulative-column or annual total) -- semantically meaningless for a
+// point-in-time balance-sheet snapshot, and reusing them risked an
+// accidental coincidental match verifying a wrong value. Two checks here,
+// both genuinely valid for instant facts:
+//   C. Cross-filing corroboration (identical to reconcilePoints' own Check
+//      C) -- the same real value at the same date, independently disclosed
+//      in 2+ separate filings (e.g. this filing's own current-period
+//      column, and a year later, the SAME date reappearing as another
+//      filing's prior-year comparative column).
+//   B'. Direct match against a REAL XBRL instant fact at the SAME end
+//      date -- not a sum, just point equality within tolerance. Useful
+//      whenever a filer's balance-sheet comparative column lands on a
+//      date XBRL also happens to have tagged (most commonly a fiscal
+//      year-end, since annual 10-K/40-F-equivalent filings usually DO get
+//      XBRL-tagged even for filers with no interim XBRL at all).
+function reconcileInstantPoints(points, knownByEnd) {
+  const verified = new Set();
+  for (const p of points) if (p.corroborations >= 2) verified.add(p);
+  for (const p of points) {
+    const known = knownByEnd.get(p.end);
+    if (known?.value == null) continue;
+    const diff = Math.abs(p.val - known.value) / Math.abs(known.value);
+    if (diff <= RECONCILE_TOLERANCE) verified.add(p);
+  }
+  return points.filter((p) => verified.has(p));
 }
 
 function reconcilePoints(points, annualByEnd) {
@@ -1121,7 +1339,11 @@ module.exports = {
   subtractThreeMonths,
   monthDayYearToIso,
   reconcilePoints,
+  reconcileInstantPoints,
   detectScaleMultiplier,
+  parseInstantTableColumns,
+  extractFromInstantTable,
+  extractInstantStatement,
   extractQuarterlyFactsFromFilings,
   throttleSecRequest,
 };

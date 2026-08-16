@@ -776,7 +776,15 @@ async function processTicker(symbol, cik, isBank) {
   let ocf = dedupeAndClassify(ocfRaw);
   let capex = dedupeAndClassify(capexRaw);
   let netIncome = dedupeAndClassify(netIncomeRaw);
-  const ebit = dedupeAndClassify(ebitRaw);
+  let ebit = dedupeAndClassify(ebitRaw);
+  // Computed early (moved ahead of dedupeInstantFacts's original call site
+  // further below) so the filing-text fallback right below can use these
+  // as reconciliation anchors (reconcileInstantPoints' direct-date-match
+  // check) BEFORE any text-extracted facts get merged in — re-run after
+  // merging, same pattern the flow concepts already use.
+  let equityInstant = dedupeInstantFacts(equityRaw);
+  let cashInstant = dedupeInstantFacts(cashRaw);
+  let debtInstant = dedupeInstantFacts(debtRaw);
 
   // Fallback: for tickers whose SEC XBRL genuinely has zero standalone-
   // quarter facts (foreign private issuers are exempt from 10-Q filing —
@@ -803,15 +811,36 @@ async function processTicker(symbol, cik, isBank) {
       const needed = [];
       if (needsFilingTextBackfill(revenue.quarterly, revenue.annual)) needed.push('revenue');
       if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) needed.push('netIncome');
+      if (needsFilingTextBackfill(ebit.quarterly, ebit.annual)) needed.push('ebit');
       if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) needed.push('ocf');
       if (needsFilingTextBackfill(capex.quarterly, capex.annual)) needed.push('capex');
+
+      // Balance-sheet (equity/debt/cash) concepts don't have their own
+      // quarterly/annual split to run needsFilingTextBackfill against (an
+      // instant snapshot isn't "quarterly" or "annual", just a date) — so
+      // this reuses the flow concepts' own verdict as the trigger instead:
+      // a ticker with sparse-enough interim XBRL to need revenue/netIncome/
+      // ocf/capex from 6-K text almost always has the same gap for its
+      // balance sheet too (same root cause — foreign private issuers exempt
+      // from 10-Q filing), and the filings needed are the SAME ones already
+      // about to be fetched/scanned for the flow concepts, so this is free.
+      if (needed.length) needed.push('equity', 'debt', 'cash');
 
       if (needed.length) {
         const annualByEnd = {
           revenue: new Map(revenue.annual.map((a) => [a.end, a])),
           netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
+          ebit: new Map(ebit.annual.map((a) => [a.end, a])),
           ocf: new Map(ocf.annual.map((a) => [a.end, a])),
           capex: new Map(capex.annual.map((a) => [a.end, a])),
+          // Not actually "annual" for these three — reconcileInstantPoints
+          // treats this as a direct same-date-match anchor (any real XBRL
+          // instant fact, not specifically a fiscal year-end one), reusing
+          // the same annualByEnd plumbing rather than adding a parallel
+          // parameter.
+          equity: new Map(equityInstant.map((e) => [e.end, e])),
+          debt: new Map(debtInstant.map((e) => [e.end, e])),
+          cash: new Map(cashInstant.map((e) => [e.end, e])),
         };
         let filingTextFacts = {};
         try {
@@ -821,6 +850,7 @@ async function processTicker(symbol, cik, isBank) {
         }
         if (filingTextFacts.revenue?.length) revenue = dedupeAndClassify([...revenueRaw, ...filingTextFacts.revenue]);
         if (filingTextFacts.netIncome?.length) netIncome = dedupeAndClassify([...netIncomeRaw, ...filingTextFacts.netIncome]);
+        if (filingTextFacts.ebit?.length) ebit = dedupeAndClassify([...ebitRaw, ...filingTextFacts.ebit]);
         if (filingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...filingTextFacts.ocf]);
         // XBRL's capex concept is a positive magnitude (verified live:
         // IAG's FY2025 capex = 293,500,000) but the press-release table
@@ -830,6 +860,9 @@ async function processTicker(symbol, cik, isBank) {
         if (filingTextFacts.capex?.length) {
           capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
         }
+        if (filingTextFacts.equity?.length) equityInstant = dedupeInstantFacts([...equityRaw, ...filingTextFacts.equity]);
+        if (filingTextFacts.debt?.length) debtInstant = dedupeInstantFacts([...debtRaw, ...filingTextFacts.debt]);
+        if (filingTextFacts.cash?.length) cashInstant = dedupeInstantFacts([...cashRaw, ...filingTextFacts.cash]);
       }
     }
   }
@@ -885,20 +918,17 @@ async function processTicker(symbol, cik, isBank) {
   // real quarters they surfaced (e.g. STNG's Q1-Q3 revenue, only available
   // via the 6-K fallback since XBRL itself has no standalone-quarter facts
   // for it at all — see deriveMissingQuarterFromAnnual's own comment).
-  // Flow concepts only (revenue/netIncome/ocf/capex) — equity/cash/debt
+  // Flow concepts only (revenue/netIncome/ebit/ocf/capex) — equity/cash/debt
   // below are point-in-time balance-sheet snapshots, not additive across
   // quarters, same scope boundary the main pipeline's ROIC derivation
   // draws in generateSectorMetrics.js.
-  for (const flow of [revenue, netIncome, ocf, capex]) {
+  for (const flow of [revenue, netIncome, ebit, ocf, capex]) {
     const derivedQuarters = deriveMissingQuarterFromAnnual(flow.quarterly, flow.annual);
     if (derivedQuarters.length) {
       flow.quarterly = [...flow.quarterly, ...derivedQuarters].sort((a, b) => new Date(a.start) - new Date(b.start));
     }
   }
 
-  const equityInstant = dedupeInstantFacts(equityRaw);
-  const cashInstant = dedupeInstantFacts(cashRaw);
-  const debtInstant = dedupeInstantFacts(debtRaw);
   const investedCapitalMap = investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank);
 
   const capexQByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
