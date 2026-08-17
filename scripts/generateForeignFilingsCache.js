@@ -174,9 +174,37 @@ const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfShares
 //     operating liability for a bank, not a financing choice, so bank
 //     filers like BMO naturally get debt=0 without any special-casing.
 const EBIT_CONCEPTS = ['ProfitLossFromOperatingActivities', 'ProfitLossBeforeTax', 'OperatingIncomeLoss'];
-const EQUITY_CONCEPTS = ['Equity'];
-const CASH_CONCEPTS = ['CashAndCashEquivalents'];
-const DEBT_CONCEPTS = ['Borrowings', 'LongtermBorrowings', 'CurrentPortionOfLongtermBorrowings'];
+// us-gaap equivalents added -- verified live this was the actual reason
+// ROIC was at 99% empty (391/395) for the newly-classified us-gaap foreign
+// filer population specifically: 'Equity'/'CashAndCashEquivalents'/
+// 'Borrowings' are ifrs-full-only concept names, never valid under
+// us-gaap, so XBRL-sourced invested capital was silently zero for that
+// entire population even though revenue/netIncome/ebit/ocf/capex had
+// already been fixed. Mirrors the domestic pipeline's own
+// SEC_EQUITY_CONCEPTS/SEC_CASH_CONCEPTS/DEBT_CONCEPTS in
+// generateSectorMetrics.js (battle-tested there across many real filers,
+// including several "verified live" per-company surprises like CVS's
+// combined debt+lease concept and Capital One's 3-way debt split).
+const EQUITY_CONCEPTS = ['Equity', 'StockholdersEquity'];
+const CASH_CONCEPTS = ['CashAndCashEquivalents', 'CashAndCashEquivalentsAtCarryingValue', 'CashAndCashEquivalentsAtFairValue', 'Cash'];
+const DEBT_CONCEPTS = [
+  'Borrowings',
+  'LongtermBorrowings',
+  'CurrentPortionOfLongtermBorrowings',
+  'LongTermDebtNoncurrent',
+  'LongTermDebtCurrent',
+  'LongTermDebt',
+  'ShortTermBorrowings',
+  'CommercialPaper',
+  'DebtCurrent',
+  'SecuredDebtCurrent',
+  'OtherLongTermDebtNoncurrent',
+  'LongTermDebtAndCapitalLeaseObligationsCurrent',
+  'LongTermDebtAndCapitalLeaseObligations',
+  'SecuredDebt',
+  'UnsecuredDebt',
+  'OtherBorrowings',
+];
 const ROIC_ASSUMED_TAX_RATE = 0.21; // matches the main pipeline's own default simplification
 
 // Searches ifrs-full first (what every foreign filer verified so far uses),
@@ -812,6 +840,20 @@ function needsFilingTextBackfill(quarterlyPoints, annualPoints) {
   return hasRecentQuarterlyGap(quarterlyPoints);
 }
 
+// Instant-fact (equity/debt/cash) counterpart -- no annual anchor to
+// compare against (an instant snapshot has no "cumulative" concept the way
+// a flow does), so this just checks whether the most recent real point is
+// itself stale relative to now. Same threshold as the flow-concept check
+// for consistency, generous enough to tolerate a filer that only discloses
+// its balance sheet semi-annually (verified live: STNG only shows a
+// balance sheet alongside its H1/FY earnings releases, not every quarter)
+// without misfiring on that as "stale".
+function needsInstantBackfill(instantPoints) {
+  if (!instantPoints.length) return true;
+  const lastEnd = new Date(instantPoints[instantPoints.length - 1].end);
+  return Date.now() - lastEnd.getTime() > QUARTERLY_STALE_GAP_DAYS * 24 * 60 * 60 * 1000;
+}
+
 // Returns { quarterly, yearly, ttm }, each an object keyed by
 // revenueGrowth/profitMargin/fcfMargin (only the ones with enough
 // underlying data to compute) — each cadence stands on its own, computed
@@ -931,26 +973,49 @@ async function processTicker(symbol, cik, isBank) {
       const needed = [];
       if (needsFilingTextBackfill(revenue.quarterly, revenue.annual)) needed.push('revenue');
       if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) needed.push('netIncome');
-      if (needsFilingTextBackfill(ebit.quarterly, ebit.annual)) needed.push('ebit');
+      // pretaxIncome requested WHENEVER ebit is, not just when ebit's own
+      // extraction fails -- verified live: Ardmore Shipping (ASC) has no
+      // "operating income" line in its income statement at all (nets
+      // interest/gains-on-sale in before its only pre-net-income subtotal,
+      // "Income before taxes and equity method investments"), so the ebit
+      // pattern would always come back empty for this filer, every run,
+      // if only attempted after already failing. Requesting both up front
+      // costs nothing extra -- same filings already being scanned either way.
+      const ebitNeeded = needsFilingTextBackfill(ebit.quarterly, ebit.annual);
+      if (ebitNeeded) needed.push('ebit', 'pretaxIncome');
       if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) needed.push('ocf');
       if (needsFilingTextBackfill(capex.quarterly, capex.annual)) needed.push('capex');
 
       // Balance-sheet (equity/debt/cash) concepts don't have their own
       // quarterly/annual split to run needsFilingTextBackfill against (an
-      // instant snapshot isn't "quarterly" or "annual", just a date) — so
-      // this reuses the flow concepts' own verdict as the trigger instead:
-      // a ticker with sparse-enough interim XBRL to need revenue/netIncome/
+      // instant snapshot isn't "quarterly" or "annual", just a date) —
+      // originally just reused the flow concepts' own verdict as the
+      // trigger, on the theory that a ticker needing revenue/netIncome/
       // ocf/capex from 6-K text almost always has the same gap for its
-      // balance sheet too (same root cause — foreign private issuers exempt
-      // from 10-Q filing), and the filings needed are the SAME ones already
-      // about to be fetched/scanned for the flow concepts, so this is free.
-      if (needed.length) needed.push('equity', 'debt', 'cash');
+      // balance sheet too. Verified live this ISN'T always true: ASC's
+      // revenue/profitMargin are already fresh straight from XBRL (never
+      // trigger the flow-concept fallback at all), while its equity/debt/
+      // cash XBRL genuinely stops around 2019 -- different concepts,
+      // different real coverage, so piggybacking on the flow verdict alone
+      // left ROIC stuck stale even for a ticker with otherwise-current
+      // data. Now ALSO triggers independently whenever the balance-sheet
+      // data's own most recent point is stale, on top of (not instead of)
+      // the original free-ride case.
+      const balanceSheetStale = needsInstantBackfill(equityInstant) || needsInstantBackfill(debtInstant) || needsInstantBackfill(cashInstant);
+      if (needed.length || balanceSheetStale) needed.push('equity', 'debt', 'cash');
 
       if (needed.length) {
         const annualByEnd = {
           revenue: new Map(revenue.annual.map((a) => [a.end, a])),
           netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
           ebit: new Map(ebit.annual.map((a) => [a.end, a])),
+          // Reuses ebit's own annual map as pretaxIncome's reconciliation
+          // anchor too -- extractFactSeries's EBIT_CONCEPTS list already
+          // tries ProfitLossBeforeTax as a fallback when a filer has no
+          // operating-income XBRL concept at all, so ebit.annual is ALREADY
+          // pretax-income-sourced for exactly the filers (like ASC) that
+          // need this quarterly fallback -- the right anchor either way.
+          pretaxIncome: new Map(ebit.annual.map((a) => [a.end, a])),
           ocf: new Map(ocf.annual.map((a) => [a.end, a])),
           capex: new Map(capex.annual.map((a) => [a.end, a])),
           // Not actually "annual" for these three — reconcileInstantPoints
@@ -971,6 +1036,12 @@ async function processTicker(symbol, cik, isBank) {
         if (filingTextFacts.revenue?.length) revenue = dedupeAndClassify([...revenueRaw, ...filingTextFacts.revenue]);
         if (filingTextFacts.netIncome?.length) netIncome = dedupeAndClassify([...netIncomeRaw, ...filingTextFacts.netIncome]);
         if (filingTextFacts.ebit?.length) ebit = dedupeAndClassify([...ebitRaw, ...filingTextFacts.ebit]);
+        // Only reached when the filer has no operating-income line at all
+        // (verified live: ASC) -- ebit's own text extraction above will
+        // have found nothing to merge, so this is the sole source for it.
+        if (ebitNeeded && needsFilingTextBackfill(ebit.quarterly, ebit.annual) && filingTextFacts.pretaxIncome?.length) {
+          ebit = dedupeAndClassify([...ebitRaw, ...filingTextFacts.pretaxIncome]);
+        }
         if (filingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...filingTextFacts.ocf]);
         // XBRL's capex concept is a positive magnitude (verified live:
         // IAG's FY2025 capex = 293,500,000) but the press-release table

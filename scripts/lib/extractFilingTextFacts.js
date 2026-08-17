@@ -141,6 +141,22 @@ const LABEL_ALIASES = {
     include: /operating income|operating profit|income from operations|earnings from operations|operating earnings/i,
     exclude: /per share|margin|growth/i,
   },
+  // Fallback for a filer with no operating-income subtotal at all --
+  // verified live: Ardmore Shipping (ASC) nets interest/gains-on-sale in
+  // BEFORE its only pre-net-income subtotal, "Income before taxes and
+  // equity method investments" -- mirrors EBIT_CONCEPTS' own
+  // ProfitLossBeforeTax fallback on the XBRL side (same reasoning: some
+  // filers, notably banks, don't report a genuine operating-income line
+  // at all). Deliberately a SEPARATE concept from ebit rather than folded
+  // into the same include pattern -- a filer that reports BOTH lines
+  // (the common case) would otherwise match twice and get dropped as
+  // ambiguous; the caller only requests this when ebit itself came back
+  // empty, giving the same "operating income first, pre-tax as backup"
+  // tier the XBRL concept list already has.
+  pretaxIncome: {
+    include: /income before (income )?tax|profit before tax|pre-?tax income|earnings before (income )?tax/i,
+    exclude: /per share|margin|growth/i,
+  },
   ocf: {
     // "inflow"/"outflow" added -- verified live: Scorpio Tankers (STNG,
     // Marshall Islands-domiciled) labels this line "Net cash inflow from
@@ -934,7 +950,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // identically in the filing that reports it AND, a year later, in the
   // filing that shows it as the prior-year comparative column - literal
   // agreement between two independent real documents.
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), ocf: new Map(), capex: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -996,7 +1012,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const reports = await fetchFilingSummaryReports(cik, filing.accessionNumber, userAgent);
       if (reports.length) {
         const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
-        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit }).filter(([, v]) => v));
+        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome }).filter(([, v]) => v));
         const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
         const matches = [
           ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases })) : []),
@@ -1059,7 +1075,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
 
       for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow]) {
-        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit };
+        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome };
         const cashflowAliases = { ocf: aliasMap.ocf, capex: aliasMap.capex };
         const relevantAliases = heading === STATEMENT_HEADINGS.income ? incomeAliases : cashflowAliases;
         const filtered = Object.fromEntries(Object.entries(relevantAliases).filter(([, v]) => v));
