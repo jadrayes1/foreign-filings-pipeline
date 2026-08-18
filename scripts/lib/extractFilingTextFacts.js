@@ -137,8 +137,19 @@ const LABEL_ALIASES = {
   // live: STNG labels this "Operating income", IAG "Earnings from
   // operations" -- both single, unambiguous lines on the SAME income
   // statement table revenue/netIncome are extracted from.
+  // "loss" added as an alternative to "income/profit/earnings" throughout
+  // -- verified live: Cango Inc (CANG) labels this line "Loss from
+  // operations" in a quarter where it actually lost money at the
+  // operating level, not "Income from operations". Mirrors netIncome's
+  // own pattern just above, which already handles this exact case
+  // (net (income|earnings|loss)) -- ebit/pretaxIncome were added later and
+  // missed replicating it, very likely the single largest reason a broad
+  // full-universe scan found ROIC still empty for the majority of foreign
+  // filers even after every other fix this session: ANY company that's
+  // ever reported an operating loss in the periods being scanned hits
+  // this, not just an unlucky few.
   ebit: {
-    include: /operating income|operating profit|income from operations|earnings from operations|operating earnings/i,
+    include: /operating (income|profit|earnings|loss)|(income|profit|earnings|loss) from operations/i,
     exclude: /per share|margin|growth/i,
   },
   // Fallback for a filer with no operating-income subtotal at all --
@@ -153,8 +164,13 @@ const LABEL_ALIASES = {
   // ambiguous; the caller only requests this when ebit itself came back
   // empty, giving the same "operating income first, pre-tax as backup"
   // tier the XBRL concept list already has.
+  //
+  // Tolerant of a "(loss)" parenthetical inserted between "income" and
+  // "before tax" -- verified live: CANG labels this exact line "Net
+  // income (loss) before income taxes", the same dual-framing convention
+  // netIncome's own "profit \(loss\)" pattern already accounts for.
   pretaxIncome: {
-    include: /income before (income )?tax|profit before tax|pre-?tax income|earnings before (income )?tax/i,
+    include: /(income|profit|earnings)\s*(\(loss\))?\s*before (income )?tax|pre-?tax (income|loss)/i,
     exclude: /per share|margin|growth/i,
   },
   ocf: {
@@ -374,7 +390,12 @@ function parsePeriodPhrase(text) {
 // stray "Notes" or "(In millions...)" label) is correctly ignored.
 function parseDateHeaderCell(text) {
   if (isYearCell(text)) return { year: extractYear(text), monthDay: null };
-  const compound = text.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})$/);
+  // CANG's balance sheet (and presumably other filers') labels each date
+  // column "As of December 31, 2024" rather than a bare date -- strip the
+  // prefix before the anchored date match rather than loosening the date
+  // match itself, so this can't accidentally start matching non-date cells.
+  const stripped = text.replace(/^as\s+(of|at)\s+/i, '').trim();
+  const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})$/);
   if (compound) return { year: compound[3], monthDay: `${compound[1]} ${compound[2]}` };
   return null;
 }
@@ -764,6 +785,59 @@ function extractFromInstantTable($, table, aliasMap) {
   return out;
 }
 
+// True for an element with no "real" child elements -- tolerates <br> (a
+// heading is sometimes written as "CANGO INC.<br>...BALANCE SHEETS<br>..."
+// inside one <b>, which still reads as a single heading string via
+// .text() but has element children, so a strict children().length === 0
+// check misses it entirely). Verified live: CANG's balance-sheet heading
+// is wrapped exactly this way, and its balance-sheet extraction came back
+// completely empty as a result -- the table search inside extractStatement/
+// extractInstantStatement never even started because no leaf ever matched
+// the heading regex.
+//
+// Tolerating <br> alone is too permissive on its own, though -- verified
+// live: AEM's non-GAAP reconciliation table has a row labeled "Production
+// costs per the consolidated statements of income<br>(thousands)", whose
+// <td> also has only a <br> child, and the label text contains the income-
+// statement heading phrase as a substring. A genuine heading occupies its
+// OWN row (a caption, alone); this false positive sits in a real data row
+// alongside sibling cells holding the row's dollar values. Require the
+// enclosing <tr> (if any) to have exactly one non-empty cell -- the heading
+// itself -- to tell the two apart. A heading with no enclosing <tr> at all
+// (the common case -- a standalone <p>/<div>) is unaffected.
+function isHeadingLeaf($, $el) {
+  if (!$el.children().toArray().every((c) => c.tagName === 'br')) return false;
+  const tr = $el.closest('tr');
+  if (!tr.length) return true;
+  return nonEmptyCells($, tr[0]).length === 1;
+}
+
+// Finds candidate <table>s a heading could belong to. Two real document
+// shapes seen so far: (1) STNG/IAG/GDTC/AEM style -- the heading is a
+// standalone element and the data table is the next <table> encountered
+// scanning forward (the original, extensively-verified behavior -- tried
+// first so nothing that already worked can regress); (2) CANG style -- the
+// heading is itself the first row/cell *inside* the very table that holds
+// the data (its own <table> tag therefore appears BEFORE the heading in
+// document order, which a forward-only scan can never reach) -- tried only
+// as a fallback, since trusting it FIRST caused a real regression: AEM's
+// income-statement heading sits inside a small unrelated wrapper table (a
+// by-product-revenue footnote, not the real ~$1.8B statement) that also
+// happens to have >=5 rows. Callers try each candidate in turn and keep the
+// first one that yields a real result.
+function findStatementTables($, allEls, headingIdx) {
+  const candidates = [];
+  for (let i = headingIdx; i < allEls.length; i++) {
+    if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5) {
+      candidates.push(allEls[i]);
+      break;
+    }
+  }
+  const enclosing = $(allEls[headingIdx]).closest('table');
+  if (enclosing.length && enclosing.find('tr').length >= 5 && enclosing[0] !== candidates[0]) candidates.push(enclosing[0]);
+  return candidates;
+}
+
 // Locates a statement's heading + immediately-following <table> in a big
 // combined document (press release or formal financial-statements exhibit
 // — STNG/IAG/CNQ/AEM style), then delegates to extractFromTable.
@@ -771,8 +845,9 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
   const allEls = $('body *').toArray();
   const headingIdxs = [];
   for (let i = 0; i < allEls.length; i++) {
-    const text = $(allEls[i]).text();
-    if ($(allEls[i]).children().length === 0 && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
+    const $el = $(allEls[i]);
+    const text = $el.text();
+    if (isHeadingLeaf($, $el) && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
   }
   // A heading can appear more than once (verified live: IAG's financial-
   // statements exhibit has a table-of-contents entry using the exact same
@@ -786,16 +861,10 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
     // spacer table before the real (40+ row) data table further down. Skip
     // trivial tables and keep scanning, same guard extractFromRFile already
     // uses for its own (much noisier) per-page table search.
-    let table = null;
-    for (let i = headingIdx; i < allEls.length; i++) {
-      if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5) {
-        table = allEls[i];
-        break;
-      }
+    for (const table of findStatementTables($, allEls, headingIdx)) {
+      const result = extractFromTable($, table, targetEndYear, aliasMap);
+      if (result) return result;
     }
-    if (!table) continue;
-    const result = extractFromTable($, table, targetEndYear, aliasMap);
-    if (result) return result;
   }
   return null;
 }
@@ -808,20 +877,15 @@ function extractInstantStatement($, headingRegex, aliasMap) {
   const allEls = $('body *').toArray();
   const headingIdxs = [];
   for (let i = 0; i < allEls.length; i++) {
-    const text = $(allEls[i]).text();
-    if ($(allEls[i]).children().length === 0 && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
+    const $el = $(allEls[i]);
+    const text = $el.text();
+    if (isHeadingLeaf($, $el) && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
   }
   for (const headingIdx of headingIdxs) {
-    let table = null;
-    for (let i = headingIdx; i < allEls.length; i++) {
-      if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5) {
-        table = allEls[i];
-        break;
-      }
+    for (const table of findStatementTables($, allEls, headingIdx)) {
+      const result = extractFromInstantTable($, table, aliasMap);
+      if (result.length) return result;
     }
-    if (!table) continue;
-    const result = extractFromInstantTable($, table, aliasMap);
-    if (result.length) return result;
   }
   return [];
 }
