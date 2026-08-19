@@ -239,8 +239,24 @@ function daysBetween(startStr, endStr) {
 function quarterLabelFromDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return null;
-  const q = Math.floor(d.getUTCMonth() / 3) + 1;
-  return `Q${q} '${String(d.getUTCFullYear()).slice(-2)}`;
+  // Subtract a day before classifying -- a DERIVED quarter's end date is
+  // sometimes computed as "the day the next quarter starts" (see
+  // dedupeAndClassify's H1/annual decumulation), which can legitimately
+  // fall on the 1st of the following month rather than the last day of
+  // the quarter it actually closes out. Verified live: TNK's own Q2
+  // duration starts "2017-04-01" per its own disclosed period boundary,
+  // so a derived Q1 (H1 total minus known Q2) ends up dated the same
+  // "2017-04-01" -- correct as a boundary, but a naive calendar-month
+  // classification mislabels it "Q2 '17", colliding with the REAL Q2
+  // anchor (which correctly ends June 30) under the identical label, and
+  // silently doubling that quarter in any trend built from labels alone
+  // (verified live in TTM revenue growth). No genuine accounting period
+  // ends on the 1st of a month, so this adjustment can't misclassify any
+  // real date -- every normal month-end (Mar 31, Jun 30, Sep 30, Dec 31)
+  // shifts back one day and stays within the same quarter.
+  const adjusted = new Date(d.getTime() - 24 * 60 * 60 * 1000);
+  const q = Math.floor(adjusted.getUTCMonth() / 3) + 1;
+  return `Q${q} '${String(adjusted.getUTCFullYear()).slice(-2)}`;
 }
 
 // Dedupes by (start, end) — preferring the most-recently-`filed` value, since

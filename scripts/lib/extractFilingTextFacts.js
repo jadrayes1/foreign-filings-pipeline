@@ -150,7 +150,20 @@ const LABEL_ALIASES = {
   // this, not just an unlucky few.
   ebit: {
     include: /operating (income|profit|earnings|loss)|(income|profit|earnings|loss) from operations/i,
-    exclude: /per share|margin|growth/i,
+    // "^other\b" added -- verified live: IMPP's income statement has a real
+    // sub-component line, "Other operating income" (a piece that rolls
+    // UP INTO the real "Income from operations" subtotal, not the subtotal
+    // itself), which also matches "operating income" via this rule's own
+    // first alternative. Both labels lack a "Total" prefix, so the
+    // ambiguity tiebreak below can't resolve it either -- previously
+    // harmless only because "Other operating income"'s row had a cell-count
+    // mismatch (split-parenthesis formatting, see nonEmptyCells) that made
+    // it unparseable and silently dropped; fixing that formatting quirk
+    // elsewhere ironically made this row parseable too, turning a
+    // previously-unambiguous match into a real conflict that suppressed
+    // ebit entirely for this filer. A real operating-income SUBTOTAL is
+    // never itself prefixed "Other" in standard accounting presentation.
+    exclude: /per share|margin|growth|^other\b/i,
   },
   // Fallback for a filer with no operating-income subtotal at all --
   // verified live: Ardmore Shipping (ASC) nets interest/gains-on-sale in
@@ -192,7 +205,15 @@ const LABEL_ALIASES = {
     // "Acquisition of vessels and payments for vessels under
     // construction" and "Drydock and other vessel related payments" (see
     // the capex-specific summing tiebreak above, which combines the two).
-    include: /capital expenditures?|purchase(s)? of property|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
+    // "of property" tolerates ONE inserted qualifier word before "property"
+    // -- verified live: AAUC (a gold miner) labels this line "Purchase of
+    // mineral property, plant and equipment", which the original
+    // "purchase(s)? of property" (no gap allowed) never matched. Capex came
+    // back completely empty for AAUC as a result, dragging fcfMargin down
+    // with it even though revenue/ebit extraction were both fine --
+    // confirmed this is a distinct root cause from ROIC's reconciliation
+    // gap, not the same bug wearing a different mask.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -345,11 +366,29 @@ function extractYear(text) {
 }
 
 function nonEmptyCells($, row) {
-  return $(row)
+  const cells = $(row)
     .find('td,th')
     .toArray()
     .map((c) => ({ text: $(c).text().replace(/\s+/g, ' ').trim(), colspan: parseInt($(c).attr('colspan') || '1', 10) }))
     .filter((c) => c.text.length > 0);
+  // Merge a lone ")" cell into the immediately preceding one -- verified
+  // live: CANG's Q4/full-year release renders a negative value's closing
+  // parenthesis in its own separate <td> ("(688,395" then ")" as two
+  // adjacent cells, presumably for right-alignment), which otherwise
+  // inflates the row's cell count past columns.length and makes every
+  // loss-reporting row in the table unparseable (a same-table row with only
+  // positive values, with no parenthesis to split, is unaffected -- verified
+  // live too). A cell whose ENTIRE text is just ")" is never meaningful
+  // data on its own, so merging it is safe regardless of what precedes it.
+  const merged = [];
+  for (const c of cells) {
+    if (c.text === ')' && merged.length) {
+      merged[merged.length - 1] = { ...merged[merged.length - 1], text: merged[merged.length - 1].text + ')' };
+    } else {
+      merged.push(c);
+    }
+  }
+  return merged;
 }
 
 // "For the three months ended June 30," -> {months: 3, endMonthDay: 'June 30'}
@@ -366,7 +405,17 @@ function nonEmptyCells($, row) {
 // enough the first time -- the OUTER gate that decides whether to even
 // call it also only recognized literal "month(s) ended", silently
 // discarding this row before parsePeriodPhrase ever ran.
-const PERIOD_PHRASE_INDICATOR = /months? ended|quarters? ended/i;
+// "years? ended" added -- verified live: CANG's Q4/full-year combined
+// earnings release headers its two column groups "For three months ended
+// December 31" and "For the years ended" side by side (4 date cells: 3mo-
+// 2024, 3mo-2025, FY-2024, FY-2025). Without this, the annual phrase cell
+// didn't match at all and was silently dropped from periodPhrases, leaving
+// only the 3-month phrase to cover all 4 date cells -- the even-
+// distribution math in parseTableColumns then mislabeled the two real
+// full-year columns as 3-month too, corrupting every concept extracted
+// from this table shape (a near-universal one: any foreign filer's Q4
+// release plausibly has both a quarter and a full-year column together).
+const PERIOD_PHRASE_INDICATOR = /months? ended|quarters? ended|years? ended/i;
 
 function parsePeriodPhrase(text) {
   const months = /nine months|9 months/i.test(text)
@@ -375,7 +424,9 @@ function parsePeriodPhrase(text) {
       ? 6
       : /three months|3 months|quarters? ended/i.test(text)
         ? 3
-        : null;
+        : /twelve months|12 months|years? ended/i.test(text)
+          ? 12
+          : null;
   if (!months) return null;
   const dateMatch = text.match(/ended\s+([A-Za-z]+\s+\d{1,2})/i);
   return { months, endMonthDay: dateMatch ? dateMatch[1] : null };
@@ -519,6 +570,16 @@ function parseTableColumns($, table) {
       const phraseCells = cells.filter((c) => PERIOD_PHRASE_INDICATOR.test(c.text));
       if (phraseCells.length) {
         const parsed = phraseCells.map((c) => parsePeriodPhrase(c.text)).filter(Boolean);
+        // A "years ended"/"twelve months ended" phrase in a Q4+FY combined
+        // table often doesn't repeat its own end date -- verified live:
+        // CANG's "For the years ended" carries no date at all, unlike its
+        // sibling "For three months ended December 31" in the same header
+        // row. The fiscal year-end IS the same date as the quarter it's
+        // paired with by definition, so backfill a missing endMonthDay from
+        // any sibling phrase that has one, rather than rejecting every
+        // column in the row for a date every phrase already implies.
+        const knownEndMonthDay = parsed.find((p) => p.endMonthDay)?.endMonthDay;
+        if (knownEndMonthDay) for (const p of parsed) if (!p.endMonthDay) p.endMonthDay = knownEndMonthDay;
         if (parsed.length) periodPhrases = parsed;
       }
       continue;
@@ -827,14 +888,29 @@ function isHeadingLeaf($, $el) {
 // first one that yields a real result.
 function findStatementTables($, allEls, headingIdx) {
   const candidates = [];
+  // Enclosing table (structure #2: heading is the table's own first row)
+  // tried FIRST when one exists -- it's a stronger authority signal than
+  // "whichever table happens to appear next", not just an equally-likely
+  // alternative. Verified live this ordering matters, not just which
+  // candidates exist: CANG's real, complete income statement is itself
+  // structure #2, but a forward scan from its heading lands on an
+  // unrelated, smaller supplementary schedule first (a "Net income (loss)"
+  // reconciliation table, 27 rows) that still yields a non-null (if
+  // partial -- missing ebit/pretaxIncome entirely) result, which used to
+  // short-circuit the search before the real, complete enclosing table was
+  // ever tried. Safe to prioritize now that isHeadingLeaf's sibling-cell-
+  // count check (see its own comment) already filters out AEM's false
+  // heading match at the SOURCE -- the ordering here no longer needs to
+  // compensate for that, since a genuinely non-heading row can't produce a
+  // heading match in the first place anymore.
+  const enclosing = $(allEls[headingIdx]).closest('table');
+  if (enclosing.length && enclosing.find('tr').length >= 5) candidates.push(enclosing[0]);
   for (let i = headingIdx; i < allEls.length; i++) {
-    if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5) {
+    if (allEls[i].tagName === 'table' && $(allEls[i]).find('tr').length >= 5 && allEls[i] !== candidates[0]) {
       candidates.push(allEls[i]);
       break;
     }
   }
-  const enclosing = $(allEls[headingIdx]).closest('table');
-  if (enclosing.length && enclosing.find('tr').length >= 5 && enclosing[0] !== candidates[0]) candidates.push(enclosing[0]);
   return candidates;
 }
 
@@ -849,24 +925,37 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
     const text = $el.text();
     if (isHeadingLeaf($, $el) && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
   }
-  // A heading can appear more than once (verified live: IAG's financial-
-  // statements exhibit has a table-of-contents entry using the exact same
-  // heading text before the real statement) — try each occurrence in order
-  // and use the first one that actually yields a parseable table, rather
-  // than assuming the first match is the real statement.
+  // A heading can appear more than once, for two different real reasons —
+  // verified live for both: (1) IAG's financial-statements exhibit has a
+  // table-of-contents entry using the exact same heading text before the
+  // real statement -- its "table" candidate simply yields nothing (or a
+  // spurious partial), correctly skipped below. (2) NYAX's actual cash-flow
+  // statement is split across TWO separate tables under two separate
+  // headings -- operating activities (OCF) in the first, investing/
+  // financing (capex) in the second -- apparently a page break in the
+  // original filing that restates the heading for continuity. Neither
+  // table alone is complete; only their union is. MERGE facts across every
+  // (heading, table) candidate rather than returning on the first non-null
+  // result (which used to let NYAX's first, OCF-only table short-circuit
+  // before ever reaching capex) -- first-found wins per CONCEPT on overlap,
+  // so a later, less-trustworthy candidate can only fill genuine gaps, never
+  // override an already-matched value. The table immediately after a
+  // heading is also sometimes a formatting/spacer table, not the actual
+  // statement — verified live: GDTC's real "Statements of Cash Flows"
+  // heading is followed by a genuine 1-row spacer table before the real
+  // (40+ row) data table further down; that candidate yields no result at
+  // all and is naturally skipped, same guard extractFromRFile already uses
+  // for its own per-page table search.
+  let merged = null;
   for (const headingIdx of headingIdxs) {
-    // The table immediately after a real heading is sometimes a formatting/
-    // spacer table, not the actual statement — verified live: GDTC's real
-    // "Statements of Cash Flows" heading is followed by a genuine 1-row
-    // spacer table before the real (40+ row) data table further down. Skip
-    // trivial tables and keep scanning, same guard extractFromRFile already
-    // uses for its own (much noisier) per-page table search.
     for (const table of findStatementTables($, allEls, headingIdx)) {
       const result = extractFromTable($, table, targetEndYear, aliasMap);
-      if (result) return result;
+      if (!result) continue;
+      if (!merged) merged = result;
+      else merged = { period: merged.period, facts: { ...result.facts, ...merged.facts } };
     }
   }
-  return null;
+  return merged;
 }
 
 // Same heading-location shape as extractStatement above, but for the
@@ -881,13 +970,24 @@ function extractInstantStatement($, headingRegex, aliasMap) {
     const text = $el.text();
     if (isHeadingLeaf($, $el) && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
   }
+  // Same "keep the most complete match, not just the first" reasoning as
+  // extractStatement above -- a duplicate/summary heading's table could
+  // just as easily win a subset of columns/concepts here otherwise. Summed
+  // across every period in the result, since this returns one entry PER
+  // DATE COLUMN rather than a single result.
+  let best = null;
+  let bestFactCount = 0;
   for (const headingIdx of headingIdxs) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
       const result = extractFromInstantTable($, table, aliasMap);
-      if (result.length) return result;
+      const factCount = result.reduce((sum, r) => sum + Object.keys(r.facts).length, 0);
+      if (result.length && factCount > bestFactCount) {
+        best = result;
+        bestFactCount = factCount;
+      }
     }
   }
-  return [];
+  return best || [];
 }
 
 // SEC auto-renders each individual XBRL-tagged statement of an Inline XBRL
@@ -1190,11 +1290,24 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // depends on order-sensitive addition against a real disclosed subtotal,
   // not just an order-insensitive sum.
   const pointsByConcept = new Map();
+  // Instant concepts only (see reconcileInstantPoints' sibling-trust pass
+  // below): accession number -> set of end-dates this same filing produced
+  // for this concept. Built from the RAW per-end-date lists (every filing
+  // that mentioned this concept at all), not just each end-date's winning
+  // "best" value, so a sibling lookup can't miss a real same-document
+  // relationship just because that filing's value lost a corroboration tie
+  // for its OWN date.
+  const accessionToDatesByConcept = new Map();
   for (const concept of neededConcepts) {
     const grouped = collected[concept] || new Map();
     const points = [];
-    for (const list of grouped.values()) {
+    const accessionToDates = new Map();
+    for (const [end, list] of grouped) {
       if (!list.length) continue;
+      for (const l of list) {
+        if (!accessionToDates.has(l.accessionNumber)) accessionToDates.set(l.accessionNumber, new Set());
+        accessionToDates.get(l.accessionNumber).add(end);
+      }
       // Group this end-date's occurrences (one per independent filing) by
       // their disclosed value, and pick the value with the most independent
       // corroborations (ties broken by most-recently-filed) as the
@@ -1209,10 +1322,11 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         if (!best || occurrences.length > best.length) best = occurrences;
       }
       const rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
-      points.push({ ...rep, corroborations: new Set(best.map((o) => o.accessionNumber)).size });
+      points.push({ ...rep, corroborations: new Set(best.map((o) => o.accessionNumber)).size, accessionNumbers: new Set(best.map((o) => o.accessionNumber)) });
     }
     points.sort((a, b) => new Date(a.end) - new Date(b.end));
     if (points.length) pointsByConcept.set(concept, points);
+    accessionToDatesByConcept.set(concept, accessionToDates);
   }
 
   // Auto-detect and correct a systematic unit-scale mismatch BEFORE
@@ -1249,7 +1363,9 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
 
   const result = {};
   for (const [concept, points] of pointsByConcept) {
-    const verified = INSTANT_CONCEPTS.has(concept) ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map()) : reconcilePoints(points, annualByEnd?.[concept] || new Map());
+    const verified = INSTANT_CONCEPTS.has(concept)
+      ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept))
+      : reconcilePoints(points, annualByEnd?.[concept] || new Map());
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
@@ -1346,7 +1462,7 @@ const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
 //      for periods that used to compute fine. Checking per-point against
 //      its own real anchor, independent of whatever the flow concepts
 //      decided, catches this the way a single borrowed global scale can't.
-function reconcileInstantPoints(points, knownByEnd) {
+function reconcileInstantPoints(points, knownByEnd, accessionToDates) {
   const verified = new Set();
   for (const p of points) if (p.corroborations >= 2) verified.add(p);
   for (const p of points) {
@@ -1357,11 +1473,56 @@ function reconcileInstantPoints(points, knownByEnd) {
       const diff = Math.abs(scaledVal - known.value) / Math.abs(known.value);
       if (diff <= RECONCILE_TOLERANCE) {
         p.val = scaledVal;
+        p.appliedScale = scale;
         verified.add(p);
         break;
       }
     }
   }
+
+  // Sibling-column trust: a point sharing a filing (same accession number)
+  // with an already-verified point for the SAME concept -- in practice
+  // almost always the same physical table, just a different date column --
+  // is trusted too. A balance-sheet snapshot has no cumulative-sum identity
+  // to self-check the way flow concepts do (see reconcilePoints' Check A),
+  // so corroboration/XBRL-match alone leaves genuinely correct INTERIM
+  // (non-fiscal-year-end) points permanently unverifiable for any filer
+  // that only ever discloses a given quarter once -- verified live: CANG's
+  // real, correctly-extracted Sept 30 2025 balance sheet had no way to ever
+  // pass either existing check, since its own filing convention only ever
+  // re-discloses the prior FISCAL YEAR END as a comparative (never the same
+  // interim quarter a year later), and CANG furnishes just one 6-K per
+  // quarter (no separate press-release + full-financials pair the way some
+  // other filers do, which independently corroborates BOTH columns of a
+  // table right away). Scoped to same accession number rather than
+  // literal table identity, which isn't tracked this far downstream --
+  // accepted as a safe approximation since a single 6-K's exhibits all
+  // describe one filer's one true financial position for that filing
+  // event. Non-transitive by construction (checked against a snapshot of
+  // the base-verified set, not the growing one) -- a point can be trusted
+  // via a directly base-verified sibling, never via a chain of siblings
+  // trusting siblings. Propagates the sibling's own scale correction (if
+  // any), since two columns of the same table share one unit convention --
+  // a table needing "x1000" for its FYE column (the one with a real XBRL
+  // anchor to check against) needs it for every other column too.
+  if (accessionToDates) {
+    const baseVerified = new Set(verified);
+    const byEnd = new Map(points.map((p) => [p.end, p]));
+    for (const p of points) {
+      if (verified.has(p)) continue;
+      for (const accession of p.accessionNumbers || []) {
+        const siblingEnds = accessionToDates.get(accession);
+        if (!siblingEnds) continue;
+        const sibling = [...siblingEnds].map((end) => byEnd.get(end)).find((q) => q && q !== p && baseVerified.has(q));
+        if (sibling) {
+          if (sibling.appliedScale) p.val *= sibling.appliedScale;
+          verified.add(p);
+          break;
+        }
+      }
+    }
+  }
+
   return points.filter((p) => verified.has(p));
 }
 
