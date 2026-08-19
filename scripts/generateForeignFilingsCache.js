@@ -848,6 +848,14 @@ function hasRecentQuarterlyGap(quarterlyPoints, scanEntries = RECENT_GAP_SCAN_EN
 }
 
 function needsFilingTextBackfill(quarterlyPoints, annualPoints) {
+  // Completely empty in BOTH cadences is unambiguously a backfill case, not
+  // a "nothing to compare against" no-op -- verified live: ASC's capex has
+  // zero XBRL data of any kind (no vessel-purchase concept exists in
+  // CAPEX_CONCEPTS), so the very next check below (`!annualPoints.length`)
+  // was silently concluding "nothing to backfill" and never even
+  // attempting text-extraction for it, even though every quarter genuinely
+  // needed it.
+  if (!quarterlyPoints.length && !annualPoints.length) return true;
   if (!annualPoints.length) return false; // nothing to backfill against
   if (!quarterlyPoints.length) return true;
   const lastQuarterlyEnd = new Date(quarterlyPoints[quarterlyPoints.length - 1].end);

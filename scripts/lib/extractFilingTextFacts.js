@@ -80,7 +80,15 @@ const RECONCILE_TOLERANCE = 0.02; // 2%
 // Neither company's income statement was found at all without this.
 const STATEMENT_HEADINGS = {
   income: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
-  cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS? OF CASH ?FLOWS/i,
+  // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
+  // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
+  // genuinely singular throughout ("Statement", not "Statements"; "Flow",
+  // not "Flows"). "STATEMENTS?" already tolerated the singular/plural
+  // difference for the first word -- inconsistent that "FLOWS" was left
+  // mandatory-plural right next to it. hasCashflow was false for every one
+  // of DHT's real documents as a result, so capex/ocf extraction never
+  // even attempted to run for this filer.
+  cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS? OF CASH ?FLOWS?/i,
   // Not anchored on "CONSOLIDATED" needing to be the very first word — same
   // reasoning as income/cashflow above (the regex isn't `^`-anchored, so
   // "Condensed Consolidated Balance Sheets" still matches via the
@@ -213,7 +221,21 @@ const LABEL_ALIASES = {
     // with it even though revenue/ebit extraction were both fine --
     // confirmed this is a distinct root cause from ROIC's reconciliation
     // gap, not the same bug wearing a different mask.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
+    // "acquisition(s)? of property" added alongside "acquisition(s)? of
+    // vessels" -- verified live: NYAX's real, investing-section capex line
+    // is "Acquisition of property and equipment", which neither the
+    // vessel-specific nor the purchase-specific alternative matched. Only
+    // a smaller, unrelated supplemental line ("Purchase of property and
+    // equipment on credit") was matching before, silently understating
+    // capex (and therefore fcfMargin) for this filer.
+    // "investment(s)? in vessels/property" added -- verified live: DHT (a
+    // tanker company like STNG, but a different real-terms phrasing) has
+    // "Investment in vessels", "Investment in vessels under construction",
+    // and "Investment in other property, plant and equipment" as its real
+    // investing-section capex lines -- a THIRD distinct real-world phrasing
+    // for the same underlying concept, none of "acquisition of"/"purchase
+    // of"/"capital expenditures" covering it.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -659,29 +681,91 @@ function parseDataRow(cells, columnCount) {
 // column value for the SAME fiscal year (used for within-filing
 // reconciliation by the caller — no separate lookup needed since it's the
 // same row, just a different column).
+
+// Concepts that should only ever match a row within a SPECIFIC cash-flow-
+// statement section -- see extractFromTable's section-tracking comment for
+// why this exists. Concepts not listed here are unrestricted, matching
+// anywhere in the table exactly as before.
+const SECTION_RESTRICTED_CONCEPTS = { capex: 'investing' };
+
+// Concepts for which a cumulative-only (H1/9mo) column is an acceptable
+// substitute for a missing 3-month one -- see the usingCumulativeOnly
+// fallback below. Deliberately NOT extended to income-statement concepts
+// (revenue/netIncome/ebit/pretaxIncome) -- verified live this caused a
+// real regression for IMPP, whose XBRL already carries real H1-duration
+// facts for these concepts that dedupeAndClassify already knows how to
+// handle correctly on its own. A redundant, differently-shaped text-
+// extracted duplicate of that SAME H1 period won a "most recently filed"
+// tiebreak over the XBRL original and broke whatever made the existing
+// XBRL-native handling work, even though the duplicate's own value was
+// identical. Cash-flow concepts (ocf/capex) had no equivalent XBRL
+// coverage at all for the motivating case (ASC) -- there's nothing for a
+// redundant text duplicate to conflict with there.
+const CUMULATIVE_FALLBACK_CONCEPTS = new Set(['ocf', 'capex']);
+
 function extractFromTable($, table, targetEndYear, aliasMap) {
   const parsed = parseTableColumns($, table);
   if (!parsed) return null;
   const { columns, dataStartRowIdx } = parsed;
 
   const targetIdx3mo = columns.findIndex((c) => c.months === 3 && c.year === targetEndYear);
-  if (targetIdx3mo === -1) return null; // this filing doesn't cover the quarter we're after
-  const targetPeriod = columns[targetIdx3mo];
   // Same fiscal year's cumulative (6mo/9mo) column, if this table has one —
-  // used for the within-filing reconciliation check.
+  // normally just used for the within-filing reconciliation check below.
   const cumulativeIdx = columns.findIndex((c) => c.months > 3 && c.year === targetEndYear);
+  const eligibleForCumulativeFallback = Object.keys(aliasMap).every((c) => CUMULATIVE_FALLBACK_CONCEPTS.has(c));
+  // Fallback for a filer whose statement only ever discloses a cumulative
+  // (H1/9mo) column, never a standalone 3-month one -- verified live:
+  // Ardmore Shipping (ASC)'s cash flow statement shows only "Six Months
+  // Ended" columns, no 3-month breakdown at all, so capex (and everything
+  // else pulled from that table) previously came back completely empty for
+  // every quarter. Use the cumulative column itself as the extracted
+  // period in that case, carrying its OWN real duration (6 or 9 months,
+  // not a fabricated 3) through to the caller -- the existing decumulation
+  // logic in dedupeAndClassify already knows how to turn a real H1/9mo
+  // fact into a derived quarter the same way it already does for XBRL H1
+  // facts, so nothing downstream of extraction needs to change.
+  const usingCumulativeOnly = targetIdx3mo === -1 && eligibleForCumulativeFallback && cumulativeIdx !== -1;
+  if (targetIdx3mo === -1 && !usingCumulativeOnly) return null; // this filing doesn't cover the period we're after (or isn't an eligible concept for the cumulative-only fallback)
+  const targetIdx = usingCumulativeOnly ? cumulativeIdx : targetIdx3mo;
+  const targetPeriod = columns[targetIdx];
 
   const rows = $(table).find('tr').toArray();
   const candidates = {}; // concept -> [{label, value3mo, valueCumulative}]
+  let currentSection = null;
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
+    // Tracks which cash-flow-statement section we're currently inside, so
+    // a section-restricted concept (see SECTION_RESTRICTED_CONCEPTS) can't
+    // match a same-worded row from the WRONG section -- verified live:
+    // Ardmore Shipping (ASC)'s operating-activities section has
+    // "Amortization of deferred drydock expenditures" (a non-cash P&L
+    // add-back) and "Deferred drydock payments" (already reflected in
+    // operating cash flow), neither a real investing outflow, but both
+    // matched capex's "drydock" alternative and got summed alongside the
+    // genuine investing-section vessel-purchase line by the tiebreak
+    // below, corrupting the total. A section-header row has no numeric
+    // cells (parseDataRow rejects it below), so this check runs on the
+    // RAW cell text, independent of whether the row ends up a real data
+    // row at all.
+    const rowText = cells.map((c) => c.text).join(' ');
+    if (/operating activities/i.test(rowText)) currentSection = 'operating';
+    else if (/investing activities/i.test(rowText)) currentSection = 'investing';
+    else if (/financing activities/i.test(rowText)) currentSection = 'financing';
     const row = parseDataRow(cells, columns.length);
     if (!row) continue;
     for (const concept of Object.keys(aliasMap)) {
       if (!matchesConcept(row.label, concept)) continue;
-      const value3mo = row.values[targetIdx3mo];
-      const valueCumulative = cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null;
+      const requiredSection = SECTION_RESTRICTED_CONCEPTS[concept];
+      if (requiredSection && currentSection !== requiredSection) continue;
+      // value3mo actually means "the value for whatever period we ended up
+      // targeting" -- normally a genuine 3-month figure, but the
+      // cumulative total itself when that's all this table has. Kept under
+      // the same field name so every downstream consumer (ambiguity
+      // resolution, the debt-summing tiebreak, recordExtracted) needs no
+      // change at all.
+      const value3mo = usingCumulativeOnly ? row.values[cumulativeIdx] : row.values[targetIdx3mo];
+      const valueCumulative = !usingCumulativeOnly && cumulativeIdx !== -1 ? row.values[cumulativeIdx] : null;
       (candidates[concept] = candidates[concept] || []).push({ label: row.label, value3mo, valueCumulative });
     }
   }
@@ -1015,10 +1099,14 @@ function extractFromRFile($, targetEndYear, aliasMap) {
   return null;
 }
 
-function subtractThreeMonths(dateStr) {
+function subtractMonths(dateStr, months) {
   const d = new Date(dateStr);
-  const result = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 3, d.getUTCDate()));
+  const result = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - months, d.getUTCDate()));
   return result.toISOString().slice(0, 10);
+}
+
+function subtractThreeMonths(dateStr) {
+  return subtractMonths(dateStr, 3);
 }
 
 function monthDayYearToIso(endMonthDay, year) {
@@ -1132,7 +1220,14 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     if (!extracted) return;
     const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
     if (!endIso) return;
-    const startIso = subtractThreeMonths(endIso);
+    // Uses the period's OWN real duration (usually 3 months, but 6 or 9
+    // when extractFromTable fell back to a cumulative-only column -- see
+    // its own comment) rather than always assuming 3, so a genuine H1/9mo
+    // fact gets a correctly-spanning start date instead of a fabricated
+    // one -- required for dedupeAndClassify to classify it into the right
+    // bucket (h1/q3ytd) and decumulate it downstream the same way an XBRL
+    // H1 fact already would be.
+    const startIso = subtractMonths(endIso, extracted.period.months);
     for (const [concept, fact] of Object.entries(extracted.facts)) {
       const list = collected[concept].get(endIso) || [];
       if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
