@@ -1339,6 +1339,7 @@ module.exports = {
   dedupeInstantFacts,
   isGenuineForeignFiler,
   isGenuineForeignFormFiler,
+  needsFilingTextBackfill,
   buildTrailingWindows,
   buildRatioTrend,
   buildQuarterlyRatioTrend,

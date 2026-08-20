@@ -19,14 +19,22 @@
 // 800-calls/day free-tier budget. Twelve Data's free tier allows creating
 // additional accounts at no cost.
 //
-// Unlike stock-metrics-pipeline's P/FCF job, this doesn't need a
-// least-recently-attempted rotation — the foreign-filer universe (~133
-// tickers as of this writing) is small enough that a full pass fits
-// comfortably in one run well under Twelve Data's daily cap (~133 calls vs.
-// an 800/day budget).
+// Like stock-metrics-pipeline's P/FCF job, this uses a least-recently-
+// attempted-first rotation (see MAX_TWELVEDATA_CALLS_PER_RUN/TIME_BUDGET_MS
+// below) — the foreign-filer universe grew to ~769 candidates
+// (discoverForeignFilers.js), too large to fit in this workflow's 60-minute
+// timeout in one pass; see the GIST_FOREIGN_FILER_LIST_URL comment below for
+// the verified failure mode this fixes.
 
 const fs = require('fs');
 const path = require('path');
+// Reused rather than duplicated -- both scripts live in this same repo
+// (unlike the cross-REPO duplication this codebase otherwise deliberately
+// uses for genuinely separate pipelines), and requiring it here has no
+// side effects (its own `if (require.main === module)` guard means main()
+// only runs when THIS file is the entry point, not when it's required).
+const { isGenuineForeignFiler, needsFilingTextBackfill } = require('./generateForeignFilingsCache');
+const { extractQuarterlyFactsFromFilings } = require('./lib/extractFilingTextFacts');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
@@ -51,6 +59,12 @@ const SEC_USER_AGENT = 'stock-analyzer-app foreign-filings-pipeline contact:jadr
 const SEC_REQUEST_SPACING_MS = 200; // well under SEC's documented ~10 req/sec fair-use guidance
 const TWELVEDATA_REQUEST_SPACING_MS = 8000; // ~7.5/min, under Twelve Data's free-tier 8/min cap
 const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
+// Rotation budget -- see the priority/rotation comment at its call site
+// for why this is needed now. Mirrors generatePfcfTrendCache.js's own
+// constants, scaled to this workflow's 60-minute timeout (vs. that one's
+// 7-hour budget) and this universe's smaller size (~769 vs 1,500+).
+const MAX_TWELVEDATA_CALLS_PER_RUN = 700; // leaves buffer under Twelve Data's 800/day free-tier cap for this key
+const TIME_BUDGET_MS = 50 * 60 * 1000; // safety net alongside the call cap above; leaves headroom under the workflow's 60-minute timeout
 
 function readTwelveDataApiKey() {
   if (process.env.TWELVEDATA_FOREIGN_PIPELINE_API_KEY) return process.env.TWELVEDATA_FOREIGN_PIPELINE_API_KEY;
@@ -95,12 +109,28 @@ async function fetchMonthlyPrices(symbol, apiKey) {
 // Margin; Shares is defined there but unused until now).
 // ---------------------------------------------------------------------------
 
-const OCF_CONCEPTS = ['CashFlowsFromUsedInOperatingActivities'];
+// us-gaap equivalents added alongside the original ifrs-full-only concepts
+// -- verified live: 395 of 769 known foreign filers (51%) are us-gaap
+// filers (see discoverForeignFilers.js's own taxonomy field), and this
+// script's isForeignFiler gate below was rejecting every one of them outright
+// regardless of these concept lists -- but even with that gate fixed, none
+// of them would have matched here either, since 'CashFlowsFromUsedIn
+// OperatingActivities' and the two Purchase* concepts are IFRS-only
+// terminology. Mirrors OCF_CONCEPTS/CAPEX_CONCEPTS/SHARES_CONCEPTS in
+// generateForeignFilingsCache.js exactly -- this script never got the
+// us-gaap classification expansion that landed there earlier, the same
+// "fast path never carried over" gap already documented above for
+// GIST_FOREIGN_FILER_LIST_URL.
+const OCF_CONCEPTS = ['CashFlowsFromUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
 const CAPEX_CONCEPTS = [
   'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
   'PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwillInvestmentPropertyAndOtherNoncurrentAssets',
+  'PaymentsToAcquirePropertyPlantAndEquipment',
+  'PaymentsToAcquireProductiveAssets',
+  'PaymentsForCapitalImprovements',
+  'PaymentsToAcquireOtherPropertyPlantAndEquipment',
 ];
-const SHARES_CONCEPTS = ['WeightedAverageShares'];
+const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfSharesOutstandingBasic', 'WeightedAverageNumberOfDilutedSharesOutstanding'];
 
 function extractFactSeries(companyFacts, conceptCandidates) {
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
@@ -327,11 +357,11 @@ async function main() {
 
   const cache = existingCache?.trends || {};
 
-  // The ifrs-full check inside the loop below (before any Twelve Data
-  // spend) is what actually filters out non-IFRS tickers — cheap since it
-  // happens on the SEC fetch alone, before any Twelve Data budget is
-  // touched. Still kept as a real gate even on the fast path below (not
-  // just trusting the list blindly), same defense-in-depth
+  // The isGenuineForeignFiler check inside the loop below (before any
+  // Twelve Data spend) is what actually filters out non-foreign tickers —
+  // cheap since it happens on the SEC fetch alone, before any Twelve Data
+  // budget is touched. Still kept as a real gate even on the fast path
+  // below (not just trusting the list blindly), same defense-in-depth
   // generateForeignFilingsCache.js's own processTicker applies.
   let withCik;
   if (foreignFilerList?.foreignFilers?.length) {
@@ -347,33 +377,93 @@ async function main() {
     console.log(`${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK.`);
   }
 
+  // Least-recently-attempted first (never-attempted sorts first, via epoch
+  // 0) -- same rotation strategy as stock-metrics-pipeline's own
+  // generatePfcfTrendCache.js. Necessary now that the universe (769 known
+  // foreign filers, up from ~133 when this script was first written) no
+  // longer reliably fits in one run -- verified live: this job previously
+  // hit its own 60-minute workflow timeout partway through the full list,
+  // and since nothing here persisted per-ticker progress, tickers landing
+  // later in iteration order (e.g. DHT) never got reached at all, no
+  // matter how many times the workflow ran on schedule.
+  const priority = withCik
+    .map((entry) => ({ ...entry, attemptedAt: cache[entry.symbol]?.fetchedAt ? new Date(cache[entry.symbol].fetchedAt).getTime() : 0 }))
+    .sort((a, b) => a.attemptedAt - b.attemptedAt);
+
+  const startTime = Date.now();
   let processed = 0;
   let resolved = 0;
   let twelveDataCalls = 0;
 
-  for (const { symbol, cik } of withCik) {
+  for (const { symbol, cik } of priority) {
+    if (twelveDataCalls >= MAX_TWELVEDATA_CALLS_PER_RUN) {
+      console.log(`Twelve Data call budget (${MAX_TWELVEDATA_CALLS_PER_RUN}) reached after ${processed} tickers — stopping for this run.`);
+      break;
+    }
+    if (Date.now() - startTime > TIME_BUDGET_MS) {
+      console.log(`Time budget reached after ${processed} tickers — stopping for this run.`);
+      break;
+    }
     let fresh = { ttm: [], quarterly: [], yearly: [] };
     try {
       const companyFacts = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
       await sleep(SEC_REQUEST_SPACING_MS);
 
-      // Only genuine IFRS filers — see generateForeignFilingsCache.js's
-      // identical check for the full rationale (a domestic filer's SEC
-      // companyfacts also has real us-gaap data, so without this gate
-      // extractFactSeries's us-gaap fallback would happily compute P/FCF
-      // for every SEC-registered company, duplicating stock-metrics-
-      // pipeline's own Finnhub-based reconstruction). Checked BEFORE any
-      // Twelve Data call, so scanning the ~5,000 non-IFRS tickers in the
-      // full candidate list above costs nothing but SEC requests.
-      const isIfrsFiler = !!(companyFacts?.facts?.['ifrs-full'] && Object.keys(companyFacts.facts['ifrs-full']).length);
+      // Only genuine foreign filers (ifrs-full, OR us-gaap with real
+      // 20-F/40-F/6-K form history -- see isGenuineForeignFiler's own
+      // comment) — a domestic filer's SEC companyfacts also has real
+      // us-gaap data, so without this gate extractFactSeries's us-gaap
+      // fallback would happily compute P/FCF for every SEC-registered
+      // company, duplicating stock-metrics-pipeline's own Finnhub-based
+      // reconstruction. Checked BEFORE any Twelve Data call, so scanning
+      // the ~5,000 non-foreign tickers in the full candidate list above
+      // costs nothing but SEC requests. Previously checked ifrs-full
+      // alone, silently excluding 395 of 769 known foreign filers (51%,
+      // every us-gaap-taxonomy one) regardless of anything else in this
+      // file -- verified live for ASC specifically.
+      const isForeignFiler = isGenuineForeignFiler(companyFacts);
 
-      if (isIfrsFiler) {
+      if (isForeignFiler) {
         const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
         const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
         const ocf = dedupeAndClassify(ocfRaw);
-        const capex = dedupeAndClassify(capexRaw);
+        let capex = dedupeAndClassify(capexRaw);
         const shares = dedupeAndClassify(sharesRaw);
+
+        // Capex is the concept that's actually gapped for this universe --
+        // verified live: ASC has zero capex XBRL facts under ANY of
+        // CAPEX_CONCEPTS (its "Purchase of vessels" line isn't tagged with
+        // a concept this list recognizes), and DHT's capex XBRL stops being
+        // tagged at all after FY2021 even though its ocf/shares XBRL stay
+        // current through today -- while its ocf/shares are fine. Reuses
+        // the SAME 6-K earnings-release text-extraction fallback already
+        // shipped and verified in generateForeignFilingsCache.js's own
+        // processTicker for exactly these tickers, rather than duplicating
+        // that ~1000-line extractor. Only attempted when capex specifically
+        // needs it (needsFilingTextBackfill), not gated behind
+        // ENABLE_FILING_TEXT_FALLBACK the way the sibling script's daily
+        // run still is -- that flag exists there because EVERY concept gets
+        // scanned for EVERY gap ticker (a multi-hour cost even with a
+        // 350-minute timeout); here it's one targeted concept, checked only
+        // for tickers this loop already reached under its own rotation
+        // budget.
+        if (needsFilingTextBackfill(capex.quarterly, capex.annual)) {
+          try {
+            const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
+            const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
+            // XBRL's capex concept is a positive magnitude but the
+            // press-release table reports it parenthesized/negative (a
+            // cash outflow) -- negated here to match XBRL's sign
+            // convention, same as generateForeignFilingsCache.js's own
+            // identical merge.
+            if (filingTextFacts.capex?.length) {
+              capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+            }
+          } catch (err) {
+            console.log(`  capex filing-text fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
 
         const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
         await sleep(TWELVEDATA_REQUEST_SPACING_MS);
@@ -394,8 +484,8 @@ async function main() {
     }
 
     const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh);
+    cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences };
     if (cadences.ttm.length || cadences.quarterly.length || cadences.yearly.length) {
-      cache[symbol] = cadences;
       resolved++;
     }
 
