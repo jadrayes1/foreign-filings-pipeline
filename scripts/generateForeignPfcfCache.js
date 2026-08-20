@@ -37,8 +37,8 @@ const { isGenuineForeignFiler, needsFilingTextBackfill } = require('./generateFo
 const { extractQuarterlyFactsFromFilings } = require('./lib/extractFilingTextFacts');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
-const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
-const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/foreignPfcfCache.json';
+const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
+const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignPfcfCache.json';
 // Published weekly by discoverForeignFilers.js (see that file's header) —
 // read here so this job skips straight to its known ~374 candidates instead
 // of re-checking ifrs-full for the full ~5,067-ticker universe every run.
@@ -49,7 +49,7 @@ const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/db6f
 // reached at all, not even once, since progress isn't persisted/resumed
 // across runs either. Same fast path generateForeignFilingsCache.js already
 // uses, just never carried over here when that fix was built.
-const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/foreignFilerList.json';
+const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignFilerList.json';
 const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
 const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 // SEC's fair-use policy asks for a descriptive User-Agent identifying the
