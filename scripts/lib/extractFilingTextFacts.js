@@ -235,7 +235,13 @@ const LABEL_ALIASES = {
     // investing-section capex lines -- a THIRD distinct real-world phrasing
     // for the same underlying concept, none of "acquisition of"/"purchase
     // of"/"capital expenditures" covering it.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)? of vessels|drydock/i,
+    // "acquisition(s)?( and \w+)? of vessels" tolerates ONE inserted phrase
+    // before "of vessels", mirroring "purchase(s)? of( \w+)? property"'s
+    // own tolerance above -- verified live: IMPP's real line is
+    // "Acquisition and improvement of vessels", a FOURTH distinct real-
+    // world phrasing, which the original "acquisition(s)? of vessels" (no
+    // gap allowed) never matched.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)?( and \w+)? of vessels|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
