@@ -48,6 +48,9 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install dependencies
+        run: npm ci
+
       - name: Generate foreign P/FCF cache
         env:
           TWELVEDATA_FOREIGN_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_FOREIGN_PIPELINE_API_KEY }}
