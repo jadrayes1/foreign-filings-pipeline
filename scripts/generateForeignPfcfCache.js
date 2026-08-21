@@ -33,8 +33,8 @@ const path = require('path');
 // uses for genuinely separate pipelines), and requiring it here has no
 // side effects (its own `if (require.main === module)` guard means main()
 // only runs when THIS file is the entry point, not when it's required).
-const { isGenuineForeignFiler, needsFilingTextBackfill } = require('./generateForeignFilingsCache');
-const { extractQuarterlyFactsFromFilings } = require('./lib/extractFilingTextFacts');
+const { isGenuineForeignFiler, needsFilingTextBackfill, needsAnnual20FBackfill } = require('./generateForeignFilingsCache');
+const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F } = require('./lib/extractFilingTextFacts');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
@@ -132,7 +132,13 @@ const CAPEX_CONCEPTS = [
 ];
 const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfSharesOutstandingBasic', 'WeightedAverageNumberOfDilutedSharesOutstanding'];
 
+// Merges facts across every matching concept rather than short-circuiting
+// on the first one -- see generateForeignFilingsCache.js's own copy of
+// this function for the full rationale (verified live for IMPP: it
+// switches which XBRL concept it tags capex under between early 6-K
+// filings and its 20-F annual reports).
 function extractFactSeries(companyFacts, conceptCandidates) {
+  const merged = [];
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
     const facts = companyFacts?.facts?.[taxonomy];
     if (!facts) continue;
@@ -140,11 +146,11 @@ function extractFactSeries(companyFacts, conceptCandidates) {
       const entry = facts[concept];
       if (!entry?.units) continue;
       for (const unitFacts of Object.values(entry.units)) {
-        if (Array.isArray(unitFacts) && unitFacts.length) return unitFacts;
+        if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
       }
     }
   }
-  return [];
+  return merged;
 }
 
 function daysBetween(startStr, endStr) {
@@ -448,20 +454,53 @@ async function main() {
         // 350-minute timeout); here it's one targeted concept, checked only
         // for tickers this loop already reached under its own rotation
         // budget.
+        let capexFilingTextFacts = {};
         if (needsFilingTextBackfill(capex.quarterly, capex.annual)) {
           try {
             const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
-            const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
+            capexFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
             // XBRL's capex concept is a positive magnitude but the
             // press-release table reports it parenthesized/negative (a
             // cash outflow) -- negated here to match XBRL's sign
             // convention, same as generateForeignFilingsCache.js's own
             // identical merge.
-            if (filingTextFacts.capex?.length) {
-              capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+            if (capexFilingTextFacts.capex?.length) {
+              capex = dedupeAndClassify([...capexRaw, ...capexFilingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
             }
           } catch (err) {
             console.log(`  capex filing-text fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+
+        // 20-F annual fallback -- fills a genuinely different gap than the
+        // 6-K one above: a filer whose 20-F switched capex to a company-
+        // specific custom XBRL extension tag (verified live: DHT's
+        // `dht:InvestmentsInVessels`), never exposed under any standard
+        // taxonomy name in companyfacts no matter how many concept-list
+        // alternatives are added -- only parsing the 20-F document itself
+        // recovers it. Re-checked on the POST-6-K-merge state so a ticker
+        // the 6-K pass already fixed doesn't pay for the heavier 20-F scan.
+        // Not gated behind ENABLE_20F_ANNUAL_FALLBACK the way the sibling
+        // script's daily run is -- same reasoning as the 6-K call above:
+        // one targeted concept, only for tickers this loop already reached
+        // under its own rotation budget, not a full-universe scan.
+        // needsAnnual20FBackfill (not needsFilingTextBackfill) -- checks
+        // whether ANNUAL itself is stale, independent of quarterly's own
+        // freshness. Verified live this distinction matters: DHT's
+        // quarterly capex is already fresh via the 6-K fallback above while
+        // annual specifically stays stuck at FY2021 -- needsFilingTextBackfill
+        // only checks quarterly staleness RELATIVE TO annual, so it never
+        // even notices annual itself needs its own fallback here. See
+        // needsAnnual20FBackfill's own comment in generateForeignFilingsCache.js.
+        if (needsAnnual20FBackfill(capex.annual)) {
+          try {
+            const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
+            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
+            if (annual20FFacts.capex?.length) {
+              capex = dedupeAndClassify([...capexRaw, ...(capexFilingTextFacts.capex || []), ...annual20FFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+            }
+          } catch (err) {
+            console.log(`  20-F capex fallback failed for ${symbol}: ${err.message}`);
           }
         }
 

@@ -49,7 +49,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractQuarterlyFactsFromFilings, throttleSecRequest } = require('./lib/extractFilingTextFacts');
+const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, throttleSecRequest } = require('./lib/extractFilingTextFacts');
 const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilingsCache.json');
@@ -174,6 +174,18 @@ const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfShares
 //     operating liability for a bank, not a financing choice, so bank
 //     filers like BMO naturally get debt=0 without any special-casing.
 const EBIT_CONCEPTS = ['ProfitLossFromOperatingActivities', 'ProfitLossBeforeTax', 'OperatingIncomeLoss'];
+// One fallback tier below EBIT_CONCEPTS -- for a filer that tags NONE of
+// the 3 concepts above under ANY name, but does separately tag after-tax
+// net income and income-tax expense with identical (start,end) period
+// boundaries, pretax income (= netIncome + taxExpense) is real, standard
+// arithmetic, not fabrication. Verified live: Toronto-Dominion Bank (TD)
+// has zero facts under any of EBIT_CONCEPTS -- unlike its peer Canadian
+// banks (RY/BNS/CM), which all tag ProfitLossBeforeTax directly -- but DOES
+// have real, period-aligned ProfitLoss and IncomeTaxExpenseContinuing
+// Operations facts for every fiscal year. us-gaap equivalent included for
+// symmetry with EBIT_CONCEPTS' own ifrs-full/us-gaap mix, though only the
+// ifrs-full one has a verified real-world case so far.
+const TAX_EXPENSE_CONCEPTS = ['IncomeTaxExpenseContinuingOperations', 'IncomeTaxExpenseBenefit'];
 // us-gaap equivalents added -- verified live this was the actual reason
 // ROIC was at 99% empty (391/395) for the newly-classified us-gaap foreign
 // filer population specifically: 'Equity'/'CashAndCashEquivalents'/
@@ -209,13 +221,28 @@ const ROIC_ASSUMED_TAX_RATE = 0.21; // matches the main pipeline's own default s
 
 // Searches ifrs-full first (what every foreign filer verified so far uses),
 // then us-gaap as a defensive fallback in case a filer mixes taxonomies —
-// returns the raw fact array (list of {start,end,val,filed,accn,form,fp,fy})
-// for the first matching concept with real data, across any reported unit
-// (currency doesn't matter here — every ratio computed below is dimension-
-// less or a self-relative percentage, so no cross-currency conversion is
-// ever needed as long as a single company's own concepts share one currency,
-// which they do).
+// returns the MERGED raw fact array (list of {start,end,val,filed,accn,
+// form,fp,fy}) across every matching concept with real data, not just the
+// first one found. conceptCandidates is a list of alternative XBRL tag
+// names for the same real-world line item (never expected to represent
+// two genuinely different amounts to be summed) -- merging rather than
+// short-circuiting on the first match matters because a filer can (and
+// does) switch which concept it tags the SAME line under across its
+// filing history. Verified live: IMPP tagged its capex line as
+// PaymentsToAcquirePropertyPlantAndEquipment in early 6-K filings (3
+// sparse, H1-only facts) but PaymentsForCapitalImprovements in its actual
+// 20-F annual reports back to 2020 (real annual data, current through
+// FY2025) -- since the sparse concept came first in CAPEX_CONCEPTS and
+// short-circuit-return stopped there, the rich annual data was never even
+// looked at, even though every downstream consumer of this function
+// already dedupes overlapping (start,end) periods by most-recently-filed
+// (see dedupeAndClassify's byPeriod Map) -- exactly the mechanism needed
+// to safely merge here too. Currency doesn't matter for the merge -- every
+// ratio computed below is dimensionless or a self-relative percentage, so
+// no cross-currency conversion is ever needed as long as a single
+// company's own concepts share one currency, which they do.
 function extractFactSeries(companyFacts, conceptCandidates) {
+  const merged = [];
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
     const facts = companyFacts?.facts?.[taxonomy];
     if (!facts) continue;
@@ -223,11 +250,35 @@ function extractFactSeries(companyFacts, conceptCandidates) {
       const entry = facts[concept];
       if (!entry?.units) continue;
       for (const unitFacts of Object.values(entry.units)) {
-        if (Array.isArray(unitFacts) && unitFacts.length) return unitFacts;
+        if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
       }
     }
   }
-  return [];
+  return merged;
+}
+
+// Derives pretax income = netIncome + taxExpense for the SAME (start,end)
+// period -- real arithmetic, not fabrication. Only meaningful when both
+// concepts share identical period boundaries (verified live for TD: every
+// ProfitLoss fact's (start,end) has a matching IncomeTaxExpenseContinuing
+// Operations fact at the exact same (start,end)) -- a period mismatch
+// between the two raw fact arrays just means no derived point for that
+// period, never a guessed one. See TAX_EXPENSE_CONCEPTS' own comment for
+// the motivating case.
+function derivePretaxFromNetIncomeAndTax(netIncomeRaw, taxExpenseRaw) {
+  const taxByPeriod = new Map();
+  for (const f of taxExpenseRaw) {
+    if (f.val == null || !f.start || !f.end) continue;
+    taxByPeriod.set(`${f.start}|${f.end}`, f);
+  }
+  const derived = [];
+  for (const ni of netIncomeRaw) {
+    if (ni.val == null || !ni.start || !ni.end) continue;
+    const tax = taxByPeriod.get(`${ni.start}|${ni.end}`);
+    if (!tax) continue;
+    derived.push({ start: ni.start, end: ni.end, val: ni.val + tax.val, filed: new Date(ni.filed) > new Date(tax.filed) ? ni.filed : tax.filed });
+  }
+  return derived;
 }
 
 function daysBetween(startStr, endStr) {
@@ -864,6 +915,26 @@ function needsFilingTextBackfill(quarterlyPoints, annualPoints) {
   return hasRecentQuarterlyGap(quarterlyPoints);
 }
 
+// 20-F annual-fallback trigger -- deliberately NOT needsFilingTextBackfill
+// above, which checks whether QUARTERLY is stale RELATIVE TO annual (the
+// right question for the 6-K fallback, which exists to recover quarterly
+// data). The 20-F fallback exists to recover ANNUAL data specifically, and
+// verified live this is a genuinely different failure shape: DHT's
+// quarterly capex is already fresh (reaches the current quarter via the
+// 6-K fallback above) while its ANNUAL capex specifically stays stuck at
+// FY2021 (a company-specific custom XBRL extension tag switch -- see
+// extractAnnualFactsFrom20F's own comment) -- needsFilingTextBackfill sees
+// fresh quarterly data and never even notices annual is stale, since
+// annual being OLDER than quarterly never trips its
+// "annual much newer than quarterly" check. This checks annual's own
+// staleness directly, independent of whatever quarterly looks like. Same
+// threshold/shape as needsInstantBackfill just below.
+function needsAnnual20FBackfill(annualPoints) {
+  if (!annualPoints.length) return true;
+  const lastAnnualEnd = new Date(annualPoints[annualPoints.length - 1].end);
+  return Date.now() - lastAnnualEnd.getTime() > QUARTERLY_STALE_GAP_DAYS * 24 * 60 * 60 * 1000;
+}
+
 // Instant-fact (equity/debt/cash) counterpart -- no annual anchor to
 // compare against (an instant snapshot has no "cumulative" concept the way
 // a flow does), so this just checks whether the most recent real point is
@@ -963,6 +1034,20 @@ async function processTicker(symbol, cik, isBank) {
   let capex = dedupeAndClassify(capexRaw);
   let netIncome = dedupeAndClassify(netIncomeRaw);
   let ebit = dedupeAndClassify(ebitRaw);
+  // TD-style fallback: a filer with ZERO facts under any EBIT_CONCEPTS name
+  // (not just stale/sparse -- see TAX_EXPENSE_CONCEPTS' own comment) gets
+  // one more real, non-fabricated tier: pretax income derived from its
+  // separately-tagged net income and tax expense. Placed before the
+  // ENABLE_FILING_TEXT_FALLBACK block below so needsFilingTextBackfill sees
+  // the improved state and doesn't waste a redundant 6-K-text pretaxIncome
+  // request for a ticker this already fixes via pure arithmetic.
+  // Unconditional (no flag) since it costs zero extra network calls --
+  // companyFacts is already fetched.
+  if (!ebitRaw.length) {
+    const taxExpenseRaw = extractFactSeries(companyFacts, TAX_EXPENSE_CONCEPTS);
+    const derivedPretax = derivePretaxFromNetIncomeAndTax(netIncomeRaw, taxExpenseRaw);
+    if (derivedPretax.length) ebit = dedupeAndClassify(derivedPretax);
+  }
   // Computed early (moved ahead of dedupeInstantFacts's original call site
   // further below) so the filing-text fallback right below can use these
   // as reconciliation anchors (reconcileInstantPoints' direct-date-match
@@ -989,6 +1074,13 @@ async function processTicker(symbol, cik, isBank) {
   //   - the extractor itself never returns an unverified point (see its
   //     own reconciliation checks) — this integration only decides WHEN
   //     to ask, not whether to trust what comes back
+  // Declared here (not inside the block below) so the 20-F fallback further
+  // down -- which needs to layer its own recovered facts on top of the
+  // ORIGINAL XBRL raw arrays (revenueRaw etc.) PLUS whatever this 6-K pass
+  // already recovered, never on top of already-classified .quarterly/
+  // .annual points, which dedupeAndClassify can't re-consume (different
+  // shape: {value}, not {val,filed}) -- can see what this pass found.
+  let filingTextFacts = {};
   if (process.env.ENABLE_FILING_TEXT_FALLBACK) {
     const allowlist = process.env.FILING_TEXT_FALLBACK_TICKERS
       ? new Set(process.env.FILING_TEXT_FALLBACK_TICKERS.split(',').map((s) => s.trim().toUpperCase()))
@@ -1051,7 +1143,6 @@ async function processTicker(symbol, cik, isBank) {
           debt: new Map(debtInstant.map((e) => [e.end, e])),
           cash: new Map(cashInstant.map((e) => [e.end, e])),
         };
-        let filingTextFacts = {};
         try {
           filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT);
         } catch (err) {
@@ -1078,6 +1169,81 @@ async function processTicker(symbol, cik, isBank) {
         if (filingTextFacts.equity?.length) equityInstant = dedupeInstantFacts([...equityRaw, ...filingTextFacts.equity]);
         if (filingTextFacts.debt?.length) debtInstant = dedupeInstantFacts([...debtRaw, ...filingTextFacts.debt]);
         if (filingTextFacts.cash?.length) cashInstant = dedupeInstantFacts([...cashRaw, ...filingTextFacts.cash]);
+      }
+    }
+  }
+
+  // 20-F annual-report fallback -- fills a genuinely different gap than the
+  // 6-K fallback above: a filer whose 20-F switched a concept to a
+  // company-specific custom XBRL extension tag (verified live: DHT's
+  // `dht:InvestmentsInVessels`), which SEC's structured companyfacts API
+  // never exposes under any standard taxonomy name, no matter how many
+  // concept-list alternatives are added -- only parsing the 20-F document
+  // itself recovers it. Re-checks needsFilingTextBackfill AFTER the 6-K
+  // merge above (not the pre-merge state) so a concept the 6-K pass already
+  // fixed doesn't pay for a redundant, heavier 20-F scan (3 full documents'
+  // FilingSummary.xml + several R-files each, vs. the 6-K path's lighter
+  // per-filing cost). Own flag/allowlist, separate from
+  // ENABLE_FILING_TEXT_FALLBACK -- same rollout discipline as
+  // ENABLE_BUSINESSQUANT_FALLBACK below, staged via workflow_dispatch
+  // against a small ticker set first given the added per-ticker cost.
+  if (process.env.ENABLE_20F_ANNUAL_FALLBACK) {
+    const allowlist = process.env.FILING_TEXT_FALLBACK_TICKERS
+      ? new Set(process.env.FILING_TEXT_FALLBACK_TICKERS.split(',').map((s) => s.trim().toUpperCase()))
+      : null;
+    if (!allowlist || allowlist.has(symbol.toUpperCase())) {
+      const needed20F = [];
+      if (needsAnnual20FBackfill(revenue.annual)) needed20F.push('revenue');
+      if (needsAnnual20FBackfill(netIncome.annual)) needed20F.push('netIncome');
+      if (needsAnnual20FBackfill(ebit.annual)) needed20F.push('ebit', 'pretaxIncome');
+      if (needsAnnual20FBackfill(ocf.annual)) needed20F.push('ocf');
+      if (needsAnnual20FBackfill(capex.annual)) needed20F.push('capex');
+      const balanceSheetStale20F = needsInstantBackfill(equityInstant) || needsInstantBackfill(debtInstant) || needsInstantBackfill(cashInstant);
+      if (needed20F.length || balanceSheetStale20F) needed20F.push('equity', 'debt', 'cash');
+
+      if (needed20F.length) {
+        const annualByEnd20F = {
+          revenue: new Map(revenue.annual.map((a) => [a.end, a])),
+          netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
+          ebit: new Map(ebit.annual.map((a) => [a.end, a])),
+          pretaxIncome: new Map(ebit.annual.map((a) => [a.end, a])),
+          ocf: new Map(ocf.annual.map((a) => [a.end, a])),
+          capex: new Map(capex.annual.map((a) => [a.end, a])),
+          equity: new Map(equityInstant.map((e) => [e.end, e])),
+          debt: new Map(debtInstant.map((e) => [e.end, e])),
+          cash: new Map(cashInstant.map((e) => [e.end, e])),
+        };
+        let annual20FFacts = {};
+        try {
+          annual20FFacts = await extractAnnualFactsFrom20F(cik, needed20F, annualByEnd20F, SEC_USER_AGENT);
+        } catch (err) {
+          console.warn(`  20-F annual fallback failed for ${symbol}: ${err.message}`);
+        }
+        // Layered on top of the ORIGINAL XBRL raw arrays (revenueRaw etc.)
+        // plus whatever the 6-K pass above already recovered (filingTextFacts,
+        // hoisted to this function's scope for exactly this) -- NOT on top
+        // of revenue.quarterly/.annual, which are already-classified
+        // {value}-shaped points dedupeAndClassify can't re-consume (it
+        // expects raw {val,filed}-shaped facts). Same merge shape the 6-K
+        // block above already uses.
+        if (annual20FFacts.revenue?.length) revenue = dedupeAndClassify([...revenueRaw, ...(filingTextFacts.revenue || []), ...annual20FFacts.revenue]);
+        if (annual20FFacts.netIncome?.length) netIncome = dedupeAndClassify([...netIncomeRaw, ...(filingTextFacts.netIncome || []), ...annual20FFacts.netIncome]);
+        if (annual20FFacts.ebit?.length) ebit = dedupeAndClassify([...ebitRaw, ...(filingTextFacts.ebit || []), ...annual20FFacts.ebit]);
+        if (needsAnnual20FBackfill(ebit.annual) && annual20FFacts.pretaxIncome?.length) {
+          ebit = dedupeAndClassify([...ebitRaw, ...(filingTextFacts.ebit || []), ...annual20FFacts.pretaxIncome]);
+        }
+        if (annual20FFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...(filingTextFacts.ocf || []), ...annual20FFacts.ocf]);
+        // Same sign flip as the 6-K path above -- a 20-F table's own
+        // parenthesized value is a negative outflow, same convention as
+        // the 6-K exhibit's, but XBRL's capex concept is a positive
+        // magnitude; downstream fcfMargin math (ocf.value - capex.value)
+        // assumes XBRL's convention.
+        if (annual20FFacts.capex?.length) {
+          capex = dedupeAndClassify([...capexRaw, ...(filingTextFacts.capex || []), ...annual20FFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+        }
+        if (annual20FFacts.equity?.length) equityInstant = dedupeInstantFacts([...equityRaw, ...(filingTextFacts.equity || []), ...annual20FFacts.equity]);
+        if (annual20FFacts.debt?.length) debtInstant = dedupeInstantFacts([...debtRaw, ...(filingTextFacts.debt || []), ...annual20FFacts.debt]);
+        if (annual20FFacts.cash?.length) cashInstant = dedupeInstantFacts([...cashRaw, ...(filingTextFacts.cash || []), ...annual20FFacts.cash]);
       }
     }
   }
@@ -1340,6 +1506,7 @@ module.exports = {
   isGenuineForeignFiler,
   isGenuineForeignFormFiler,
   needsFilingTextBackfill,
+  needsAnnual20FBackfill,
   buildTrailingWindows,
   buildRatioTrend,
   buildQuarterlyRatioTrend,

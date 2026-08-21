@@ -39,6 +39,16 @@ const cheerio = require('cheerio');
 const SEC_SUBMISSIONS_BASE = 'https://data.sec.gov/submissions';
 const SEC_ARCHIVES_BASE = 'https://www.sec.gov/Archives/edgar/data';
 const MAX_FILINGS_TO_SCAN = 25; // ~2 years of quarters for a normal quarterly filer
+// 3, not 1 or 2 -- deliberately buys cross-filing corroboration (Check C),
+// not just raw coverage: a 20-F's own comparative table already carries
+// 2-3 fiscal years, so two CONSECUTIVE 20-Fs overlap in 2 of their 3 years,
+// letting Check C verify those years the same way it verifies 6-K-derived
+// quarters, without needing Check D's section-subtotal self-check at all
+// for anything but the single newest, not-yet-echoed fiscal year. Verified
+// live for DHT: its 3 most recent 20-Fs (filed 2026/2025/2024) cover
+// FY2021-2025 with FY2022-2024 double-corroborated -- closes the actual
+// known gap (FY2022+) with margin.
+const MAX_20F_FILINGS_TO_SCAN = 3;
 // High-frequency filers (DEFT, CMBT and others verified live: 90+ 6-Ks/year,
 // mostly routine press releases/NAV updates) blow through MAX_FILINGS_TO_SCAN
 // within a few months when just taking the N most recent 6-Ks regardless of
@@ -241,7 +251,17 @@ const LABEL_ALIASES = {
     // "Acquisition and improvement of vessels", a FOURTH distinct real-
     // world phrasing, which the original "acquisition(s)? of vessels" (no
     // gap allowed) never matched.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)?( and \w+)? of vessels|drydock/i,
+    // "expenditures? for( \w+)? (vessels?|property)" added -- verified
+    // live: Teekay Tankers (TNK) labels its real investing-section capex
+    // line "Expenditures for vessels and equipment", a FIFTH distinct
+    // real-world phrasing -- neither "capital expenditures" (no "for X"
+    // suffix) nor any vessel/property alternative above (all anchored on
+    // "acquisition"/"purchase"/"investment", none on bare "expenditures")
+    // matched it. Found in TNK's own separate, fuller "Consolidated
+    // Statements of Cash Flows" 6-K exhibit (its condensed earnings-release
+    // exhibit omits the investing section entirely) -- the extractor
+    // already scans both filings; only the label pattern was the gap.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)?( and \w+)? of vessels|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -709,6 +729,84 @@ const SECTION_RESTRICTED_CONCEPTS = { capex: 'investing' };
 // redundant text duplicate to conflict with there.
 const CUMULATIVE_FALLBACK_CONCEPTS = new Set(['ocf', 'capex']);
 
+// Resolves a list of candidate rows that all matched the same concept down
+// to either a single winning candidate or (for capex/debt, which can
+// genuinely split across multiple real, non-overlapping lines with no
+// single "Total" row -- see the capex/debt LABEL_ALIASES comments) the
+// full surviving candidate set for the CALLER to sum (each caller's
+// candidates carry a different value shape -- extractFromTable's have
+// value3mo+valueCumulative, extractFromInstantTable's have a single value
+// -- so summation itself stays caller-specific). Returns null if still
+// genuinely ambiguous (0 or 2+ candidates after every tiebreak).
+// `valueKey` names which field represents each candidate's numeric value,
+// for the repeat-match dedup only. Shared, behavior-preserving extraction
+// of logic previously duplicated (with slight variations) between
+// extractFromTable and extractFromInstantTable.
+function resolveConceptCandidates(list, concept, valueKey) {
+  const distinct = [];
+  for (const c of list) if (!distinct.some((d) => d[valueKey] === c[valueKey])) distinct.push(c);
+  if (distinct.length === 1) return { winner: distinct[0] };
+
+  // A repeat match is only a genuine conflict if its value actually
+  // DIFFERS from an earlier one — verified live: Eldorado Gold (EGO)
+  // repeats "Net earnings for the period" verbatim, once as the
+  // statement's own subtotal and again after the shareholders/non-
+  // controlling-interest attribution breakdown, both carrying the
+  // IDENTICAL real figure. Treating any second label match as
+  // automatically ambiguous was silently dropping a large share of real,
+  // unambiguous matches whenever a filer's presentation repeats a
+  // subtotal this way (a common pattern, not specific to EGO).
+  //
+  // Multiple genuinely different values for the same concept — verified
+  // live: DEFT breaks revenue into several real sub-lines that all match
+  // the broad revenue keyword alongside the statement's own "Total
+  // revenues" line — a universal accounting-statement convention (sub-
+  // items roll up into one "Total" row). When exactly one candidate is
+  // unambiguously a total line, prefer it over the sub-items rather than
+  // dropping the concept entirely.
+  const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
+  if (totalMatches.length === 1) return { winner: totalMatches[0] };
+
+  // Still tied — for netIncome specifically, DEFT also discloses a
+  // separate "Net income for the period after taxes" alongside "Net
+  // income and comprehensive income for the period" (the latter folds in
+  // OCI items like currency translation, a genuinely different figure). A
+  // PREFERENCE, not an exclude: a filer with no separate net-income line
+  // at all (its only bottom-line total literally named "...and
+  // comprehensive income...") never reaches this branch (already resolved
+  // above via the single-candidate or total-match case).
+  if (concept === 'netIncome') {
+    const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
+    if (nonComprehensive.length === 1) return { winner: nonComprehensive[0] };
+  }
+  // ocf specifically: a filer can show a pre-tax operating cash flow
+  // SUBTOTAL as its own line before subtracting taxes paid down to the
+  // real bottom-line figure -- verified live: IAMGOLD (IAG) shows both
+  // "Cash from operating activities, before income taxes paid" AND "Net
+  // cash from operating activities" as genuinely different real values in
+  // the same statement, neither prefixed "Total". The second is the
+  // actual OCF figure every other source means by the term -- prefer
+  // whichever candidate's label starts with "net cash" when exactly one
+  // does.
+  if (concept === 'ocf') {
+    const netCash = distinct.filter((d) => /^net\s+cash\b/i.test(d.label.trim()));
+    if (netCash.length === 1) return { winner: netCash[0] };
+  }
+  // capex/debt specifically: unlike revenue/netIncome (one bottom-line
+  // total rolling up sub-items), a filer can report either as several
+  // genuinely separate, non-overlapping lines with no single "Total" row
+  // at all. Signaled here rather than summed here, since safe to attempt
+  // because the sum still has to pass the SAME downstream reconciliation
+  // as any other extracted point before it's ever trusted; an accidental/
+  // wrong sum simply fails to verify and gets dropped exactly like a bad
+  // single-row match would.
+  if (concept === 'capex' || concept === 'debt') return { sum: distinct };
+
+  // Any other shape (0 or 2+ candidates after every tiebreak) stays
+  // genuinely ambiguous.
+  return null;
+}
+
 function extractFromTable($, table, targetEndYear, aliasMap) {
   const parsed = parseTableColumns($, table);
   if (!parsed) return null;
@@ -778,83 +876,156 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
 
   const results = {};
   for (const [concept, list] of Object.entries(candidates)) {
-    // A repeat match is only a genuine conflict if its value actually
-    // DIFFERS from an earlier one — verified live: Eldorado Gold (EGO)
-    // repeats "Net earnings for the period" verbatim, once as the
-    // statement's own subtotal and again after the shareholders/non-
-    // controlling-interest attribution breakdown, both carrying the
-    // IDENTICAL real figure. Treating any second label match as
-    // automatically ambiguous was silently dropping a large share of real,
-    // unambiguous matches whenever a filer's presentation repeats a
-    // subtotal this way (a common pattern, not specific to EGO).
-    const distinct = [];
-    for (const c of list) if (!distinct.some((d) => d.value3mo === c.value3mo)) distinct.push(c);
-    if (distinct.length === 1) {
-      results[concept] = distinct[0];
-      continue;
-    }
-    // Multiple genuinely different values for the same concept — verified
-    // live: DEFT breaks revenue into several real sub-lines ("Other
-    // revenue", "Revenues excluding realized and net change in unrealized
-    // gains (losses)", "Revenues from realized and net change in
-    // unrealized gains (losses)") that all match the broad revenue keyword
-    // alongside the statement's own "Total revenues" line — a universal
-    // accounting-statement convention (sub-items roll up into one "Total"
-    // row). When exactly one candidate is unambiguously a total line,
-    // prefer it over the sub-items rather than dropping the concept
-    // entirely.
-    const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
-    if (totalMatches.length === 1) { results[concept] = totalMatches[0]; continue; }
-    // Still tied — for netIncome specifically, DEFT also discloses a
-    // separate "Net income for the period after taxes" alongside "Net
-    // income and comprehensive income for the period" (the latter folds in
-    // OCI items like currency translation, a genuinely different figure).
-    // A PREFERENCE, not an exclude: GreenFire Resources (GFR) has no
-    // separate net-income line at all — its only bottom-line total is
-    // literally named "Net income (loss) and comprehensive income (loss)"
-    // — so this only narrows the set when a non-comprehensive alternative
-    // actually exists; GFR's single-candidate case never reaches this
-    // branch at all (already returned above).
-    if (concept === 'netIncome') {
-      const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
-      if (nonComprehensive.length === 1) results[concept] = nonComprehensive[0];
-    }
-    // ocf specifically: a filer can show a pre-tax operating cash flow
-    // SUBTOTAL as its own line before subtracting taxes paid down to the
-    // real bottom-line figure -- verified live: IAMGOLD (IAG) shows both
-    // "Cash from operating activities, before income taxes paid" AND
-    // "Net cash from operating activities" as genuinely different real
-    // values in the same statement, neither prefixed "Total". The second
-    // is the actual OCF figure every other source (XBRL, Finnhub) means
-    // by the term -- prefer whichever candidate's label starts with "net
-    // cash" when exactly one does.
-    if (concept === 'ocf') {
-      const netCash = distinct.filter((d) => /^net\s+cash\b/i.test(d.label.trim()));
-      if (netCash.length === 1) results[concept] = netCash[0];
-    }
-    // capex specifically: unlike revenue/netIncome (one bottom-line total
-    // rolling up sub-items), a filer can report capex-equivalent outflow
-    // as several genuinely separate, non-overlapping lines with no single
-    // "Total" row at all -- verified live: Scorpio Tankers (STNG) reports
-    // "Acquisition of vessels and payments for vessels under construction"
-    // and "Drydock and other vessel related payments" as two distinct real
-    // cash-flow lines, neither of which is a subtotal of the other. Summed
-    // here as a single synthetic candidate rather than dropped as
-    // ambiguous -- safe to attempt because the sum still has to pass the
-    // SAME downstream reconciliation (reconcilePoints' cumulative-column
-    // and annual-XBRL checks) as any other extracted point before it's
-    // ever trusted; an accidental/wrong sum simply fails to verify and
-    // gets dropped exactly like a bad single-row match would.
-    if (concept === 'capex' && results[concept] === undefined) {
-      const value3mo = distinct.reduce((sum, d) => sum + d.value3mo, 0);
-      const cumulativeParts = distinct.map((d) => d.valueCumulative);
+    const resolved = resolveConceptCandidates(list, concept, 'value3mo');
+    if (!resolved) continue;
+    if (resolved.winner) { results[concept] = resolved.winner; continue; }
+    // capex-only sum (debt has no value3mo/valueCumulative shape — that's
+    // extractFromInstantTable's concept) -- see resolveConceptCandidates'
+    // own comment for why this is safe to attempt.
+    if (resolved.sum && concept === 'capex') {
+      const value3mo = resolved.sum.reduce((sum, d) => sum + d.value3mo, 0);
+      const cumulativeParts = resolved.sum.map((d) => d.valueCumulative);
       const valueCumulative = cumulativeParts.every((v) => v != null) ? cumulativeParts.reduce((sum, v) => sum + v, 0) : null;
-      results[concept] = { label: distinct.map((d) => d.label).join(' + '), value3mo, valueCumulative };
+      results[concept] = { label: resolved.sum.map((d) => d.label).join(' + '), value3mo, valueCumulative };
     }
-    // Any other shape (0 or 2+ candidates after every tiebreak) stays
-    // genuinely ambiguous and is dropped, same as before.
   }
   return Object.keys(results).length ? { period: targetPeriod, facts: results } : null;
+}
+
+// ---------------------------------------------------------------------------
+// 20-F annual extraction — unlike extractFromTable above (which targets ONE
+// specific quarter), a 20-F's own comparative table already carries 2-3
+// full fiscal years in ONE table, all independently useful, so this returns
+// one result PER ANNUAL COLUMN rather than a single target period (same
+// "every column is useful" shape as extractFromInstantTable). Kept as a
+// separate sibling function rather than a modification of extractFromTable
+// -- reuses parseTableColumns/matchesConcept/resolveConceptCandidates, but
+// the "collect every annual column at once, plus each section's own
+// disclosed subtotal" shape is different enough that folding it into the
+// already-heavily-tested interim-quarter function risked destabilizing it
+// for no benefit.
+//
+// A real subtotal row ("Net cash used in investing activities", "Net cash
+// provided by operating activities", etc.) -- deliberately narrow (starts
+// with "net cash"/"net increase"/"net decrease", names one of the three
+// section words) so a genuine subtotal is never confused with an ordinary
+// line item. Used for "Check D" below: if every numeric row assigned to a
+// section sums to that section's OWN disclosed subtotal, every section-
+// restricted concept extracted from that column is corroborated by the
+// document's own internal arithmetic, without needing a second filing to
+// agree. Verified live against DHT's real 20-F: investing-activities rows
+// for FY2025 (-111,125 + -198,511 + 143,521 + 0 + -306) sum to exactly
+// -166,421, matching that column's own disclosed "Net cash used in
+// investing activities" subtotal to the dollar.
+const SECTION_SUBTOTAL_PATTERN = /^net (cash|increase|decrease)\b.*(operating|investing|financing) activities/i;
+
+// SEC's auto-rendered R-files state their own unit convention directly in
+// the table's own header caption -- e.g. "Consolidated Statement of Cash
+// Flow - USD ($) $ in Thousands" -- rather than requiring statistical
+// inference the way detectScaleMultiplier's 6-K-path comparison does.
+// Deliberately NOT reusing detectScaleMultiplier here: its algorithm sums
+// MULTIPLE same-year points to approximate a fraction of a real annual
+// XBRL total (built for quarterly-vs-annual comparison), which doesn't
+// apply when the points ARE the annual values themselves, AND no reliable
+// same-concept-same-year anchor exists for the very years this path exists
+// to recover (verified live: DHT's real capex XBRL anchor only covers
+// FY2015-2021, under a different, narrower concept than the gap years
+// FY2022+ this path recovers -- nothing to compare against even if the
+// shapes did line up). Verified live against two real filers: DHT's own
+// caption reads "...$ in Thousands" (its real capex is ~$100-300M/year,
+// confirming the displayed ~$100-300K-looking figures needed x1000);
+// IMPP's caption has no unit qualifier at all (raw dollars, needs no
+// scaling) -- both handled by the same simple text check.
+function detectTableScale($, table) {
+  const headerText = $(table).find('tr').first().text();
+  if (/in thousands/i.test(headerText)) return 1000;
+  if (/in millions/i.test(headerText)) return 1000000;
+  return 1;
+}
+
+function extractAllAnnualColumnsFromTable($, table, aliasMap) {
+  const parsed = parseTableColumns($, table);
+  if (!parsed) return [];
+  const { columns, dataStartRowIdx } = parsed;
+  const annualIdxs = columns.map((c, i) => (c.months === 12 ? i : -1)).filter((i) => i !== -1);
+  if (!annualIdxs.length) return [];
+  const scale = detectTableScale($, table);
+
+  const rows = $(table).find('tr').toArray();
+  const candidatesByColumn = annualIdxs.map(() => ({})); // concept -> [{label, value}]
+  const sectionDataByColumn = annualIdxs.map(() => ({})); // section -> {sum, subtotal}
+  let currentSection = null;
+  for (let i = dataStartRowIdx; i < rows.length; i++) {
+    const cells = nonEmptyCells($, rows[i]);
+    if (!cells.length) continue;
+    const rowText = cells.map((c) => c.text).join(' ');
+    const isSubtotalRow = SECTION_SUBTOTAL_PATTERN.test(rowText);
+    // Same section-tracking as extractFromTable -- see its own comment for
+    // why this runs on raw cell text, independent of whether the row ends
+    // up a real parseable data row at all. A subtotal row names its own
+    // section too (e.g. "...investing activities") but must NOT re-trigger
+    // this branch -- it's concluding the section, not opening a new one.
+    if (!isSubtotalRow) {
+      if (/operating activities/i.test(rowText)) currentSection = 'operating';
+      else if (/investing activities/i.test(rowText)) currentSection = 'investing';
+      else if (/financing activities/i.test(rowText)) currentSection = 'financing';
+    }
+    const row = parseDataRow(cells, columns.length);
+    if (!row) continue;
+    if (scale !== 1) row.values = row.values.map((v) => v * scale);
+
+    if (isSubtotalRow && currentSection) {
+      for (let ci = 0; ci < annualIdxs.length; ci++) {
+        const data = (sectionDataByColumn[ci][currentSection] = sectionDataByColumn[ci][currentSection] || { sum: 0, subtotal: null });
+        data.subtotal = row.values[annualIdxs[ci]];
+      }
+      continue; // a subtotal row is never itself a concept candidate
+    }
+    if (currentSection) {
+      for (let ci = 0; ci < annualIdxs.length; ci++) {
+        const data = (sectionDataByColumn[ci][currentSection] = sectionDataByColumn[ci][currentSection] || { sum: 0, subtotal: null });
+        data.sum += row.values[annualIdxs[ci]];
+      }
+    }
+
+    for (const concept of Object.keys(aliasMap)) {
+      if (!matchesConcept(row.label, concept)) continue;
+      const requiredSection = SECTION_RESTRICTED_CONCEPTS[concept];
+      if (requiredSection && currentSection !== requiredSection) continue;
+      for (let ci = 0; ci < annualIdxs.length; ci++) {
+        (candidatesByColumn[ci][concept] = candidatesByColumn[ci][concept] || []).push({ label: row.label, value: row.values[annualIdxs[ci]] });
+      }
+    }
+  }
+
+  const out = [];
+  for (let ci = 0; ci < annualIdxs.length; ci++) {
+    const results = {};
+    for (const [concept, list] of Object.entries(candidatesByColumn[ci])) {
+      const resolved = resolveConceptCandidates(list, concept, 'value');
+      if (!resolved) continue;
+      if (resolved.winner) { results[concept] = resolved.winner; continue; }
+      if (resolved.sum && concept === 'capex') {
+        results[concept] = { label: resolved.sum.map((d) => d.label).join(' + '), value: resolved.sum.reduce((sum, d) => sum + d.value, 0) };
+      }
+    }
+    if (!Object.keys(results).length) continue;
+    // Check D eligibility -- only meaningful for section-restricted
+    // concepts (currently just capex), where the section boundary is
+    // already well-defined; an unrestricted concept has no single section
+    // to check a subtotal against.
+    const sectionVerifiedConcepts = new Set();
+    for (const concept of Object.keys(results)) {
+      const section = SECTION_RESTRICTED_CONCEPTS[concept];
+      if (!section) continue;
+      const data = sectionDataByColumn[ci][section];
+      if (!data || data.subtotal == null) continue;
+      const diff = Math.abs(data.sum - data.subtotal) / Math.abs(data.subtotal || 1);
+      if (diff <= RECONCILE_TOLERANCE) sectionVerifiedConcepts.add(concept);
+    }
+    out.push({ period: columns[annualIdxs[ci]], facts: results, sectionVerifiedConcepts });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,18 +1088,16 @@ function extractFromInstantTable($, table, aliasMap) {
   for (let c = 0; c < columns.length; c++) {
     const results = {};
     for (const [concept, list] of Object.entries(candidatesByColumn[c])) {
-      const distinct = [];
-      for (const cand of list) if (!distinct.some((d) => d.value === cand.value)) distinct.push(cand);
-      if (distinct.length === 1) { results[concept] = distinct[0]; continue; }
-      const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
-      if (totalMatches.length === 1) { results[concept] = totalMatches[0]; continue; }
-      // debt specifically: current + non-current portions are two real,
-      // genuinely separate lines with no single "Total debt" row — see
-      // LABEL_ALIASES.debt's own comment. Summed the same way capex's
-      // duration-side equivalent is above; safe because the sum still has
-      // to pass reconcileInstantPoints before it's ever trusted.
-      if (concept === 'debt' && results[concept] === undefined && distinct.length >= 2) {
-        results[concept] = { label: distinct.map((d) => d.label).join(' + '), value: distinct.reduce((sum, d) => sum + d.value, 0) };
+      const resolved = resolveConceptCandidates(list, concept, 'value');
+      if (!resolved) continue;
+      if (resolved.winner) { results[concept] = resolved.winner; continue; }
+      // debt-only sum here (capex is extractFromTable's duration-side
+      // concept) -- current + non-current portions are two real, genuinely
+      // separate lines with no single "Total debt" row — see
+      // LABEL_ALIASES.debt's own comment. Safe because the sum still has to
+      // pass reconcileInstantPoints before it's ever trusted.
+      if (resolved.sum && concept === 'debt') {
+        results[concept] = { label: resolved.sum.map((d) => d.label).join(' + '), value: resolved.sum.reduce((sum, d) => sum + d.value, 0) };
       }
     }
     if (Object.keys(results).length) out.push({ period: columns[c], facts: results });
@@ -1105,6 +1274,25 @@ function extractFromRFile($, targetEndYear, aliasMap) {
   return null;
 }
 
+// Instant-fact (balance-sheet) counterpart to extractFromRFile above — same
+// per-page table search, calling extractFromInstantTable instead. Closes a
+// real pre-existing gap: the R-file loop in extractQuarterlyFactsFromFilings
+// previously only ever tried income/cashflow aliases against R-files, never
+// balance-sheet ones — only the slower exhibit-scan fallback path attempted
+// equity/debt/cash extraction at all, even for Inline XBRL filings whose
+// FilingSummary.xml already points straight at the exact balance-sheet
+// R-file (verified live: DHT's own manifest lists "Consolidated Statement
+// of Financial Position" as its own R-file, same as its cash-flow one).
+function extractFromInstantRFile($, aliasMap) {
+  const tables = $('table').toArray();
+  for (const table of tables) {
+    if ($(table).find('tr').length < 5) continue;
+    const result = extractFromInstantTable($, table, aliasMap);
+    if (result.length) return result;
+  }
+  return [];
+}
+
 function subtractMonths(dateStr, months) {
   const d = new Date(dateStr);
   const result = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - months, d.getUTCDate()));
@@ -1279,18 +1467,38 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
         const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome }).filter(([, v]) => v));
         const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+        // Balance-sheet (equity/debt/cash) R-files -- previously only ever
+        // attempted via the slower exhibit-scan fallback below, even when
+        // FilingSummary.xml already pointed straight at the right R-file
+        // (verified live: DHT's manifest lists "Consolidated Statement of
+        // Financial Position" as its own R-file, same shape as its
+        // cash-flow one). See extractFromInstantRFile's own comment.
+        const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
         const matches = [
-          ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases })) : []),
-          ...(Object.keys(cashflowAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.cashflow.test(rep.shortName) || STATEMENT_HEADINGS.cashflow.test(rep.longName)).map((rep) => ({ rep, aliases: cashflowAliases })) : []),
+          ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases, instant: false })) : []),
+          ...(Object.keys(cashflowAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.cashflow.test(rep.shortName) || STATEMENT_HEADINGS.cashflow.test(rep.longName)).map((rep) => ({ rep, aliases: cashflowAliases, instant: false })) : []),
+          ...(Object.keys(balanceSheetAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.balanceSheet.test(rep.shortName) || STATEMENT_HEADINGS.balanceSheet.test(rep.longName)).map((rep) => ({ rep, aliases: balanceSheetAliases, instant: true })) : []),
         ];
         if (matches.length) usedFilingSummary = true;
-        for (const { rep, aliases } of matches) {
+        for (const { rep, aliases, instant } of matches) {
           const accessionNoDashes = filing.accessionNumber.replace(/-/g, '');
           const rUrl = `${SEC_ARCHIVES_BASE}/${Number(cik)}/${accessionNoDashes}/${rep.htmlFileName}`;
           const html = await fetchText(rUrl, userAgent);
           if (debug) console.error('DEBUG R-file', rUrl, rep.shortName || rep.longName);
           if (!html) continue;
           const $ = cheerio.load(html);
+          if (instant) {
+            let extractedList;
+            try {
+              extractedList = extractFromInstantRFile($, aliases);
+            } catch (e) {
+              if (debug) console.error('DEBUG extractFromInstantRFile threw', rUrl, e.message);
+              continue;
+            }
+            if (debug) console.error('DEBUG extractFromInstantRFile result', rUrl, JSON.stringify(extractedList));
+            recordExtractedInstant(extractedList, filing);
+            continue;
+          }
           for (const year of candidateYears) {
             let extracted;
             try {
@@ -1474,6 +1682,215 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   return result;
 }
 
+/**
+ * Annual counterpart to extractQuarterlyFactsFromFilings above -- extracts
+ * real annual facts for `neededConcepts` from a ticker's 3 most recent
+ * 20-F filings (see MAX_20F_FILINGS_TO_SCAN's own comment for why 3, and
+ * why no exhibit-scan fallback is needed here the way the 6-K path has one:
+ * 20-Fs are Inline XBRL, and FilingSummary.xml already pointed straight at
+ * the right R-file for both real filers checked live (DHT, IMPP) -- add a
+ * heading-search fallback (reusing extractStatement/extractInstantStatement
+ * against the raw 20-F document, same shape as the 6-K exhibit-scan path)
+ * only if a real 20-F filer without one ever turns up.
+ *
+ * Fills a genuinely different gap than the 6-K path: a foreign filer whose
+ * 20-F switched a concept to a company-specific custom XBRL extension tag
+ * (verified live: DHT's `dht:InvestmentsInVessels`), which SEC's structured
+ * companyfacts API never exposes at all under any standard taxonomy name,
+ * no matter how many concept-list alternatives are added -- only parsing
+ * the document itself recovers it. `annualByEnd` is the same real-annual-
+ * XBRL reconciliation anchor the 6-K path already threads through (Check
+ * B); for a concept whose real XBRL genuinely stopped (like DHT's capex),
+ * Check C (cross-filing corroboration, built into how MAX_20F_FILINGS_TO_SCAN
+ * is chosen) and Check D (same-document section-subtotal self-check, see
+ * reconcilePoints' own comment) do the real verification work instead.
+ *
+ * Returns { [concept]: Array<{start, end, val, filed}> } -- identical shape
+ * to extractQuarterlyFactsFromFilings/extractFactSeries, so callers merge
+ * it into their raw fact arrays via the exact same
+ * dedupeAndClassify([...raw, ...new20FFacts]) idiom used everywhere else.
+ */
+async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userAgent) {
+  const submissions = await fetchJsonSec(`${SEC_SUBMISSIONS_BASE}/CIK${cik}.json`, userAgent);
+  if (!submissions?.filings?.recent) return {};
+
+  const r = submissions.filings.recent;
+  const filings = [];
+  // Exact form-type match ('20-F', not '20-F/A') -- same reasoning as the
+  // 6-K path excluding '6-K/A': two entries must be genuinely independent
+  // filings for cross-filing corroboration (Check C) to mean anything.
+  for (let i = 0; i < r.form.length && filings.length < MAX_20F_FILINGS_TO_SCAN; i++) {
+    if (r.form[i] === '20-F') filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
+  }
+  if (!filings.length) return {};
+
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const aliasMap = {};
+  for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
+
+  const debug = !!process.env.DEBUG_FILING_EXTRACT;
+
+  // Duration-concept counterpart to recordExtractedInstant above --
+  // computes each fact's own real start date from its real 12-month
+  // duration (subtractMonths(endIso, 12), same helper the 6-K path already
+  // uses for its own 3/6/9-month periods), and carries sectionVerified
+  // through from extractAllAnnualColumnsFromTable's own per-concept flag
+  // (feeds Check D below).
+  function recordExtractedAnnual(extractedList, filing) {
+    for (const extracted of extractedList) {
+      const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
+      if (!endIso) continue;
+      const startIso = subtractMonths(endIso, extracted.period.months);
+      for (const [concept, fact] of Object.entries(extracted.facts)) {
+        const list = collected[concept].get(endIso) || [];
+        if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
+          list.push({
+            start: startIso,
+            end: endIso,
+            val: fact.value,
+            filed: filing.filingDate,
+            accessionNumber: filing.accessionNumber,
+            sectionVerified: extracted.sectionVerifiedConcepts?.has(concept) || false,
+          });
+        }
+        collected[concept].set(endIso, list);
+      }
+    }
+  }
+
+  function recordExtractedInstantAnnual(extractedList, filing) {
+    for (const extracted of extractedList) {
+      const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
+      if (!endIso) continue;
+      for (const [concept, fact] of Object.entries(extracted.facts)) {
+        const list = collected[concept].get(endIso) || [];
+        if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
+          list.push({ end: endIso, val: fact.value, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
+        }
+        collected[concept].set(endIso, list);
+      }
+    }
+  }
+
+  const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome }).filter(([, v]) => v));
+  const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+  const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
+
+  for (const filing of filings) {
+    let reports;
+    try {
+      reports = await fetchFilingSummaryReports(cik, filing.accessionNumber, userAgent);
+    } catch (e) {
+      if (debug) console.error('DEBUG 20-F fetchFilingSummaryReports threw', filing.accessionNumber, e.message);
+      continue;
+    }
+    if (!reports.length) { if (debug) console.error('DEBUG no FilingSummary.xml for 20-F', filing.accessionNumber); continue; }
+
+    const matches = [
+      ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases, instant: false })) : []),
+      ...(Object.keys(cashflowAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.cashflow.test(rep.shortName) || STATEMENT_HEADINGS.cashflow.test(rep.longName)).map((rep) => ({ rep, aliases: cashflowAliases, instant: false })) : []),
+      ...(Object.keys(balanceSheetAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.balanceSheet.test(rep.shortName) || STATEMENT_HEADINGS.balanceSheet.test(rep.longName)).map((rep) => ({ rep, aliases: balanceSheetAliases, instant: true })) : []),
+    ];
+
+    for (const { rep, aliases, instant } of matches) {
+      const accessionNoDashes = filing.accessionNumber.replace(/-/g, '');
+      const rUrl = `${SEC_ARCHIVES_BASE}/${Number(cik)}/${accessionNoDashes}/${rep.htmlFileName}`;
+      const html = await fetchText(rUrl, userAgent);
+      if (debug) console.error('DEBUG 20-F R-file', rUrl, rep.shortName || rep.longName);
+      if (!html) continue;
+      const $ = cheerio.load(html);
+
+      if (instant) {
+        let extractedList;
+        try {
+          extractedList = extractFromInstantRFile($, aliases);
+        } catch (e) {
+          if (debug) console.error('DEBUG extractFromInstantRFile (20-F) threw', rUrl, e.message);
+          continue;
+        }
+        if (debug) console.error('DEBUG extractFromInstantRFile (20-F) result', rUrl, JSON.stringify(extractedList));
+        recordExtractedInstantAnnual(extractedList, filing);
+        continue;
+      }
+
+      // Same per-page table search as extractFromRFile -- picks the first
+      // substantial table (>=5 rows) that yields a real result, rather than
+      // just the literal first <table> on the page (verified live: R-file
+      // pages can carry several small formatting/auxiliary tables ahead of
+      // the real statement).
+      const tables = $('table').toArray();
+      for (const table of tables) {
+        if ($(table).find('tr').length < 5) continue;
+        let extractedList;
+        try {
+          extractedList = extractAllAnnualColumnsFromTable($, table, aliases);
+        } catch (e) {
+          if (debug) console.error('DEBUG extractAllAnnualColumnsFromTable threw', rUrl, e.message);
+          continue;
+        }
+        if (extractedList.length) {
+          if (debug) console.error('DEBUG extractAllAnnualColumnsFromTable result', rUrl, JSON.stringify(extractedList));
+          recordExtractedAnnual(extractedList, filing);
+          break;
+        }
+      }
+    }
+  }
+
+  // Reconciliation -- same shared machinery the 6-K path uses. Check A
+  // (valueCumulative) naturally no-ops for every point here (nothing above
+  // ever sets valueCumulative -- an annual column has no shorter cumulative
+  // sub-period to reconcile against). Check B (real annual XBRL) and Check
+  // C (cross-filing corroboration) apply completely unmodified. Check D
+  // (section-subtotal self-check) is the new one -- see its own comment in
+  // reconcilePoints.
+  const pointsByConcept = new Map();
+  const accessionToDatesByConcept = new Map();
+  for (const concept of neededConcepts) {
+    const grouped = collected[concept] || new Map();
+    const points = [];
+    const accessionToDates = new Map();
+    for (const [end, list] of grouped) {
+      if (!list.length) continue;
+      for (const l of list) {
+        if (!accessionToDates.has(l.accessionNumber)) accessionToDates.set(l.accessionNumber, new Set());
+        accessionToDates.get(l.accessionNumber).add(end);
+      }
+      const byValue = new Map();
+      for (const l of list) {
+        if (!byValue.has(l.val)) byValue.set(l.val, []);
+        byValue.get(l.val).push(l);
+      }
+      let best = null;
+      for (const occurrences of byValue.values()) {
+        if (!best || occurrences.length > best.length) best = occurrences;
+      }
+      const rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+      points.push({
+        ...rep,
+        corroborations: new Set(best.map((o) => o.accessionNumber)).size,
+        accessionNumbers: new Set(best.map((o) => o.accessionNumber)),
+        sectionVerified: best.some((o) => o.sectionVerified),
+      });
+    }
+    points.sort((a, b) => new Date(a.end) - new Date(b.end));
+    if (points.length) pointsByConcept.set(concept, points);
+    accessionToDatesByConcept.set(concept, accessionToDates);
+  }
+
+  const result = {};
+  for (const [concept, points] of pointsByConcept) {
+    if (debug) console.error('DEBUG 20-F points before reconcile', concept, JSON.stringify(points.map((p) => ({ end: p.end, val: p.val, corroborations: p.corroborations, sectionVerified: p.sectionVerified }))));
+    const verified = INSTANT_CONCEPTS.has(concept)
+      ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept))
+      : reconcilePoints(points, annualByEnd?.[concept] || new Map());
+    if (verified.length) {
+      result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
+    }
+  }
+  return result;
+}
+
 function isAdjacentDate(dateA, dateB) {
   const gapDays = Math.abs((new Date(dateB) - new Date(dateA)) / (1000 * 60 * 60 * 24));
   return gapDays <= 5;
@@ -1630,6 +2047,17 @@ function reconcileInstantPoints(points, knownByEnd, accessionToDates) {
 function reconcilePoints(points, annualByEnd) {
   const verified = new Set();
 
+  // Check D — same-document section-subtotal self-check (20-F annual
+  // extraction only -- see extractAllAnnualColumnsFromTable's own comment).
+  // A newly-recovered fiscal year with no second filing to cross-corroborate
+  // it via Check C yet (e.g. a company's most recent 20-F, filed once,
+  // comparative years not yet echoed by a future filing) would otherwise
+  // stay unverified for up to a year. If every numeric row in this point's
+  // own section summed to that section's own disclosed subtotal at
+  // extraction time, the document already corroborates itself -- no
+  // arithmetic assumption beyond what the filer itself disclosed.
+  for (const p of points) if (p.sectionVerified) verified.add(p);
+
   // Check C — cross-filing corroboration: the SAME real value for this
   // exact period was independently disclosed in 2+ separate 6-K filings
   // (e.g. as this year's own current-quarter figure, and again a year
@@ -1722,5 +2150,9 @@ module.exports = {
   extractFromInstantTable,
   extractInstantStatement,
   extractQuarterlyFactsFromFilings,
+  extractAllAnnualColumnsFromTable,
+  extractFromInstantRFile,
+  extractAnnualFactsFrom20F,
+  resolveConceptCandidates,
   throttleSecRequest,
 };
