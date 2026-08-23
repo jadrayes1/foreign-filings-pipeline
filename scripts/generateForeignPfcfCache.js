@@ -433,9 +433,9 @@ async function main() {
         const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
         const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
-        const ocf = dedupeAndClassify(ocfRaw);
+        let ocf = dedupeAndClassify(ocfRaw);
         let capex = dedupeAndClassify(capexRaw);
-        const shares = dedupeAndClassify(sharesRaw);
+        let shares = dedupeAndClassify(sharesRaw);
 
         // Capex is the concept that's actually gapped for this universe --
         // verified live: ASC has zero capex XBRL facts under ANY of
@@ -501,6 +501,54 @@ async function main() {
             }
           } catch (err) {
             console.log(`  20-F capex fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+
+        // ocf/shares fallback -- same 6-K + 20-F pattern as capex above,
+        // added for STNG specifically: it has zero raw XBRL for ocf/capex/
+        // shares quarterly, so capex's fallback alone still leaves the
+        // ocf/shares side of the join empty. OCF's text-extraction already
+        // exists and works (proven via generateForeignFilingsCache.js's
+        // own fcfMargin success for STNG) -- this script just never
+        // requested it. No sign flip needed for either (OCF's and shares'
+        // text-extracted sign conventions already match XBRL's directly,
+        // unlike capex's parenthesized-outflow convention).
+        let ocfFilingTextFacts = {};
+        let sharesFilingTextFacts = {};
+        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) {
+          try {
+            const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
+            ocfFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['ocf'], annualByEnd, SEC_USER_AGENT);
+            if (ocfFilingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...ocfFilingTextFacts.ocf]);
+          } catch (err) {
+            console.log(`  ocf filing-text fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) {
+          try {
+            const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
+            sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT);
+            if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...sharesFilingTextFacts.shares]);
+          } catch (err) {
+            console.log(`  shares filing-text fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+        if (needsAnnual20FBackfill(ocf.annual)) {
+          try {
+            const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
+            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['ocf'], annualByEnd, SEC_USER_AGENT);
+            if (annual20FFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...(ocfFilingTextFacts.ocf || []), ...annual20FFacts.ocf]);
+          } catch (err) {
+            console.log(`  20-F ocf fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+        if (needsAnnual20FBackfill(shares.annual)) {
+          try {
+            const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
+            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['shares'], annualByEnd, SEC_USER_AGENT);
+            if (annual20FFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...(sharesFilingTextFacts.shares || []), ...annual20FFacts.shares]);
+          } catch (err) {
+            console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
           }
         }
 

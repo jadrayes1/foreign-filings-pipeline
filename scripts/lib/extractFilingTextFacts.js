@@ -62,10 +62,18 @@ const MAX_20F_FILINGS_TO_SCAN = 3;
 // Q1 2026 filing: 409,230 bytes vs. a 149,098-byte routine-filing ceiling)
 // - so filtering by size before counting against MAX_FILINGS_TO_SCAN lets
 // the same fetch budget reach much further back in time by skipping the
-// routine noise entirely. Set comfortably below the smaller real filer
-// (CMBT) while still well above every filer's routine-filing ceiling seen
-// so far.
-const MIN_SUBSTANTIVE_FILING_BYTES = 200000;
+// routine noise entirely. Lowered from 200,000 -- verified live this was
+// silently excluding IMPP's own real quarterly earnings-release exhibits
+// entirely: its genuine standalone-Q1 filings (e.g. 189,759 bytes filed
+// 2025-05-23, with a real "Three Month Periods Ended March 31, 2024 2025"
+// cash-flow statement including real capex) sit just under the old
+// threshold, so IMPP's quarterly data was never even ATTEMPTED, not
+// genuinely unextractable -- the earlier "IMPP has no standalone quarter
+// anywhere" conclusion was wrong, reached without checking this filing at
+// all. Set comfortably above CMBT's known 149,098-byte routine ceiling
+// (the highest routine ceiling seen so far) while now also comfortably
+// below IMPP's real ~189-190K filings.
+const MIN_SUBSTANTIVE_FILING_BYTES = 160000;
 const FILING_LOOKBACK_ENTRIES = 400; // how far into submissions.json's 'recent' list to look for size-qualifying candidates
 const MIN_EXHIBIT_BYTES = 20000; // cover-page heuristic — verified live: STNG's 6-K cover page was 11,450 bytes, its real earnings exhibit 733,171 bytes
 const RECONCILE_TOLERANCE = 0.02; // 2%
@@ -106,6 +114,16 @@ const STATEMENT_HEADINGS = {
   // "Condensed Consolidated Balance Sheets", IAG uses plain "Consolidated
   // Balance Sheets" with no extra qualifiers.
   balanceSheet: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(BALANCE SHEETS?|STATEMENTS? OF FINANCIAL POSITION)/i,
+  // Weighted-average share count lives in its OWN note, not under the main
+  // income-statement heading -- verified live: TNK's real income
+  // statement table has no share-count row at all; the actual "Weighted
+  // average number of common shares - basic/diluted" table sits under a
+  // separate numbered footnote, "16. Earnings Per Share" (part of "NOTES
+  // TO THE UNAUDITED CONSOLIDATED FINANCIAL STATEMENTS"). Not anchored on
+  // a leading number (varies by filer) or "CONSOLIDATED" -- this is a note
+  // title, not a primary statement title, so it doesn't share those
+  // primary statements' naming convention.
+  earningsPerShare: /EARNINGS PER (COMMON )?SHARE/i,
 };
 
 // A real statement title is always short - verified live this matters:
@@ -213,7 +231,12 @@ const LABEL_ALIASES = {
     // which needs it) silently found nothing for a filer whose real cash
     // flow statement was sitting right there. Likely not STNG-specific;
     // "inflow"/"outflow" is standard IFRS statement-of-cash-flows wording.
-    include: /cash (flows? )?(from|provided by|generated (from|by)|used in|inflow|outflow).*operating/i,
+    // "operating cash flow" (reversed word order, no "from"/"provided by"
+    // verb) added -- verified live: TNK labels its three cash-flow
+    // subtotals "Net operating cash flow"/"Net financing cash flow"/"Net
+    // investing cash flow" -- the sibling "financing"/"investing" lines
+    // are still safely excluded below since they contain those words.
+    include: /cash (flows? )?(from|provided by|generated (from|by)|used in|inflow|outflow).*operating|operating cash flow/i,
     exclude: /investing|financing|discontinued/i,
   },
   capex: {
@@ -261,7 +284,22 @@ const LABEL_ALIASES = {
     // Statements of Cash Flows" 6-K exhibit (its condensed earnings-release
     // exhibit omits the investing section entirely) -- the extractor
     // already scans both filings; only the label pattern was the gap.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)?( and \w+)? of vessels|drydock/i,
+    //
+    // "vessels? acquisitions?" (noun-first order, not "acquisition OF
+    // vessels") and "deposits? for( \w+)? (vessel|property) purchase"
+    // added -- verified live: TNK's SAME investing section also has
+    // "Vessel acquisitions" and "Deposit for vessel purchase" as two
+    // FURTHER real, much LARGER lines (its actual dominant capex driver --
+    // real annual capex is $70-190M/year, while "Expenditures for vessels
+    // and equipment" alone is only a few hundred thousand to a few million
+    // per quarter) that the "acquisition(s)? of vessels" alternative never
+    // matched, since the word order is reversed here ("Vessel
+    // acquisitions", not "acquisition of vessels"). Silently understated
+    // TNK's real capex by roughly 95%+ until found -- the existing
+    // capex-summing tiebreak in resolveConceptCandidates already combines
+    // every matching line in the same section, so no further change is
+    // needed beyond recognizing these two additional real phrasings.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -296,6 +334,24 @@ const LABEL_ALIASES = {
     // (mirrors investedCapitalByEnd's own XBRL-sourced CASH_CONCEPTS
     // scope, which also excludes restricted cash).
     exclude: /restricted/i,
+  },
+  // Weighted-average share count -- for generateForeignPfcfCache.js's
+  // per-share P/FCF calculation. Verified live: TNK's real income
+  // statement has this as a genuine table row ("Weighted average number of
+  // common shares - basic (1)" / "...diluted"), not prose -- confirmed
+  // extractable via the same table-based infrastructure every other
+  // concept here already uses. NOT every filer discloses this in a table
+  // though -- verified live: STNG's real earnings exhibit states its
+  // share count ONLY as a narrative sentence ("the Company's basic
+  // weighted average number of shares outstanding were X and Y,
+  // respectively"), nowhere as a table row in the whole document --
+  // genuinely unextractable by this include/exclude, label-matching
+  // system (built entirely around <table> rows), not a pattern-coverage
+  // gap. Left unaddressed by design -- a prose parser is a different
+  // mechanism with no infrastructure to reuse here.
+  shares: {
+    include: /weighted average (number of )?(common )?shares?( outstanding)?/i,
+    exclude: /dilutive effect|per share/i,
   },
 };
 
@@ -463,20 +519,36 @@ function nonEmptyCells($, row) {
 // full-year columns as 3-month too, corrupting every concept extracted
 // from this table shape (a near-universal one: any foreign filer's Q4
 // release plausibly has both a quarter and a full-year column together).
-const PERIOD_PHRASE_INDICATOR = /months? ended|quarters? ended|years? ended/i;
+// "( periods?)?" tolerates "Period(s)" inserted before "Ended" -- verified
+// live: IMPP's real header reads "Three Month Periods EndedMarch 31,"
+// (also missing the space before the month name entirely -- see the date
+// match below), which neither "months? ended" nor any prior IMPP-specific
+// fix here matched, since "Periods" sits directly between "Month" and
+// "Ended". This ticker in particular has surfaced several distinct real
+// header phrasings already (see "Quarters Ended" above) -- another
+// legitimate variant, not a one-off typo.
+const PERIOD_PHRASE_INDICATOR = /months?( periods?)? ended|quarters?( periods?)? ended|years?( periods?)? ended/i;
 
 function parsePeriodPhrase(text) {
-  const months = /nine months|9 months/i.test(text)
+  // "months?" (not just plural "months") on every count -- verified live:
+  // IMPP's real phrase is "Three Month Periods..." (singular "Month"), not
+  // "Three Months...".
+  const months = /nine months?|9 months?/i.test(text)
     ? 9
-    : /six months|6 months/i.test(text)
+    : /six months?|6 months?/i.test(text)
       ? 6
-      : /three months|3 months|quarters? ended/i.test(text)
+      : /three months?|3 months?|quarters? ended/i.test(text)
         ? 3
-        : /twelve months|12 months|years? ended/i.test(text)
+        : /twelve months?|12 months?|years? ended/i.test(text)
           ? 12
           : null;
   if (!months) return null;
-  const dateMatch = text.match(/ended\s+([A-Za-z]+\s+\d{1,2})/i);
+  // \s* (not \s+) after "ended" -- verified live: IMPP's real header has no
+  // space at all between "Ended" and the month name ("EndedMarch 31,"),
+  // likely two adjacent inline elements with no text node between them in
+  // the source HTML (same class of artifact as the already-documented
+  // "Jun 302026" no-space case elsewhere in this file).
+  const dateMatch = text.match(/ended\s*([A-Za-z]+\s+\d{1,2})/i);
   return { months, endMonthDay: dateMatch ? dateMatch[1] : null };
 }
 
@@ -791,6 +863,17 @@ function resolveConceptCandidates(list, concept, valueKey) {
   if (concept === 'ocf') {
     const netCash = distinct.filter((d) => /^net\s+cash\b/i.test(d.label.trim()));
     if (netCash.length === 1) return { winner: netCash[0] };
+  }
+  // shares specifically: "basic" and "diluted" are both real, genuinely
+  // different values, both commonly disclosed as separate lines -- prefer
+  // basic when both are present, matching SHARES_CONCEPTS' own existing
+  // preference order (WeightedAverageNumberOfSharesOutstandingBasic listed
+  // before ...Diluted) in generateForeignFilingsCache.js/
+  // generateForeignPfcfCache.js -- basic is the convention this codebase
+  // already uses for the P/FCF-per-share calculation.
+  if (concept === 'shares') {
+    const basicOnly = distinct.filter((d) => /\bbasic\b/i.test(d.label));
+    if (basicOnly.length === 1) return { winner: basicOnly[0] };
   }
   // capex/debt specifically: unlike revenue/netIncome (one bottom-line
   // total rolling up sub-items), a filer can report either as several
@@ -1396,7 +1479,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // identically in the filing that reports it AND, a year later, in the
   // filing that shows it as the prior-year comparative column - literal
   // agreement between two independent real documents.
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -1474,10 +1557,14 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         // Financial Position" as its own R-file, same shape as its
         // cash-flow one). See extractFromInstantRFile's own comment.
         const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
+        // Shares R-file -- its own note/heading, NOT the main income
+        // statement -- see STATEMENT_HEADINGS.earningsPerShare's own comment.
+        const sharesAliases = Object.fromEntries(Object.entries({ shares: aliasMap.shares }).filter(([, v]) => v));
         const matches = [
           ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases, instant: false })) : []),
           ...(Object.keys(cashflowAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.cashflow.test(rep.shortName) || STATEMENT_HEADINGS.cashflow.test(rep.longName)).map((rep) => ({ rep, aliases: cashflowAliases, instant: false })) : []),
           ...(Object.keys(balanceSheetAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.balanceSheet.test(rep.shortName) || STATEMENT_HEADINGS.balanceSheet.test(rep.longName)).map((rep) => ({ rep, aliases: balanceSheetAliases, instant: true })) : []),
+          ...(Object.keys(sharesAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.earningsPerShare.test(rep.shortName) || STATEMENT_HEADINGS.earningsPerShare.test(rep.longName)).map((rep) => ({ rep, aliases: sharesAliases, instant: false })) : []),
         ];
         if (matches.length) usedFilingSummary = true;
         for (const { rep, aliases, instant } of matches) {
@@ -1540,17 +1627,20 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const hasIncome = STATEMENT_HEADINGS.income.test(fullText);
       const hasCashflow = STATEMENT_HEADINGS.cashflow.test(fullText);
       const hasBalanceSheet = STATEMENT_HEADINGS.balanceSheet.test(fullText);
-      if (debug) console.error('DEBUG', url, 'hasIncome', hasIncome, 'hasCashflow', hasCashflow, 'hasBalanceSheet', hasBalanceSheet);
-      if (!hasIncome && !hasCashflow && !hasBalanceSheet) continue;
+      const hasEarningsPerShare = STATEMENT_HEADINGS.earningsPerShare.test(fullText);
+      if (debug) console.error('DEBUG', url, 'hasIncome', hasIncome, 'hasCashflow', hasCashflow, 'hasBalanceSheet', hasBalanceSheet, 'hasEarningsPerShare', hasEarningsPerShare);
+      if (!hasIncome && !hasCashflow && !hasBalanceSheet && !hasEarningsPerShare) continue;
 
       // Try every year we might plausibly need (this filing's own filing
       // year and the one prior) rather than assuming which quarter it covers.
       const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
 
-      for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow]) {
+      for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow, STATEMENT_HEADINGS.earningsPerShare]) {
         const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome };
         const cashflowAliases = { ocf: aliasMap.ocf, capex: aliasMap.capex };
-        const relevantAliases = heading === STATEMENT_HEADINGS.income ? incomeAliases : cashflowAliases;
+        const sharesAliases = { shares: aliasMap.shares };
+        const relevantAliases =
+          heading === STATEMENT_HEADINGS.income ? incomeAliases : heading === STATEMENT_HEADINGS.cashflow ? cashflowAliases : sharesAliases;
         const filtered = Object.fromEntries(Object.entries(relevantAliases).filter(([, v]) => v));
         if (!Object.keys(filtered).length) continue;
 
@@ -1724,7 +1814,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
   }
   if (!filings.length) return {};
 
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -1775,6 +1865,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
   const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome }).filter(([, v]) => v));
   const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
   const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
+  const sharesAliases = Object.fromEntries(Object.entries({ shares: aliasMap.shares }).filter(([, v]) => v));
 
   for (const filing of filings) {
     let reports;
@@ -1790,6 +1881,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
       ...(Object.keys(incomeAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)).map((rep) => ({ rep, aliases: incomeAliases, instant: false })) : []),
       ...(Object.keys(cashflowAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.cashflow.test(rep.shortName) || STATEMENT_HEADINGS.cashflow.test(rep.longName)).map((rep) => ({ rep, aliases: cashflowAliases, instant: false })) : []),
       ...(Object.keys(balanceSheetAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.balanceSheet.test(rep.shortName) || STATEMENT_HEADINGS.balanceSheet.test(rep.longName)).map((rep) => ({ rep, aliases: balanceSheetAliases, instant: true })) : []),
+      ...(Object.keys(sharesAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.earningsPerShare.test(rep.shortName) || STATEMENT_HEADINGS.earningsPerShare.test(rep.longName)).map((rep) => ({ rep, aliases: sharesAliases, instant: false })) : []),
     ];
 
     for (const { rep, aliases, instant } of matches) {
@@ -1929,10 +2021,31 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
       for (const annual of annuals.values()) {
         if (!annual.value) continue;
         const fyEndYear = annual.end.slice(0, 4);
-        const candidates = byYear.get(fyEndYear) || [];
+        // Decumulate nested/overlapping candidates before summing -- same
+        // reasoning and same helper as Check B's own fix (see
+        // decumulateNestedCandidates' comment); without this, a filer with
+        // TNK's hybrid Q1-standalone/H1-9mo-cumulative shape would have its
+        // naive overlapping sum never land in any plausible ratio bound at
+        // any scale, always concluding "no scaling needed" regardless of
+        // whether that's actually true.
+        const candidates = decumulateNestedCandidates(byYear.get(fyEndYear) || []);
         if (candidates.length < 2) continue;
         const sum = candidates.reduce((s, p) => s + p.val * scale, 0);
-        const ratio = sum / annual.value;
+        // Magnitude-only ratio -- capex specifically has a real, known sign
+        // mismatch here: text-extracted values stay in their disclosed
+        // outflow (negative) convention THROUGHOUT this function (the
+        // caller flips the sign to match XBRL's positive-magnitude
+        // convention only AFTER receiving the final result), while
+        // annualByEnd's real XBRL anchor is already positive. A raw signed
+        // ratio (sum / annual.value) is always negative for capex against
+        // its own real anchor, permanently failing the plausibility bound
+        // regardless of how correct the magnitude is -- verified live:
+        // TNK's real 2025 capex sum vs annual anchor is a near-perfect
+        // magnitude match (ratio -1.01) but fails outright unsigned.
+        // Comparing magnitudes only is safe for same-signed concepts too
+        // (abs of two already-matching signs is a no-op).
+        const ratio = Math.abs(sum) / Math.abs(annual.value);
+        if (process.env.DEBUG_FILING_EXTRACT) console.error('DEBUG detectScaleMultiplier', concept, fyEndYear, 'scale', scale, 'candidates', JSON.stringify(candidates), 'sum', sum, 'annual.value', annual.value, 'ratio', ratio);
         // 2-3 real quarters of a real fiscal year should land roughly in
         // [30%, 105%] of that year's total (generous bounds for
         // seasonality and the possibility all 4 are present) — not a
@@ -2044,6 +2157,87 @@ function reconcileInstantPoints(points, knownByEnd, accessionToDates) {
   return points.filter((p) => verified.has(p));
 }
 
+// Check B (below) sums every same-fiscal-year candidate and compares
+// against the real annual total -- correct when candidates are genuinely
+// adjacent, non-overlapping periods, wrong when they're NESTED (multiple
+// points sharing the same implicit fiscal-year start but different end
+// dates -- e.g. a hybrid filer whose Q1 is a real standalone 3-month
+// figure but whose Q2/Q3 are disclosed as H1/9mo CUMULATIVE totals, each
+// one containing the shorter ones before it). Verified live: TNK's real
+// capex shape is exactly this -- Q1 [Jan 1, Mar 31], H1 [Jan 1, Jun 30],
+// 9mo [Jan 1, Sep 30], all sharing the same Jan 1 start -- summing them
+// naively (as Check B used to) double/triple-counts Q1 and never matches
+// the real annual total, correctly failing to verify even though every
+// individual figure is genuinely real. Check A can't help either: it's
+// built for a point with BOTH a 3-month figure AND a same-row longer
+// cumulative column in the SAME document -- this shape only ever shows
+// the cumulative column alone, no adjacent 3-month column to check
+// against in the same row.
+//
+// Derives the real non-overlapping standalone sub-periods via subtraction
+// -- same principle as dedupeAndClassify's own H1-Q1/9mo-H1 decumulation
+// in generateForeignFilingsCache.js, applied one layer earlier so Check B
+// can evaluate a correct, summable candidate set. Deliberately NOT
+// switching to a magnitude/ratio plausibility check instead (e.g. "a
+// 9-month figure should be roughly 60-90% of the annual total") -- that
+// would be a real precision regression from the "exact arithmetic match,
+// never estimate" principle every other check here already holds to.
+//
+// Returns a REPLACEMENT (non-overlapping) candidate set for summing --
+// for a nested family, only the shortest original point (e.g. Q1) plus
+// synthetic deltas between each subsequent pair (H1-Q1, 9mo-H1) are kept,
+// never the longer originals themselves (those would still overlap the
+// derived deltas). A point with a unique start (not part of any nested
+// family -- the common, already-correct case) passes through unchanged.
+// The synthetic deltas exist ONLY to make Check B's sum-vs-annual-total
+// arithmetic come out right -- they are NEVER what gets marked verified
+// or returned (see the call site below): once Check B confirms the real
+// underlying points (Q1, H1, 9mo) are mutually consistent with the real
+// annual total, those REAL points flow back to the caller exactly as
+// disclosed, and dedupeAndClassify's own already-proven decumulation logic
+// independently re-derives the same standalone quarters downstream --
+// this function's job is only to let Check B correctly SEE that the real
+// points are trustworthy, not to duplicate the decumulation itself.
+function decumulateNestedCandidates(points) {
+  // Groups by APPROXIMATE start (within isAdjacentDate's own tolerance),
+  // not exact string equality -- verified live this matters: subtractMonths'
+  // calendar-month arithmetic doesn't land on the exact same synthetic
+  // date for different durations from the same real fiscal-year start
+  // (e.g. TNK's Q1 2023, ending Mar 31, synthesizes a start of
+  // "2022-12-31", while its 9mo 2023, ending Sep 30, synthesizes
+  // "2022-12-30" -- one calendar day apart, same underlying fiscal year).
+  // An exact-match grouping never recognized these as the same nested
+  // family at all, silently making this whole function a no-op for the
+  // motivating case. Small (O(n^2)) clustering is fine given at most a
+  // handful of candidates per fiscal year.
+  const groups = [];
+  for (const p of points) {
+    const group = groups.find((g) => isAdjacentDate(g[0].start, p.start));
+    if (group) group.push(p);
+    else groups.push([p]);
+  }
+  const result = [];
+  for (const group of groups) {
+    if (group.length === 1) {
+      result.push(group[0]);
+      continue;
+    }
+    const sorted = [...group].sort((a, b) => new Date(a.end) - new Date(b.end));
+    result.push(sorted[0]); // shortest kept as-is (e.g. the real standalone Q1)
+    for (let i = 1; i < sorted.length; i++) {
+      const shorter = sorted[i - 1];
+      const longer = sorted[i];
+      result.push({
+        start: shorter.end,
+        end: longer.end,
+        val: longer.val - shorter.val,
+        derivedFrom: [shorter, longer],
+      });
+    }
+  }
+  return result;
+}
+
 function reconcilePoints(points, annualByEnd) {
   const verified = new Set();
 
@@ -2123,11 +2317,35 @@ function reconcilePoints(points, annualByEnd) {
       // Q2/Q3/Q4's much-later starts) fixes this while still requiring
       // every candidate to fall within the fiscal year.
       const startToleranceMs = 5 * 24 * 60 * 60 * 1000;
-      const candidates = (byYear.get(fyEndYear) || []).filter((p) => p.end <= annual.end && new Date(p.start).getTime() >= new Date(annual.start).getTime() - startToleranceMs);
+      const rawCandidates = (byYear.get(fyEndYear) || []).filter((p) => p.end <= annual.end && new Date(p.start).getTime() >= new Date(annual.start).getTime() - startToleranceMs);
+      // Decumulate nested/overlapping periods (see decumulateNestedCandidates'
+      // own comment) before summing -- a no-op for the common case where
+      // every candidate already has a unique start.
+      const candidates = decumulateNestedCandidates(rawCandidates);
       if (candidates.length < 2) continue; // too little to meaningfully reconcile
       const sum = candidates.reduce((s, p) => s + p.val, 0);
-      const diff = Math.abs(sum - annual.value) / Math.abs(annual.value);
-      if (diff <= RECONCILE_TOLERANCE) candidates.forEach((c) => verified.add(c));
+      // Magnitude-only comparison -- same real sign-convention mismatch as
+      // detectScaleMultiplier's own ratio above: capex's text-extracted sum
+      // stays in its disclosed outflow (negative) convention here, while
+      // annualByEnd's real XBRL anchor is already positive. A raw signed
+      // diff (sum - annual.value) effectively DOUBLES the true magnitude
+      // gap for capex specifically, permanently failing this check
+      // regardless of how correct the extraction is. Safe for same-signed
+      // concepts too (their existing relationship is unchanged by abs()).
+      const diff = Math.abs(Math.abs(sum) - Math.abs(annual.value)) / Math.abs(annual.value);
+      if (process.env.DEBUG_FILING_EXTRACT) console.error('DEBUG CheckB', fyEndYear, 'rawCandidates', JSON.stringify(rawCandidates), 'candidates', JSON.stringify(candidates), 'sum', sum, 'annual.value', annual.value, 'diff', diff);
+      if (diff <= RECONCILE_TOLERANCE) {
+        // A synthetic candidate (derivedFrom set) only exists to make the
+        // sum arithmetic come out right -- it's never itself part of
+        // `points`, so marking IT verified would do nothing (the final
+        // `points.filter((p) => verified.has(p))` below couldn't find it).
+        // Mark its REAL underlying originals verified instead; a plain
+        // (non-derived) candidate is already a real point from `points`.
+        for (const c of candidates) {
+          if (c.derivedFrom) c.derivedFrom.forEach((src) => verified.add(src));
+          else verified.add(c);
+        }
+      }
     }
   }
 

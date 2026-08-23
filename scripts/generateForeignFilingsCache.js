@@ -382,20 +382,30 @@ function dedupeAndClassify(rawFacts) {
   annual = dedupeByEnd(annual);
 
   const hasEnd = (end) => quarterly.some((q) => q.end === end);
-  const q1ByStart = new Map(quarterly.map((q) => [q.start, q]));
-  const h1ByStart = new Map(h1.map((h) => [h.start, h]));
-  const q3ByStart = new Map(q3ytd.map((q) => [q.start, q]));
+  // Approximate (not exact-string) start match -- verified live this
+  // matters: IMPP's real standalone Q1 2024 fact (from a text-extracted
+  // 6-K) carries start=2023-12-31, while its real H1 2024 fact (a
+  // DIFFERENT filing) carries start=2023-12-30 -- both synthesized via
+  // subtractMonths from their own real end dates, landing one calendar day
+  // apart purely from month-length arithmetic, despite representing the
+  // exact same real fiscal-year start. An exact `Map.get(start)` lookup
+  // never found the match, so H1-Q1 (and the same-shaped 9mo-H1/FY-9mo
+  // derivations) silently never fired for IMPP at all -- not because the
+  // data didn't exist, but because this lookup was too strict to find it.
+  // Linear scan is fine -- these arrays hold at most a handful of points
+  // per ticker.
+  const findByApproxStart = (points, targetStart) => points.find((p) => Math.abs(daysBetween(p.start, targetStart)) <= 5);
 
   for (const h of h1) {
-    const q1 = q1ByStart.get(h.start);
+    const q1 = findByApproxStart(quarterly, h.start);
     if (q1 && !hasEnd(h.end)) quarterly.push({ start: q1.end, end: h.end, value: h.value - q1.value });
   }
   for (const q3 of q3ytd) {
-    const half = h1ByStart.get(q3.start);
+    const half = findByApproxStart(h1, q3.start);
     if (half && !hasEnd(q3.end)) quarterly.push({ start: half.end, end: q3.end, value: q3.value - half.value });
   }
   for (const fy of annual) {
-    const q3 = q3ByStart.get(fy.start);
+    const q3 = findByApproxStart(q3ytd, fy.start);
     if (q3 && !hasEnd(fy.end)) quarterly.push({ start: q3.end, end: fy.end, value: fy.value - q3.value });
   }
 
