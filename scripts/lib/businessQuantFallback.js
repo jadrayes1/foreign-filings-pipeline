@@ -30,7 +30,7 @@
 // (a wrong-concept quarter's sum won't reconcile to the real annual total),
 // not a guarantee every ticker is coverable this way.
 
-const { subtractThreeMonths, reconcilePoints } = require('./extractFilingTextFacts');
+const { subtractThreeMonths, reconcilePoints, isAdjacentDate } = require('./extractFilingTextFacts');
 
 const BQ_BASE = 'https://data.businessquant.com/statements';
 const FETCH_TIMEOUT_MS = 30000;
@@ -55,6 +55,10 @@ const CONCEPT_MAP = {
   netIncome: { statement: 'IS', section: 'Consolidated Net Income (Quarter)' },
   ocf: { statement: 'CF', section: 'Cash from Operations (Quarter)' },
   capex: { statement: 'CF', section: 'Capital Expenditures (Quarter)' },
+  // "basic" not diluted -- matches this whole pipeline's own established
+  // preference for the shares concept elsewhere (resolveConceptCandidates
+  // in extractFilingTextFacts.js).
+  shares: { statement: 'IS', section: 'Shares Outstanding (Quarter)', nonAdditive: true },
 };
 
 function sleep(ms) {
@@ -92,13 +96,52 @@ function extractSectionPoints(json, sectionName) {
   return [];
 }
 
+// Verification for NON-ADDITIVE concepts (shares outstanding), where Check
+// B's sum-vs-annual reconciliation doesn't apply -- 4 quarterly share
+// counts don't sum to anything meaningful, unlike revenue/ocf/capex.
+// Instead: verify BusinessQuant's OWN value at every date where a real,
+// independently-known ground-truth value already exists (from the filer's
+// own real filings, at whatever cadence they actually disclose -- verified
+// live for IMPP: BusinessQuant's own quarterly points at the filer's real
+// H1/FY dates match its filed weighted-average-shares figures to the exact
+// share, both basic and diluted, across every year checked). If every
+// checkable point agrees, BusinessQuant's methodology is trusted for the
+// WHOLE series -- including the interior quarters a filer like IMPP never
+// discloses on its own, which have no ground truth to check against by
+// definition. A single disagreement at any checkable point rejects the
+// entire series for that ticker, rather than cherry-picking which points
+// to trust. Requires at least one checkable point -- a ticker with zero
+// real ground truth for this concept has nothing to establish trust from.
+const GROUND_TRUTH_TOLERANCE = 0.01;
+
+function verifyByGroundTruthMatch(points, groundTruthByEnd) {
+  if (!groundTruthByEnd || !groundTruthByEnd.size) return [];
+  const truths = [...groundTruthByEnd.values()];
+  let checkedCount = 0;
+  for (const p of points) {
+    const match = truths.find((g) => isAdjacentDate(g.end, p.end));
+    if (!match) continue;
+    checkedCount++;
+    const diff = Math.abs(p.val - match.value) / Math.abs(match.value);
+    if (diff > GROUND_TRUTH_TOLERANCE) return []; // one disagreement -- distrust the whole series
+  }
+  if (!checkedCount) return [];
+  return points;
+}
+
 /**
  * Fetches standalone-quarter facts for `neededConcepts` from BusinessQuant,
  * for a ticker whose own SEC XBRL and 6-K filing-text extraction both left
  * that concept's quarterly series empty. `annualByEnd` maps ISO end-date ->
- * real annual XBRL value per concept (same shape the 6-K fallback already
- * uses) - the required verification anchor; a concept with no real annual
- * data is never attempted.
+ * a real ground-truth value per concept (same shape the 6-K fallback
+ * already uses) - the required verification anchor; a concept with no real
+ * ground-truth data is never attempted. For additive concepts (revenue/
+ * netIncome/ocf/capex) this should be real ANNUAL XBRL facts only (Check
+ * B's sum target). For "shares" (see CONCEPT_MAP's nonAdditive flag and
+ * verifyByGroundTruthMatch above), the caller should pass EVERY real
+ * disclosed value it has for this concept regardless of duration (annual
+ * AND any real H1/cumulative facts) -- more real anchors means a stronger
+ * trust basis, not a sum target.
  *
  * Returns { [concept]: Array<{start, end, val, filed}> }, same shape as
  * extractFactSeries/extractQuarterlyFactsFromFilings, ready to merge into
@@ -141,7 +184,9 @@ async function fetchBusinessQuantFacts(ticker, neededConcepts, annualByEnd, apiK
       });
     if (!points.length) continue;
 
-    const verified = reconcilePoints(points, annualByEnd[concept]);
+    const verified = CONCEPT_MAP[concept].nonAdditive
+      ? verifyByGroundTruthMatch(points, annualByEnd[concept])
+      : reconcilePoints(points, annualByEnd[concept]);
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }

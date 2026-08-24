@@ -35,6 +35,7 @@ const path = require('path');
 // only runs when THIS file is the entry point, not when it's required).
 const { isGenuineForeignFiler, needsFilingTextBackfill, needsAnnual20FBackfill } = require('./generateForeignFilingsCache');
 const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F } = require('./lib/extractFilingTextFacts');
+const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
@@ -549,6 +550,38 @@ async function main() {
             if (annual20FFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...(sharesFilingTextFacts.shares || []), ...annual20FFacts.shares]);
           } catch (err) {
             console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+
+        // Last-resort BusinessQuant fallback for shares specifically --
+        // added for IMPP, which only ever discloses shares at H1/FY
+        // cadence (never a standalone quarter anywhere, so the two
+        // fallbacks above have nothing to decumulate against). Verified
+        // live: BusinessQuant's own quarterly shares-outstanding series
+        // matches IMPP's real filed weighted-average-shares to the exact
+        // share at every date IMPP itself discloses (both H1 and FY,
+        // basic and diluted) -- see verifyByGroundTruthMatch's own comment
+        // in businessQuantFallback.js for why this needs a different
+        // verification than the sum-to-annual Check B used for the other
+        // concepts (a share count isn't additive across quarters). Ground
+        // truth here is EVERY real disclosed value regardless of duration
+        // (not just shares.annual, which drops IMPP's real H1 facts --
+        // dedupeAndClassify only classifies genuine ~90-day or ~365-day
+        // spans), most-recently-filed wins per end-date, same tiebreak
+        // dedupeAndClassify itself already uses elsewhere.
+        if (needsFilingTextBackfill(shares.quarterly, shares.annual) && process.env.ENABLE_BUSINESSQUANT_FALLBACK && process.env.BUSINESSQUANT_API_KEY) {
+          try {
+            const groundTruth = new Map();
+            for (const f of sharesRaw) {
+              const existing = groundTruth.get(f.end);
+              if (!existing || new Date(f.filed) > new Date(existing.filed)) {
+                groundTruth.set(f.end, { end: f.end, value: f.val, filed: f.filed });
+              }
+            }
+            const bqFacts = await fetchBusinessQuantFacts(symbol, ['shares'], { shares: groundTruth }, process.env.BUSINESSQUANT_API_KEY);
+            if (bqFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...bqFacts.shares]);
+          } catch (err) {
+            console.log(`  BusinessQuant shares fallback failed for ${symbol}: ${err.message}`);
           }
         }
 

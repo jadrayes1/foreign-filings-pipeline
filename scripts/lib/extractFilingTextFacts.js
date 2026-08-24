@@ -2373,4 +2373,5 @@ module.exports = {
   extractAnnualFactsFrom20F,
   resolveConceptCandidates,
   throttleSecRequest,
+  isAdjacentDate,
 };
