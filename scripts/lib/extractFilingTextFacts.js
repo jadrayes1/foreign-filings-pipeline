@@ -786,20 +786,73 @@ function parseDataRow(cells, columnCount) {
 // anywhere in the table exactly as before.
 const SECTION_RESTRICTED_CONCEPTS = { capex: 'investing' };
 
-// Concepts for which a cumulative-only (H1/9mo) column is an acceptable
-// substitute for a missing 3-month one -- see the usingCumulativeOnly
-// fallback below. Deliberately NOT extended to income-statement concepts
-// (revenue/netIncome/ebit/pretaxIncome) -- verified live this caused a
-// real regression for IMPP, whose XBRL already carries real H1-duration
-// facts for these concepts that dedupeAndClassify already knows how to
-// handle correctly on its own. A redundant, differently-shaped text-
-// extracted duplicate of that SAME H1 period won a "most recently filed"
-// tiebreak over the XBRL original and broke whatever made the existing
-// XBRL-native handling work, even though the duplicate's own value was
-// identical. Cash-flow concepts (ocf/capex) had no equivalent XBRL
-// coverage at all for the motivating case (ASC) -- there's nothing for a
-// redundant text duplicate to conflict with there.
+// DEFAULT concepts for which a cumulative-only (H1/9mo) column is an
+// acceptable substitute for a missing 3-month one -- see the
+// usingCumulativeOnly fallback below. Used only when a caller doesn't pass
+// its own per-ticker Set (see extractQuarterlyFactsFromFilings's
+// `cumulativeFallbackConcepts` parameter) -- kept narrow to ocf/capex here
+// as a safe fallback for any caller that hasn't been updated to compute a
+// real per-ticker Set.
+//
+// The real, general rule (why this can't just be a bigger static allow-
+// list) -- verified live for IMPP: its XBRL already carries real
+// H1-duration facts for revenue/netIncome/ebit/pretaxIncome that
+// dedupeAndClassify already knows how to handle correctly on its own. A
+// redundant, differently-shaped text-extracted duplicate of that SAME H1
+// period won a "most recently filed" tiebreak over the XBRL original and
+// broke whatever made the existing XBRL-native handling work, even though
+// the duplicate's own value was identical. ocf/capex were safe to blanket-
+// allow only because the motivating case (ASC) had no equivalent XBRL
+// coverage at all -- nothing for a duplicate to conflict with. Extending
+// that same reasoning to revenue/netIncome/etc. for OTHER tickers (e.g.
+// GSL, a Marine-industry filer whose XBRL is 100% annual-only, zero
+// quarterly/H1 coverage of any kind) requires knowing, per ticker per
+// concept, whether real non-annual XBRL already exists -- exactly what
+// callers now compute and pass via `cumulativeFallbackConcepts`.
 const CUMULATIVE_FALLBACK_CONCEPTS = new Set(['ocf', 'capex']);
+
+// Only recent XBRL facts count as a real conflict risk -- verified live:
+// ASC's capex XBRL has real non-annual (quarterly/H1/9mo) facts from
+// 2015-2019 (an old tagging convention it no longer uses), which would
+// otherwise permanently mark capex "unsafe" for ASC even though today's
+// text-extraction only ever scans MAX_FILINGS_TO_SCAN's most recent
+// filings and could never produce a period old enough to duplicate those.
+// 3 years comfortably covers that scan window (filers file 2-4 6-Ks/year)
+// without reaching back into unrelated old tagging eras.
+const CUMULATIVE_FALLBACK_RECENCY_YEARS = 3;
+
+// Computes the real, per-ticker `cumulativeFallbackConcepts` Set --
+// concepts safe to trust a cumulative-only (H1/9mo) text-extracted column
+// for, because THIS ticker's own raw XBRL has zero RECENT non-annual
+// (quarterly/H1/9mo) facts for that concept to conflict with.
+// `rawFactsByConcept` is `{ [concept]: Array<{start, end}> }` -- the SAME
+// raw fact arrays (extractFactSeries's output, before dedupeAndClassify)
+// every caller already has in scope; pass an entry (even an empty array)
+// for every concept being requested, since a concept missing from this
+// object is never added to the returned Set (never marked safe).
+function computeCumulativeFallbackConcepts(rawFactsByConcept) {
+  const cutoff = new Date();
+  cutoff.setFullYear(cutoff.getFullYear() - CUMULATIVE_FALLBACK_RECENCY_YEARS);
+  const safe = new Set();
+  for (const [concept, facts] of Object.entries(rawFactsByConcept || {})) {
+    const hasRecentNonAnnual = (facts || []).some((f) => {
+      if (!f.start || !f.end) return false;
+      if (new Date(f.end) < cutoff) return false;
+      const days = (new Date(f.end) - new Date(f.start)) / (1000 * 60 * 60 * 24);
+      // Only the exact duration ranges dedupeAndClassify itself buckets as
+      // quarterly/h1/q3ytd -- verified live: ASC has a real, recently-
+      // filed but 30-day-long capex fact (a stub period, not a genuine
+      // quarter/H1/9mo), which doesn't fall in ANY of dedupeAndClassify's
+      // recognized ranges and so can never actually be published or
+      // collide with a text-extracted duplicate -- a blanket "< 365 days"
+      // check flagged it as a conflict risk anyway, incorrectly blocking
+      // ASC's real, currently-working capex extraction.
+      return (days >= 80 && days <= 100) || (days >= 170 && days <= 200) || (days >= 260 && days <= 300);
+    });
+    if (!hasRecentNonAnnual) safe.add(concept);
+  }
+  return safe;
+}
 
 // Resolves a list of candidate rows that all matched the same concept down
 // to either a single winning candidate or (for capex/debt, which can
@@ -890,7 +943,7 @@ function resolveConceptCandidates(list, concept, valueKey) {
   return null;
 }
 
-function extractFromTable($, table, targetEndYear, aliasMap) {
+function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS) {
   const parsed = parseTableColumns($, table);
   if (!parsed) return null;
   const { columns, dataStartRowIdx } = parsed;
@@ -899,7 +952,7 @@ function extractFromTable($, table, targetEndYear, aliasMap) {
   // Same fiscal year's cumulative (6mo/9mo) column, if this table has one —
   // normally just used for the within-filing reconciliation check below.
   const cumulativeIdx = columns.findIndex((c) => c.months > 3 && c.year === targetEndYear);
-  const eligibleForCumulativeFallback = Object.keys(aliasMap).every((c) => CUMULATIVE_FALLBACK_CONCEPTS.has(c));
+  const eligibleForCumulativeFallback = Object.keys(aliasMap).every((c) => cumulativeFallbackConcepts.has(c));
   // Fallback for a filer whose statement only ever discloses a cumulative
   // (H1/9mo) column, never a standalone 3-month one -- verified live:
   // Ardmore Shipping (ASC)'s cash flow statement shows only "Six Months
@@ -1259,7 +1312,7 @@ function findStatementTables($, allEls, headingIdx) {
 // Locates a statement's heading + immediately-following <table> in a big
 // combined document (press release or formal financial-statements exhibit
 // — STNG/IAG/CNQ/AEM style), then delegates to extractFromTable.
-function extractStatement($, headingRegex, targetEndYear, aliasMap) {
+function extractStatement($, headingRegex, targetEndYear, aliasMap, cumulativeFallbackConcepts) {
   const allEls = $('body *').toArray();
   const headingIdxs = [];
   for (let i = 0; i < allEls.length; i++) {
@@ -1291,7 +1344,7 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap) {
   let merged = null;
   for (const headingIdx of headingIdxs) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
-      const result = extractFromTable($, table, targetEndYear, aliasMap);
+      const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts);
       if (!result) continue;
       if (!merged) merged = result;
       else merged = { period: merged.period, facts: { ...result.facts, ...merged.facts } };
@@ -1347,11 +1400,11 @@ function extractInstantStatement($, headingRegex, aliasMap) {
 // tiny/formatting), so this picks the first one that's substantial enough
 // to plausibly be the real statement (more than a few rows) rather than
 // just grabbing the literal first <table>.
-function extractFromRFile($, targetEndYear, aliasMap) {
+function extractFromRFile($, targetEndYear, aliasMap, cumulativeFallbackConcepts) {
   const tables = $('table').toArray();
   for (const table of tables) {
     if ($(table).find('tr').length < 5) continue;
-    const result = extractFromTable($, table, targetEndYear, aliasMap);
+    const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts);
     if (result) return result;
   }
   return null;
@@ -1453,7 +1506,7 @@ async function fetchFilingSummaryReports(cik, accessionNumber, userAgent) {
  * extractFactSeries, ready to merge into the caller's raw fact arrays
  * before dedupeAndClassify runs.
  */
-async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd, userAgent) {
+async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd, userAgent, cumulativeFallbackConcepts) {
   const submissions = await fetchJsonSec(`${SEC_SUBMISSIONS_BASE}/CIK${cik}.json`, userAgent);
   if (!submissions?.filings?.recent) return {};
 
@@ -1589,7 +1642,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           for (const year of candidateYears) {
             let extracted;
             try {
-              extracted = extractFromRFile($, year, aliases);
+              extracted = extractFromRFile($, year, aliases, cumulativeFallbackConcepts);
             } catch (e) {
               if (debug) console.error('DEBUG extractFromRFile threw', rUrl, year, e.message);
               continue;
@@ -1647,7 +1700,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         for (const year of candidateYears) {
           let extracted;
           try {
-            extracted = extractStatement($, heading, year, filtered);
+            extracted = extractStatement($, heading, year, filtered, cumulativeFallbackConcepts);
           } catch (e) {
             if (debug) console.error('DEBUG extractStatement threw', url, year, e.message);
             continue;
@@ -2374,4 +2427,5 @@ module.exports = {
   resolveConceptCandidates,
   throttleSecRequest,
   isAdjacentDate,
+  computeCumulativeFallbackConcepts,
 };

@@ -49,7 +49,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, throttleSecRequest } = require('./lib/extractFilingTextFacts');
+const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, throttleSecRequest, computeCumulativeFallbackConcepts } = require('./lib/extractFilingTextFacts');
 const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilingsCache.json');
@@ -1153,8 +1153,20 @@ async function processTicker(symbol, cik, isBank) {
           debt: new Map(debtInstant.map((e) => [e.end, e])),
           cash: new Map(cashInstant.map((e) => [e.end, e])),
         };
+        // Per-ticker, per-concept -- see computeCumulativeFallbackConcepts'
+        // own comment for why this can't be a static list. pretaxIncome
+        // reuses ebitRaw's own non-annual-duration check, same reasoning
+        // as annualByEnd above reusing ebit.annual as its anchor.
+        const cumulativeFallbackConcepts = computeCumulativeFallbackConcepts({
+          revenue: revenueRaw,
+          netIncome: netIncomeRaw,
+          ebit: ebitRaw,
+          pretaxIncome: ebitRaw,
+          ocf: ocfRaw,
+          capex: capexRaw,
+        });
         try {
-          filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT);
+          filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
         } catch (err) {
           console.warn(`  filing-text fallback failed for ${symbol}: ${err.message}`);
         }

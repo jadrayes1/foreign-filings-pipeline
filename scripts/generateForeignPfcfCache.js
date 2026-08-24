@@ -34,7 +34,7 @@ const path = require('path');
 // side effects (its own `if (require.main === module)` guard means main()
 // only runs when THIS file is the entry point, not when it's required).
 const { isGenuineForeignFiler, needsFilingTextBackfill, needsAnnual20FBackfill } = require('./generateForeignFilingsCache');
-const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F } = require('./lib/extractFilingTextFacts');
+const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, computeCumulativeFallbackConcepts } = require('./lib/extractFilingTextFacts');
 const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
@@ -438,6 +438,11 @@ async function main() {
         let capex = dedupeAndClassify(capexRaw);
         let shares = dedupeAndClassify(sharesRaw);
 
+        // Per-ticker, per-concept -- see computeCumulativeFallbackConcepts'
+        // own comment in extractFilingTextFacts.js for why this can't be a
+        // static list.
+        const cumulativeFallbackConcepts = computeCumulativeFallbackConcepts({ ocf: ocfRaw, capex: capexRaw, shares: sharesRaw });
+
         // Capex is the concept that's actually gapped for this universe --
         // verified live: ASC has zero capex XBRL facts under ANY of
         // CAPEX_CONCEPTS (its "Purchase of vessels" line isn't tagged with
@@ -459,7 +464,7 @@ async function main() {
         if (needsFilingTextBackfill(capex.quarterly, capex.annual)) {
           try {
             const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
-            capexFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
+            capexFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['capex'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
             // XBRL's capex concept is a positive magnitude but the
             // press-release table reports it parenthesized/negative (a
             // cash outflow) -- negated here to match XBRL's sign
@@ -519,7 +524,7 @@ async function main() {
         if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) {
           try {
             const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
-            ocfFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['ocf'], annualByEnd, SEC_USER_AGENT);
+            ocfFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['ocf'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
             if (ocfFilingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...ocfFilingTextFacts.ocf]);
           } catch (err) {
             console.log(`  ocf filing-text fallback failed for ${symbol}: ${err.message}`);
@@ -528,7 +533,7 @@ async function main() {
         if (needsFilingTextBackfill(shares.quarterly, shares.annual)) {
           try {
             const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
-            sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT);
+            sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
             if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...sharesFilingTextFacts.shares]);
           } catch (err) {
             console.log(`  shares filing-text fallback failed for ${symbol}: ${err.message}`);
