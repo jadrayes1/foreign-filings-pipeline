@@ -299,7 +299,16 @@ const LABEL_ALIASES = {
     // capex-summing tiebreak in resolveConceptCandidates already combines
     // every matching line in the same section, so no further change is
     // needed beyond recognizing these two additional real phrasings.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock/i,
+    // "propert(y|ies) additions" (noun-first order) added -- verified live:
+    // Canadian National Railway (CNI) labels its real investing-section
+    // capex line "Property additions", a SIXTH distinct real-world phrasing
+    // -- the reverse word order of the existing "additions to property"
+    // alternative, same reversed-order gap already seen for TNK's "vessel
+    // acquisitions" vs. "acquisition of vessels". CNI's netIncome/ebit/
+    // revenue/ocf text-extraction all already worked and reached Q2'26;
+    // capex alone returned zero candidates, which is why only fcfMargin/
+    // P-FCF (not profitMargin/revenueGrowth) were stuck.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock/i,
     exclude: /proceeds|disposal|\bsale of\b/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
