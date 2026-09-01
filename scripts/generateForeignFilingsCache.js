@@ -543,15 +543,24 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
   });
 }
 
-// A margin or growth rate beyond +/-1000% is essentially always a near-zero-
-// denominator artifact (verified live: Denison Mines/DNN's FY'23 profit
-// margin computes to +4870%, Cardiol/CRDL's FY'21 to -40,170% — both tiny/
-// early-stage companies where a normal-sized net loss or FCF figure divided
-// by a near-zero revenue produces a mathematically "correct" but meaningless
-// number), not a real, useful signal — same reasoning as the sanity guards
-// already applied to the DCF fair-value estimate elsewhere in this project.
-// Dropped (null) rather than published, same as any other uncomputable point.
-const MAX_ABS_RATIO = 10; // 1000%
+// Raised from 10 (1000%) to 1000 (100,000%) after a real, verified case in
+// the domestic pipeline (ASST/Strive's 2025 Bitcoin-treasury restructuring:
+// net income losses jumped ~100x in magnitude while revenue stayed at a
+// tiny pre-merger scale, producing a genuine, real ~-13,250% ratio,
+// verified independently against SEC's own primary XBRL data — not a
+// data-quality issue). The two examples that originally motivated this
+// clamp (Denison Mines/DNN's FY'23 +4870%, Cardiol/CRDL's FY'21 -40,170%)
+// are STILL both tiny/early-stage companies with a near-zero-denominator
+// shape, and both now correctly show their real number at the new bound
+// too, rather than being hidden as a "gap." The clamp's PURPOSE (catching
+// a genuine extraction bug, e.g. a filer-side scale error) is preserved at
+// this new, much wider bound — a real 1000x scale/decimal bug would still
+// land in the millions of percent, still caught. Dropped (null) rather
+// than published only beyond this new bound, same as any other
+// uncomputable point. Same bound now used in generateSectorMetrics.js and
+// src/utils/metrics.js in the main stock-analyzer/stock-metrics-pipeline
+// repos — keep in sync.
+const MAX_ABS_RATIO = 1000; // 100,000%
 function clampImplausible(value) {
   return value != null && Math.abs(value) <= MAX_ABS_RATIO ? value : null;
 }
