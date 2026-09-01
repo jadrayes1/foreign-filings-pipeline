@@ -770,7 +770,16 @@ function parseDataRow(cells, columnCount) {
   let values = valueCandidates;
   if (values.length === columnCount + 1) {
     const [first, ...rest] = values;
-    const looksLikeFootnoteRef = /^\d{1,3}$/.test(first.raw.trim());
+    // A single footnote ref ("2") or a comma-separated list of them ("2, 8")
+    // -- verified live: NTR's "Sales" row reads `Sales | 2, 8 | 6,046 |
+    // 5,100` (two note numbers in one cell), which parseNumericCell's own
+    // comma-stripping turns into the spurious number 28, silently
+    // discarding the whole row as malformed since 3 values no longer
+    // matched columnCount (2). The mandatory `\s+` before each continuation
+    // is what keeps this from also matching a real thousands-grouped value
+    // like "6,046" (no space after its comma) -- a real number here must
+    // never be misread as a footnote list.
+    const looksLikeFootnoteRef = /^\d{1,3}(,\s+\d{1,3})*$/.test(first.raw.trim());
     const restHaveDecimalOrComma = rest.some((v) => /[.,]/.test(v.raw));
     if (looksLikeFootnoteRef && restHaveDecimalOrComma) values = rest;
   }

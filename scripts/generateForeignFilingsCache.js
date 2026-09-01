@@ -137,6 +137,7 @@ const REVENUE_CONCEPTS = [
   'Revenues',
   'RevenueFromContractWithCustomerExcludingAssessedTax',
   'RevenueFromContractWithCustomerIncludingAssessedTax',
+  'RevenueFromContractsWithCustomers',
   'SalesRevenueNet',
   'RevenuesNetOfInterestExpense',
 ];
