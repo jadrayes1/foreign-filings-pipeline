@@ -31,7 +31,12 @@ name: Generate foreign P/FCF cache
 on:
   schedule:
     - cron: '0 17 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Optional: process only this ticker (debugging), ignoring the normal gap list/rotation'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -54,6 +59,7 @@ jobs:
       - name: Generate foreign P/FCF cache
         env:
           TWELVEDATA_FOREIGN_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_FOREIGN_PIPELINE_API_KEY }}
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: node scripts/generateForeignPfcfCache.js
 
       - name: Publish to gist

@@ -393,9 +393,19 @@ async function main() {
   // and since nothing here persisted per-ticker progress, tickers landing
   // later in iteration order (e.g. DHT) never got reached at all, no
   // matter how many times the workflow ran on schedule.
-  const priority = withCik
+  let priority = withCik
     .map((entry) => ({ ...entry, attemptedAt: cache[entry.symbol]?.fetchedAt ? new Date(cache[entry.symbol].fetchedAt).getTime() : 0 }))
     .sort((a, b) => a.attemptedAt - b.attemptedAt);
+
+  // Manual single-symbol override, same TARGET_SYMBOL pattern used
+  // throughout this repo's sibling scripts -- bypasses the gap
+  // list/rotation entirely for fast, isolated debugging of one ticker.
+  if (process.env.TARGET_SYMBOL) {
+    const target = process.env.TARGET_SYMBOL.trim().toUpperCase();
+    const cik = tickerToCik.get(target);
+    priority = cik ? [{ symbol: target, cik }] : [];
+    console.log(`TARGET_SYMBOL set — processing only ${target} (cik ${cik || 'NOT FOUND'}), ignoring the normal gap list/rotation.`);
+  }
 
   const startTime = Date.now();
   let processed = 0;
