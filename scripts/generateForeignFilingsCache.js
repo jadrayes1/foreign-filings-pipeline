@@ -1454,6 +1454,15 @@ async function main() {
     console.log(`${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK.`);
   }
 
+  // Manual single/multi-symbol override, same TARGET_SYMBOL pattern used
+  // throughout this repo's sibling scripts -- bypasses the normal gap
+  // list/rotation for fast, isolated debugging of specific tickers.
+  if (process.env.TARGET_SYMBOL) {
+    const targets = new Set(process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
+    withCik = withCik.filter((c) => targets.has(c.symbol.toUpperCase()));
+    console.log(`TARGET_SYMBOL set — processing only ${withCik.map((c) => c.symbol).join(', ') || '(none found in universe)'}, ignoring the normal gap list/rotation.`);
+  }
+
   const trends = { ...previouslyPublished };
   let processed = 0;
   let resolved = 0;

@@ -53,7 +53,12 @@ name: Generate foreign filings cache
 on:
   schedule:
     - cron: '0 14 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Optional: process only this ticker (or comma-separated list), ignoring the normal gap list/rotation'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -88,6 +93,7 @@ jobs:
       - name: Generate foreign filings cache
         env:
           ENABLE_FILING_TEXT_FALLBACK: '1'
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: node scripts/generateForeignFilingsCache.js
 
       - name: Publish to gist
