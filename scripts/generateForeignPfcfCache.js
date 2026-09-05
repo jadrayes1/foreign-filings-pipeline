@@ -319,7 +319,20 @@ function buildForeignPfcfQuarterly(ocfQuarterly, capexQuarterly, sharesQuarterly
 function buildForeignPfcfYearly(ocfAnnual, capexAnnual, sharesAnnual, monthlyPrices) {
   const capexByEnd = new Map(capexAnnual.map((c) => [c.end, c.value]));
   const sharesByEnd = new Map(sharesAnnual.map((s) => [s.end, s.value]));
-  return ocfAnnual
+  // dedupeAndClassify deliberately CAN return multiple entries for the same
+  // end-date (the same real annual figure independently disclosed in two
+  // different filings, kept for cross-filing corroboration elsewhere in
+  // this pipeline) -- every other call site that turns *Annual into a
+  // per-period lookup already collapses this via a Map (see capexByEnd/
+  // sharesByEnd just above, and the `annualByEnd` Maps built throughout
+  // this file). This function was the one place still iterating ocfAnnual
+  // directly, so two real facts for the same year produced two duplicate-
+  // labeled output points. Verified live: QGEN, once its extraction
+  // improved enough to have multiple corroborated annual OCF facts,
+  // started publishing "FY '23"/"FY '24"/"FY '25" twice each.
+  const ocfByEnd = new Map(ocfAnnual.map((o) => [o.end, o.value]));
+  return [...ocfByEnd.entries()]
+    .map(([end, value]) => ({ end, value }))
     .filter((o) => capexByEnd.has(o.end) && sharesByEnd.get(o.end) > 0)
     .map((o) => {
       const fcfPerShare = (o.value - capexByEnd.get(o.end)) / sharesByEnd.get(o.end);
