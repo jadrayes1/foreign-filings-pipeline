@@ -165,7 +165,12 @@ const LABEL_ALIASES = {
     exclude: /cost of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on/i,
   },
   netIncome: {
-    include: /net (income|earnings|loss)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b/i,
+    // "net profit" added -- verified live: Copa Holdings (CPA) labels its
+    // bottom line "Net Profit/(Loss)" (and plain "Net profit" elsewhere in
+    // the same document), never "net income" -- a distinct real caption
+    // from the existing "profit (loss)"/"profit for the period" patterns,
+    // which require "profit" to come FIRST.
+    include: /net (income|earnings|loss|profit)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b/i,
     exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b/i,
   },
   // ROIC's numerator (mirrors EBIT_CONCEPTS in generateForeignFilingsCache.js
@@ -541,14 +546,20 @@ const PERIOD_PHRASE_INDICATOR = /months?( periods?)? ended|quarters?( periods?)?
 function parsePeriodPhrase(text) {
   // "months?" (not just plural "months") on every count -- verified live:
   // IMPP's real phrase is "Three Month Periods..." (singular "Month"), not
-  // "Three Months...".
-  const months = /nine months?|9 months?/i.test(text)
+  // "Three Months...". "[\s-]" (not just a literal space) between the
+  // number word and "month(s)" -- verified live: BRP (DOO)'s real header
+  // reads "Three-month periods ended"/"Six-month periods ended"/"Nine-month
+  // periods ended" (hyphenated compound adjective), which a literal-space
+  // "three months?" never matched, silently leaving periodPhrases null for
+  // the rest of this table's own parsing forever (every row after the
+  // header returns null too, not just this one).
+  const months = /nine[\s-]months?|9[\s-]months?/i.test(text)
     ? 9
-    : /six months?|6 months?/i.test(text)
+    : /six[\s-]months?|6[\s-]months?/i.test(text)
       ? 6
-      : /three months?|3 months?|quarters? ended/i.test(text)
+      : /three[\s-]months?|3[\s-]months?|quarters?[\s-]ended/i.test(text)
         ? 3
-        : /twelve months?|12 months?|years? ended/i.test(text)
+        : /twelve[\s-]months?|12[\s-]months?|years?[\s-]ended/i.test(text)
           ? 12
           : null;
   if (!months) return null;
