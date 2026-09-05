@@ -687,6 +687,31 @@ function parseTableColumns($, table) {
       }
     }
 
+    // An EIGHTH header shape, verified live: Copa Holdings (CPA) labels its
+    // earnings-release comparison columns in compact "NQYY" quarter
+    // notation -- "1Q26" | "1Q25" | "Change" | "4Q25" | "Change" -- a
+    // year-over-year AND sequential-quarter comparison side by side in one
+    // row, with "Change" (a % column, never a real value column) sitting
+    // between real quarters. "Change" simply doesn't match this regex, so
+    // it's already correctly excluded from the real column list without
+    // any special-casing -- see parseDataRow's own %-column stripping for
+    // how the VALUES on each row (which similarly interleave 3 real dollar
+    // figures with 2 percent-change figures) get pared back down to just
+    // the 3 matching these real columns.
+    if (!periodPhrases) {
+      const compactQuarterCells = cells
+        .map((c) => {
+          const m = c.text.trim().match(/^([1-4])Q(\d{2})$/);
+          if (!m) return null;
+          const endMonthDay = ['March 31', 'June 30', 'September 30', 'December 31'][Number(m[1]) - 1];
+          return { months: 3, endMonthDay, year: `20${m[2]}` };
+        })
+        .filter(Boolean);
+      if (compactQuarterCells.length >= 1) {
+        return { columns: compactQuarterCells, dataStartRowIdx: i + 1 };
+      }
+    }
+
     // A SEVENTH header shape, verified live: CMBT states each column as an
     // explicit date RANGE rather than a "months ended" phrase at all -
     // "Jan. 1 - Mar. 31, 2026" / "Jan. 1 - Mar. 31, 2025" - fully self-
@@ -774,6 +799,19 @@ function parseDataRow(cells, columnCount) {
   const valueCandidates = [];
   for (; i < cells.length; i++) {
     if (cells[i].text === '$') continue;
+    // A "%"/"%)" marker cell immediately following a value means that
+    // value was itself a percent-change figure (a year-over-year or
+    // sequential-quarter "Change" column, e.g. Copa Holdings/CPA's real
+    // earnings-release rows: "1,004,173 | 859,025 | 16.9 | % | 913,623 |
+    // 9.9 | %" -- three real dollar values interleaved with two % changes).
+    // Discard the value it's attached to and move on, rather than either
+    // bailing outright (parseNumericCell("%") is null, which used to hit
+    // the "malformed" return below before this row's real values were ever
+    // reached) or keeping a percent as if it were a real dollar figure.
+    if (/^%\)?$/.test(cells[i].text.trim())) {
+      valueCandidates.pop();
+      continue;
+    }
     const val = parseNumericCell(cells[i].text);
     if (val === null) return null; // non-numeric cell after values started — malformed, bail
     valueCandidates.push({ raw: cells[i].text, val });
