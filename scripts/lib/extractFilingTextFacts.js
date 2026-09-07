@@ -169,8 +169,14 @@ const LABEL_ALIASES = {
     // bottom line "Net Profit/(Loss)" (and plain "Net profit" elsewhere in
     // the same document), never "net income" -- a distinct real caption
     // from the existing "profit (loss)"/"profit for the period" patterns,
-    // which require "profit" to come FIRST.
-    include: /net (income|earnings|loss|profit)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b/i,
+    // which require "profit" to come FIRST. "income for the period/year"
+    // added -- verified live: Corporacion America Airports (CAAP) labels
+    // its bottom line "Income for the period" (never "net income" or any
+    // "profit..." phrasing) -- the existing "\bbefore\b" exclude already
+    // keeps this from also matching "Income before income tax"/"Income
+    // before financial results and income tax", both real lines earlier
+    // in the same statement.
+    include: /net (income|earnings|loss|profit)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b|\bincome for the (period|year)\b/i,
     exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b/i,
   },
   // ROIC's numerator (mirrors EBIT_CONCEPTS in generateForeignFilingsCache.js
@@ -2420,6 +2426,12 @@ function reconcilePoints(points, annualByEnd) {
   }
 
   // Check B — full fiscal year vs. real annual XBRL value.
+  // Points derived below (currently just the single-missing-quarter case
+  // right after this comment) aren't part of the original `points` array,
+  // so `points.filter((p) => verified.has(p))` at the end of this function
+  // could never return them even if added to `verified` -- collected here
+  // and appended to the final return explicitly instead.
+  const derivedPointsToPublish = [];
   if (annualByEnd.size) {
     const byYear = new Map();
     for (const p of points) {
@@ -2447,6 +2459,37 @@ function reconcilePoints(points, annualByEnd) {
       // own comment) before summing -- a no-op for the common case where
       // every candidate already has a unique start.
       const candidates = decumulateNestedCandidates(rawCandidates);
+      // Derive a single missing quarter (in practice almost always Q4)
+      // via pure subtraction against the real annual total, when the
+      // OTHER three quarters of this fiscal year are already known and
+      // mutually adjacent with no internal gap. Verified live this is a
+      // real, common shape (not hypothetical): CAAP's 6-K earnings
+      // releases never disclose a discrete Q4/full-year-minus-9-months
+      // exhibit for ANY concept, in ANY fiscal year -- Q4 results are only
+      // ever folded into the annual 20-F, so Check B would otherwise
+      // permanently fail (short by exactly one quarter, every single
+      // year) despite Q1-Q3 all being individually real and correct. Only
+      // fires for EXACTLY 3 known candidates -- deriving from 2 or fewer
+      // would be underdetermined (more than one unknown quarter, only one
+      // equation available), so this deliberately doesn't try to guess
+      // which of two gaps is which.
+      if (candidates.length === 3) {
+        const sorted = [...candidates].sort((a, b) => new Date(a.start) - new Date(b.start));
+        const contiguous = isAdjacentDate(sorted[0].end, sorted[1].start) && isAdjacentDate(sorted[1].end, sorted[2].start);
+        const startsAtFyBegin = new Date(sorted[0].start).getTime() >= new Date(annual.start).getTime() - startToleranceMs;
+        const endsBeforeFyEnd = sorted[2].end < annual.end;
+        if (contiguous && startsAtFyBegin && endsBeforeFyEnd) {
+          const knownSum = sorted.reduce((s, p) => s + p.val, 0);
+          const derivedLastQuarter = {
+            start: sorted[2].end,
+            end: annual.end,
+            val: annual.value - knownSum,
+            filed: sorted.reduce((latest, p) => (p.filed > latest ? p.filed : latest), sorted[0].filed),
+          };
+          candidates.push(derivedLastQuarter);
+          derivedPointsToPublish.push(derivedLastQuarter);
+        }
+      }
       if (candidates.length < 2) continue; // too little to meaningfully reconcile
       const sum = candidates.reduce((s, p) => s + p.val, 0);
       // Magnitude-only comparison -- same real sign-convention mismatch as
@@ -2474,7 +2517,7 @@ function reconcilePoints(points, annualByEnd) {
     }
   }
 
-  return points.filter((p) => verified.has(p));
+  return [...points.filter((p) => verified.has(p)), ...derivedPointsToPublish];
 }
 
 module.exports = {
