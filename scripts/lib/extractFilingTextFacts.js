@@ -97,7 +97,21 @@ const RECONCILE_TOLERANCE = 0.02; // 2%
 // US-GAAP-style "Statement of Operations/Income/Earnings" phrasings below.
 // Neither company's income statement was found at all without this.
 const STATEMENT_HEADINGS = {
-  income: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
+  // "STATEMENTS OF OPERATING RESULTS" added -- verified live: Brookfield
+  // Business Corporation (BBUC) titles its real primary income statement
+  // "Unaudited Interim Condensed Consolidated Statements of Operating
+  // Results", never "...of Income"/"...of Operations"/etc. Without this,
+  // the coarse hasIncome flag (checked against the WHOLE page's text, not
+  // per-heading) came back true anyway -- from BBUC's SEPARATE, real
+  // "Consolidated Statements of Comprehensive Income" heading elsewhere in
+  // the same document -- while extractStatement's own heading search (one
+  // regex test per heading ELEMENT) found nothing to extract from at all,
+  // since neither this table's real title nor that unrelated one's
+  // narrower comprehensive-income content actually carries a usable
+  // revenue/net-income line the same way. Genuinely misleading: hasIncome
+  // looked satisfied while the real statement was never even located.
+  income:
+    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF OPERATING RESULTS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
