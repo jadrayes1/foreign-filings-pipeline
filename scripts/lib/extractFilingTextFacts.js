@@ -1929,7 +1929,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   for (const [concept, points] of pointsByConcept) {
     const verified = INSTANT_CONCEPTS.has(concept)
       ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept))
-      : reconcilePoints(points, annualByEnd?.[concept] || new Map());
+      : reconcilePoints(points, annualByEnd?.[concept] || new Map(), concept);
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
@@ -2140,7 +2140,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
     if (debug) console.error('DEBUG 20-F points before reconcile', concept, JSON.stringify(points.map((p) => ({ end: p.end, val: p.val, corroborations: p.corroborations, sectionVerified: p.sectionVerified }))));
     const verified = INSTANT_CONCEPTS.has(concept)
       ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept))
-      : reconcilePoints(points, annualByEnd?.[concept] || new Map());
+      : reconcilePoints(points, annualByEnd?.[concept] || new Map(), concept);
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
@@ -2227,6 +2227,22 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
 }
 
 const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
+
+// "shares" is a SNAPSHOT (a point-in-time count, effectively an average or
+// period-end balance), not a flow -- unlike revenue/netIncome/ocf/capex, it
+// is never meaningful to SUM four quarters' share counts and compare that
+// sum to an annual figure, and it is nonsensical to derive a "missing
+// quarter's" share count as annual-minus-three-known-quarters (there is no
+// such thing as an annual share count that decomposes into four additive
+// quarterly components). Verified live: this exact confusion corrupted DHT
+// -- Check B's derivation (added for genuinely additive concepts) computed
+// wildly wrong "shares" values for every Q4 (e.g. large negative numbers)
+// by subtracting three real quarterly share counts from an annual figure
+// that was never meant to be their sum. reconcilePoints below skips Check
+// B's summing/derivation entirely for concepts in this set -- Check A/C/D
+// still apply (Check C's cross-filing corroboration in particular is
+// exactly the right verification method for a snapshot value).
+const NON_ADDITIVE_CONCEPTS = new Set(['shares']);
 
 // Instant-fact counterpart to reconcilePoints below. Deliberately NOT the
 // same function with a branch inside it: reconcilePoints' Check A/B are
@@ -2403,7 +2419,7 @@ function decumulateNestedCandidates(points) {
   return result;
 }
 
-function reconcilePoints(points, annualByEnd) {
+function reconcilePoints(points, annualByEnd, concept) {
   const verified = new Set();
 
   // Check D — same-document section-subtotal self-check (20-F annual
@@ -2466,7 +2482,7 @@ function reconcilePoints(points, annualByEnd) {
   // could never return them even if added to `verified` -- collected here
   // and appended to the final return explicitly instead.
   const derivedPointsToPublish = [];
-  if (annualByEnd.size) {
+  if (annualByEnd.size && !NON_ADDITIVE_CONCEPTS.has(concept)) {
     const byYear = new Map();
     for (const p of points) {
       const year = p.end.slice(0, 4);
