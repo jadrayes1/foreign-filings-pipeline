@@ -648,10 +648,24 @@ async function main() {
         // alongside capex (which DOES have a real, large-scale 20-F
         // anchor for STNG), the same real "$ in thousands" table this OCF
         // figure comes from gets correctly identified and scaled.
-        const neededQuarterlyConcepts = [];
-        if (needsFilingTextBackfill(capex.quarterly, capex.annual)) neededQuarterlyConcepts.push('capex');
-        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) neededQuarterlyConcepts.push('ocf');
-        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) neededQuarterlyConcepts.push('shares');
+        const trulyNeededQuarterlyConcepts = [];
+        if (needsFilingTextBackfill(capex.quarterly, capex.annual)) trulyNeededQuarterlyConcepts.push('capex');
+        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) trulyNeededQuarterlyConcepts.push('ocf');
+        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) trulyNeededQuarterlyConcepts.push('shares');
+        // Once the call is worth making at all, request ALL THREE
+        // concepts together, not just whichever genuinely still needs new
+        // data -- verified live this matters even after combining the
+        // calls above: STNG's capex.quarterly already has real native XBRL
+        // (so capex alone never triggered needsFilingTextBackfill, never
+        // making it into the combined call), leaving OCF's scale-detection
+        // just as anchor-less as when it was requested completely alone.
+        // A concept that doesn't strictly need new text-extracted data
+        // still benefits scale-detection by being IN this same call -- its
+        // own real annual anchor only gets scored against extracted
+        // candidates when this scan actually goes looking for that concept
+        // too. Extra parsing cost only for tickers already reached by this
+        // script's own rotation, not a full-universe cost.
+        const neededQuarterlyConcepts = trulyNeededQuarterlyConcepts.length ? ['capex', 'ocf', 'shares'] : [];
 
         let capexFilingTextFacts = {};
         let ocfFilingTextFacts = {};
