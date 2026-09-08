@@ -422,14 +422,15 @@ async function main() {
     .map((entry) => ({ ...entry, attemptedAt: cache[entry.symbol]?.fetchedAt ? new Date(cache[entry.symbol].fetchedAt).getTime() : 0 }))
     .sort((a, b) => a.attemptedAt - b.attemptedAt);
 
-  // Manual single-symbol override, same TARGET_SYMBOL pattern used
+  // Manual single/multi-symbol override, same TARGET_SYMBOL pattern used
   // throughout this repo's sibling scripts -- bypasses the gap
-  // list/rotation entirely for fast, isolated debugging of one ticker.
+  // list/rotation entirely for fast, isolated debugging of specific
+  // tickers (comma-separated, matching generateForeignFilingsCache.js's
+  // own multi-symbol support).
   if (process.env.TARGET_SYMBOL) {
-    const target = process.env.TARGET_SYMBOL.trim().toUpperCase();
-    const cik = tickerToCik.get(target);
-    priority = cik ? [{ symbol: target, cik }] : [];
-    console.log(`TARGET_SYMBOL set — processing only ${target} (cik ${cik || 'NOT FOUND'}), ignoring the normal gap list/rotation.`);
+    const targets = process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+    priority = targets.map((target) => ({ symbol: target, cik: tickerToCik.get(target) })).filter((c) => c.cik);
+    console.log(`TARGET_SYMBOL set — processing only ${priority.map((c) => c.symbol).join(', ') || '(none found in universe)'}, ignoring the normal gap list/rotation.`);
   }
 
   const startTime = Date.now();
