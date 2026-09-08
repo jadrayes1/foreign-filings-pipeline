@@ -417,16 +417,51 @@ function buildForeignPfcfYearly(ocfAnnual, capexAnnual, sharesAnnual, monthlyPri
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-// A fresh attempt can come back empty or narrower on a day where SEC or
-// Twelve Data has a transient hiccup for this specific filer — mirrors
-// pickTrendToPublish/pickCadenceTrendsToPublish in
-// generatePfcfTrendCache.js and generateForeignFilingsCache.js.
+// Turns a published label ("Q1 '24", "FY '24") into a comparable ordinal
+// for sorting a merged trend back into chronological order. Quarterly
+// ordinals are year*4+quarter; annual labels get year*4 (never actually
+// compared against quarterly ones -- ttm/quarterly and yearly are always
+// separate arrays -- but a consistent scale costs nothing).
+function parseLabelToOrdinal(label) {
+  const q = /^Q(\d) '(\d\d)$/.exec(label || '');
+  if (q) return (2000 + Number(q[2])) * 4 + Number(q[1]);
+  const fy = /^FY '(\d\d)$/.exec(label || '');
+  if (fy) return (2000 + Number(fy[1])) * 4;
+  return null;
+}
+
+// A fresh attempt can come back empty, narrower, or (as verified live for
+// DHT this session) subtly WRONG on a day where extraction/reconciliation
+// hits an edge case -- a previous version of this function replaced the
+// ENTIRE existing array the moment fresh contained even one label the
+// existing one didn't, on the theory that fresh is normally a superset.
+// Verified live that assumption doesn't always hold: a single genuinely
+// new label (e.g. one more recent quarter finally reconciling) could ride
+// along with several OTHER, independently-wrong values from the same bug,
+// silently overwriting real previously-published quarters with wrong ones
+// even though the guarantee was meant to be "never regress to narrower."
+// This is a real UNION instead: every existing point is kept forever
+// (never dropped, never overwritten by a fresh value for the same label),
+// and fresh only ever contributes labels that aren't already published.
+// Merged result re-sorted chronologically (a genuinely new label can be
+// OLDER than some already-published ones -- this session's own gap-
+// backfill fixes routinely recovered previously-missing OLDER quarters,
+// not just more recent ones) and re-capped at the same rolling-window
+// size the builders themselves use, so the window still ages out its
+// oldest quarter as newer ones arrive rather than growing without bound.
 function pickTrendToPublish(existingPoints, freshPoints) {
-  if (!freshPoints || freshPoints.length === 0) return existingPoints || [];
-  if (!existingPoints || existingPoints.length === 0) return freshPoints;
-  const existingLabels = new Set(existingPoints.map((p) => p.label));
-  const hasNewQuarter = freshPoints.some((p) => !existingLabels.has(p.label));
-  return hasNewQuarter ? freshPoints : existingPoints;
+  if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
+  if (!freshPoints || freshPoints.length === 0) return existingPoints;
+  const merged = new Map();
+  for (const p of existingPoints) merged.set(p.label, p);
+  for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
+  return [...merged.values()]
+    .sort((a, b) => {
+      const oa = parseLabelToOrdinal(a.label);
+      const ob = parseLabelToOrdinal(b.label);
+      return oa != null && ob != null ? oa - ob : 0;
+    })
+    .slice(-QUARTERS_OF_HISTORY);
 }
 
 function pickCadenceTrendsToPublish(existingEntry, fresh) {
