@@ -1,1 +1,7 @@
 node_modules/
+
+# Local script output -- the real published data lives in the gist, not
+# the repo. Accidentally committed once via a stray `git add -A`; ignored
+# from here on so a local test/debug run never gets swept into a commit.
+/foreignFilingsCache.json
+/foreignPfcfCache.json
