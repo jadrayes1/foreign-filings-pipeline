@@ -630,42 +630,60 @@ async function main() {
         // requested it. No sign flip needed for either (OCF's and shares'
         // text-extracted sign conventions already match XBRL's directly,
         // unlike capex's parenthesized-outflow convention).
-        let ocfFilingTextFacts = {};
-        let sharesFilingTextFacts = {};
-        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) {
-          try {
-            const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
-            ocfFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['ocf'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
-            if (ocfFilingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...ocfFilingTextFacts.ocf]);
-          } catch (err) {
-            console.log(`  ocf filing-text fallback failed for ${symbol}: ${err.message}`);
-          }
-        }
-        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) {
-          try {
-            const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
-            sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
-            if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...sharesFilingTextFacts.shares], 'shares');
-          } catch (err) {
-            console.log(`  shares filing-text fallback failed for ${symbol}: ${err.message}`);
-          }
-        }
+        //
+        // 20-F recovery deliberately runs BEFORE each concept's 6-K
+        // quarterly pass, same reordering (and for the same reason) as
+        // capex above -- verified live this bit STNG too, not just DHT:
+        // OCF's 6-K pass was anchoring its own scale-detection on a stale/
+        // absent annual figure, silently publishing OCF three orders of
+        // magnitude too small (and, joined against a correctly-scaled real
+        // share count, a P/FCF ratio in the thousands instead of single
+        // digits).
+        let annual20FOcfFacts = [];
         if (needsAnnual20FBackfill(ocf.annual)) {
           try {
             const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
             const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['ocf'], annualByEnd, SEC_USER_AGENT);
-            if (annual20FFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...(ocfFilingTextFacts.ocf || []), ...annual20FFacts.ocf]);
+            if (annual20FFacts.ocf?.length) {
+              annual20FOcfFacts = annual20FFacts.ocf;
+              ocf = dedupeAndClassify([...ocfRaw, ...annual20FOcfFacts]);
+            }
           } catch (err) {
             console.log(`  20-F ocf fallback failed for ${symbol}: ${err.message}`);
           }
         }
+        let ocfFilingTextFacts = {};
+        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) {
+          try {
+            const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
+            ocfFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['ocf'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
+            if (ocfFilingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...annual20FOcfFacts, ...ocfFilingTextFacts.ocf]);
+          } catch (err) {
+            console.log(`  ocf filing-text fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+
+        let annual20FSharesFacts = [];
         if (needsAnnual20FBackfill(shares.annual)) {
           try {
             const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
             const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['shares'], annualByEnd, SEC_USER_AGENT);
-            if (annual20FFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...(sharesFilingTextFacts.shares || []), ...annual20FFacts.shares], 'shares');
+            if (annual20FFacts.shares?.length) {
+              annual20FSharesFacts = annual20FFacts.shares;
+              shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts], 'shares');
+            }
           } catch (err) {
             console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+        let sharesFilingTextFacts = {};
+        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) {
+          try {
+            const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
+            sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
+            if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts, ...sharesFilingTextFacts.shares], 'shares');
+          } catch (err) {
+            console.log(`  shares filing-text fallback failed for ${symbol}: ${err.message}`);
           }
         }
 
