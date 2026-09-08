@@ -600,45 +600,10 @@ async function main() {
           }
         }
 
-        let capexFilingTextFacts = {};
-        if (needsFilingTextBackfill(capex.quarterly, capex.annual)) {
-          try {
-            const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
-            capexFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['capex'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
-            // XBRL's capex concept is a positive magnitude but the
-            // press-release table reports it parenthesized/negative (a
-            // cash outflow) -- negated here to match XBRL's sign
-            // convention, same as generateForeignFilingsCache.js's own
-            // identical merge. Also re-includes annual20FCapexFacts here --
-            // dedupeAndClassify rebuilds quarterly/annual from scratch each
-            // call, so omitting it would silently drop the 20-F recovery
-            // just applied above.
-            if (capexFilingTextFacts.capex?.length) {
-              capex = dedupeAndClassify([...capexRaw, ...annual20FCapexFacts, ...capexFilingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
-            }
-          } catch (err) {
-            console.log(`  capex filing-text fallback failed for ${symbol}: ${err.message}`);
-          }
-        }
-
-        // ocf/shares fallback -- same 6-K + 20-F pattern as capex above,
-        // added for STNG specifically: it has zero raw XBRL for ocf/capex/
+        // 20-F recovery for ocf/shares -- same pattern as capex above.
+        // Added for STNG specifically: it has zero raw XBRL for ocf/capex/
         // shares quarterly, so capex's fallback alone still leaves the
-        // ocf/shares side of the join empty. OCF's text-extraction already
-        // exists and works (proven via generateForeignFilingsCache.js's
-        // own fcfMargin success for STNG) -- this script just never
-        // requested it. No sign flip needed for either (OCF's and shares'
-        // text-extracted sign conventions already match XBRL's directly,
-        // unlike capex's parenthesized-outflow convention).
-        //
-        // 20-F recovery deliberately runs BEFORE each concept's 6-K
-        // quarterly pass, same reordering (and for the same reason) as
-        // capex above -- verified live this bit STNG too, not just DHT:
-        // OCF's 6-K pass was anchoring its own scale-detection on a stale/
-        // absent annual figure, silently publishing OCF three orders of
-        // magnitude too small (and, joined against a correctly-scaled real
-        // share count, a P/FCF ratio in the thousands instead of single
-        // digits).
+        // ocf/shares side of the join empty.
         let annual20FOcfFacts = [];
         if (needsAnnual20FBackfill(ocf.annual)) {
           try {
@@ -652,17 +617,6 @@ async function main() {
             console.log(`  20-F ocf fallback failed for ${symbol}: ${err.message}`);
           }
         }
-        let ocfFilingTextFacts = {};
-        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) {
-          try {
-            const annualByEnd = { ocf: new Map(ocf.annual.map((a) => [a.end, a])) };
-            ocfFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['ocf'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
-            if (ocfFilingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...annual20FOcfFacts, ...ocfFilingTextFacts.ocf]);
-          } catch (err) {
-            console.log(`  ocf filing-text fallback failed for ${symbol}: ${err.message}`);
-          }
-        }
-
         let annual20FSharesFacts = [];
         if (needsAnnual20FBackfill(shares.annual)) {
           try {
@@ -676,14 +630,60 @@ async function main() {
             console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
           }
         }
+
+        // 6-K quarterly text-extraction for whichever of capex/ocf/shares
+        // still needs it, requested TOGETHER in one call rather than three
+        // separate ones -- verified live this matters, not just a tidiness
+        // preference: extractQuarterlyFactsFromFilings's scale-detection
+        // (detectScaleMultiplier) is scored per CALL, across every concept
+        // passed to it together, specifically so a concept with a reliable
+        // annual anchor (usually capex here, via the 20-F recovery above)
+        // can "carry along" a correct scale for a concept that has none of
+        // its own to verify against. STNG has zero real annual OCF data
+        // anywhere (native XBRL or 20-F) -- requested alone, OCF's own
+        // scale-detection had nothing to score at all and silently
+        // defaulted to no correction, publishing OCF three orders of
+        // magnitude too small (and a P/FCF ratio in the thousands once
+        // joined against a correctly-scaled share count). Requested
+        // alongside capex (which DOES have a real, large-scale 20-F
+        // anchor for STNG), the same real "$ in thousands" table this OCF
+        // figure comes from gets correctly identified and scaled.
+        const neededQuarterlyConcepts = [];
+        if (needsFilingTextBackfill(capex.quarterly, capex.annual)) neededQuarterlyConcepts.push('capex');
+        if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) neededQuarterlyConcepts.push('ocf');
+        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) neededQuarterlyConcepts.push('shares');
+
+        let capexFilingTextFacts = {};
+        let ocfFilingTextFacts = {};
         let sharesFilingTextFacts = {};
-        if (needsFilingTextBackfill(shares.quarterly, shares.annual)) {
+        if (neededQuarterlyConcepts.length) {
           try {
-            const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
-            sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
-            if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts, ...sharesFilingTextFacts.shares], 'shares');
+            const annualByEnd = {
+              capex: new Map(capex.annual.map((a) => [a.end, a])),
+              ocf: new Map(ocf.annual.map((a) => [a.end, a])),
+              shares: new Map(shares.annual.map((a) => [a.end, a])),
+            };
+            const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, neededQuarterlyConcepts, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
+            capexFilingTextFacts = { capex: filingTextFacts.capex };
+            ocfFilingTextFacts = { ocf: filingTextFacts.ocf };
+            sharesFilingTextFacts = { shares: filingTextFacts.shares };
+            // XBRL's capex concept is a positive magnitude but the
+            // press-release table reports it parenthesized/negative (a
+            // cash outflow) -- negated here to match XBRL's sign
+            // convention, same as generateForeignFilingsCache.js's own
+            // identical merge. OCF's and shares' text-extracted sign
+            // conventions already match XBRL's directly, no flip needed.
+            if (capexFilingTextFacts.capex?.length) {
+              capex = dedupeAndClassify([...capexRaw, ...annual20FCapexFacts, ...capexFilingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+            }
+            if (ocfFilingTextFacts.ocf?.length) {
+              ocf = dedupeAndClassify([...ocfRaw, ...annual20FOcfFacts, ...ocfFilingTextFacts.ocf]);
+            }
+            if (sharesFilingTextFacts.shares?.length) {
+              shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts, ...sharesFilingTextFacts.shares], 'shares');
+            }
           } catch (err) {
-            console.log(`  shares filing-text fallback failed for ${symbol}: ${err.message}`);
+            console.log(`  filing-text fallback failed for ${symbol}: ${err.message}`);
           }
         }
 
