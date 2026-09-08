@@ -206,10 +206,10 @@ function dedupeAndClassify(rawFacts, concept) {
     }
   }
 
-  const quarterly = [];
-  const h1 = [];
-  const q3ytd = [];
-  const annual = [];
+  let quarterly = [];
+  let h1 = [];
+  let q3ytd = [];
+  let annual = [];
   for (const fact of byPeriod.values()) {
     const days = daysBetween(fact.start, fact.end);
     const point = { start: fact.start, end: fact.end, value: fact.val };
@@ -218,6 +218,28 @@ function dedupeAndClassify(rawFacts, concept) {
     else if (days >= 260 && days <= 300) q3ytd.push(point);
     else if (days >= 350 && days <= 380) annual.push(point);
   }
+
+  // A second, narrower dedup pass -- the byPeriod dedup above keys on
+  // EXACT start|end, which two independent sources can legitimately
+  // disagree on for the SAME real quarter (verified live for DHT: a raw
+  // XBRL Q3 fact and its 6-K-extracted counterpart landed one calendar day
+  // apart on `start`, surviving the exact-key dedup as two "different"
+  // points with the same value, showing the same quarter twice in
+  // published output). Deduping by END DATE ALONE would be unsafe done
+  // globally, but safe here specifically because it's applied WITHIN each
+  // already-duration-classified bucket, where every member has already
+  // passed the same 80-100/170-200/260-300/350-380-day filter -- same fix
+  // already shipped in generateForeignFilingsCache.js's own copy of this
+  // function, never carried over here.
+  const dedupeByEnd = (points) => {
+    const byEnd = new Map();
+    for (const p of points) if (!byEnd.has(p.end)) byEnd.set(p.end, p);
+    return Array.from(byEnd.values());
+  };
+  quarterly = dedupeByEnd(quarterly);
+  h1 = dedupeByEnd(h1);
+  q3ytd = dedupeByEnd(q3ytd);
+  annual = dedupeByEnd(annual);
 
   if (NON_ADDITIVE_CONCEPTS.has(concept)) {
     quarterly.sort((a, b) => new Date(a.end) - new Date(b.end));
