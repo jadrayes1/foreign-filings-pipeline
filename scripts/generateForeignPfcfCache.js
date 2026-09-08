@@ -289,6 +289,37 @@ function findClosestMonthlyPrice(monthlyPrices, targetDateStr) {
   return closest && closestDiff <= MAX_PRICE_MATCH_MS ? closest.close : null;
 }
 
+// Shares outstanding moves slowly (barely at all quarter to quarter for a
+// filer without frequent buybacks/issuances) but isn't always disclosed
+// every quarter -- verified live: DHT's native XBRL only ever tags a
+// matchable share count for Q3 of each year, even though its OCF/capex
+// (via the 6-K/20-F fallbacks) now cover all four quarters. A strict
+// exact-end-date join would silently drop Q1/Q2/Q4 P/FCF entirely despite
+// every other input being real and available. Carries forward the nearest
+// REAL disclosed share count within ~200 days (a bit under a year -- wide
+// enough to bridge one missing quarter between two real annual-cadence
+// disclosures, narrow enough that a genuinely stale count never gets used
+// for a filer this doesn't apply to). Same "reuse a real, recently-
+// disclosed value across nearby periods when the metric doesn't fluctuate
+// much" approach already used for WEYS's annual shares fallback in the
+// main pipeline's generatePfcfTrendCache.js.
+const MAX_SHARES_CARRY_FORWARD_MS = 200 * 24 * 60 * 60 * 1000;
+
+function findNearestShares(sharesQuarterly, targetEndDate) {
+  const target = new Date(targetEndDate);
+  if (!sharesQuarterly?.length || Number.isNaN(target.getTime())) return null;
+  let closest = null;
+  let closestDiff = Infinity;
+  for (const s of sharesQuarterly) {
+    const diff = Math.abs(new Date(s.end).getTime() - target.getTime());
+    if (diff < closestDiff) {
+      closestDiff = diff;
+      closest = s;
+    }
+  }
+  return closest && closestDiff <= MAX_SHARES_CARRY_FORWARD_MS ? closest.value : null;
+}
+
 // ---------------------------------------------------------------------------
 // P/FCF builders — mirror buildPfcfTrendFromFilingsAndPrices/
 // buildPfcfQuarterlyFromFilingsAndPrices/buildPfcfYearlyFromFilingsAndPrices
@@ -300,8 +331,9 @@ function buildForeignPfcfTTM(ocfQuarterly, capexQuarterly, sharesQuarterly, mont
   const capexByEnd = new Map(capexQuarterly.map((c) => [c.end, c.value]));
   const sharesByEnd = new Map(sharesQuarterly.map((s) => [s.end, s.value]));
   const standalone = ocfQuarterly
-    .filter((o) => capexByEnd.has(o.end) && sharesByEnd.get(o.end) > 0)
-    .map((o) => ({ start: o.start, end: o.end, fcf: o.value - capexByEnd.get(o.end), shares: sharesByEnd.get(o.end) }));
+    .map((o) => ({ ...o, shares: sharesByEnd.get(o.end) ?? findNearestShares(sharesQuarterly, o.end) }))
+    .filter((o) => capexByEnd.has(o.end) && o.shares > 0)
+    .map((o) => ({ start: o.start, end: o.end, fcf: o.value - capexByEnd.get(o.end), shares: o.shares }));
 
   return buildTrailingWindows(standalone, 4)
     .map(({ quarters, anchor, partial }) => {
@@ -322,9 +354,10 @@ function buildForeignPfcfQuarterly(ocfQuarterly, capexQuarterly, sharesQuarterly
   const capexByEnd = new Map(capexQuarterly.map((c) => [c.end, c.value]));
   const sharesByEnd = new Map(sharesQuarterly.map((s) => [s.end, s.value]));
   return ocfQuarterly
-    .filter((o) => capexByEnd.has(o.end) && sharesByEnd.get(o.end) > 0)
+    .map((o) => ({ ...o, shares: sharesByEnd.get(o.end) ?? findNearestShares(sharesQuarterly, o.end) }))
+    .filter((o) => capexByEnd.has(o.end) && o.shares > 0)
     .map((o) => {
-      const annualizedFcfPerShare = ((o.value - capexByEnd.get(o.end)) / sharesByEnd.get(o.end)) * 4;
+      const annualizedFcfPerShare = ((o.value - capexByEnd.get(o.end)) / o.shares) * 4;
       const price = findClosestMonthlyPrice(monthlyPrices, o.end);
       const value = price != null && annualizedFcfPerShare !== 0 ? price / annualizedFcfPerShare : null;
       return value != null ? { label: quarterLabelFromDate(o.end), value } : null;
