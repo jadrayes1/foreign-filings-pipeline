@@ -182,7 +182,19 @@ function annualLabelFromDate(dateStr) {
 // was previously silently dropped). Kept as its own copy (CommonJS, not
 // part of the app's ES module bundle) rather than requiring across the
 // two scripts.
-function dedupeAndClassify(rawFacts) {
+// "shares" is a point-in-time snapshot, not a flow -- unlike ocf/capex, it
+// is never valid to derive a "missing quarter's" share count as (a longer
+// cumulative period's value minus a shorter one), the same principle
+// already fixed in extractFilingTextFacts.js's own reconcilePoints (see
+// NON_ADDITIVE_CONCEPTS there). This script keeps its OWN separate copy of
+// this H1/9mo/FY decumulation logic (for its own capex sign-handling and
+// TARGET_SYMBOL-scoped rotation), so the same fix has to be applied here
+// too -- verified live: DHT's real Q3 share counts (a plausible ~140-167
+// million each) were correct, but every derived "Q4" came out as a huge,
+// often-negative nonsense value from subtracting mismatched period shapes.
+const NON_ADDITIVE_CONCEPTS = new Set(['shares']);
+
+function dedupeAndClassify(rawFacts, concept) {
   const byPeriod = new Map();
   for (const fact of rawFacts) {
     const value = fact.val;
@@ -205,6 +217,12 @@ function dedupeAndClassify(rawFacts) {
     else if (days >= 170 && days <= 200) h1.push(point);
     else if (days >= 260 && days <= 300) q3ytd.push(point);
     else if (days >= 350 && days <= 380) annual.push(point);
+  }
+
+  if (NON_ADDITIVE_CONCEPTS.has(concept)) {
+    quarterly.sort((a, b) => new Date(a.end) - new Date(b.end));
+    annual.sort((a, b) => new Date(a.end) - new Date(b.end));
+    return { quarterly, annual };
   }
 
   const hasEnd = (end) => quarterly.some((q) => q.end === end);
@@ -460,7 +478,7 @@ async function main() {
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
         let ocf = dedupeAndClassify(ocfRaw);
         let capex = dedupeAndClassify(capexRaw);
-        let shares = dedupeAndClassify(sharesRaw);
+        let shares = dedupeAndClassify(sharesRaw, 'shares');
 
         // Per-ticker, per-concept -- see computeCumulativeFallbackConcepts'
         // own comment in extractFilingTextFacts.js for why this can't be a
@@ -558,7 +576,7 @@ async function main() {
           try {
             const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
             sharesFilingTextFacts = await extractQuarterlyFactsFromFilings(cik, ['shares'], annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
-            if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...sharesFilingTextFacts.shares]);
+            if (sharesFilingTextFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...sharesFilingTextFacts.shares], 'shares');
           } catch (err) {
             console.log(`  shares filing-text fallback failed for ${symbol}: ${err.message}`);
           }
@@ -576,7 +594,7 @@ async function main() {
           try {
             const annualByEnd = { shares: new Map(shares.annual.map((a) => [a.end, a])) };
             const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['shares'], annualByEnd, SEC_USER_AGENT);
-            if (annual20FFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...(sharesFilingTextFacts.shares || []), ...annual20FFacts.shares]);
+            if (annual20FFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...(sharesFilingTextFacts.shares || []), ...annual20FFacts.shares], 'shares');
           } catch (err) {
             console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
           }
@@ -608,7 +626,7 @@ async function main() {
               }
             }
             const bqFacts = await fetchBusinessQuantFacts(symbol, ['shares'], { shares: groundTruth }, process.env.BUSINESSQUANT_API_KEY);
-            if (bqFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...bqFacts.shares]);
+            if (bqFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...bqFacts.shares], 'shares');
           } catch (err) {
             console.log(`  BusinessQuant shares fallback failed for ${symbol}: ${err.message}`);
           }
