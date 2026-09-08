@@ -110,8 +110,16 @@ const STATEMENT_HEADINGS = {
   // narrower comprehensive-income content actually carries a usable
   // revenue/net-income line the same way. Genuinely misleading: hasIncome
   // looked satisfied while the real statement was never even located.
+  // "STATEMENTS OF NET INCOME" added -- verified live: BRP Inc. (DOO)
+  // titles its real primary income statement "Condensed Consolidated
+  // Interim Statements of Net Income", which the "(COMPREHENSIVE )?INCOME"
+  // group doesn't cover (only "COMPREHENSIVE " is optional there, not
+  // "NET "). Same misleading-hasIncome shape as BBUC above: DOO's page
+  // also has a separate, real "...Statements of Comprehensive Income"
+  // heading that satisfied the coarse whole-page hasIncome check while
+  // the actual statement with revenue/net-income lines was never located.
   income:
-    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF OPERATING RESULTS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
+    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE |NET )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF OPERATING RESULTS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
@@ -995,6 +1003,18 @@ function resolveConceptCandidates(list, concept, valueKey) {
   if (concept === 'netIncome') {
     const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
     if (nonComprehensive.length === 1) return { winner: nonComprehensive[0] };
+  }
+  // revenue specifically: a filer can break revenue into several
+  // sub-lines that don't roll up into a "Total ..."-prefixed row -- verified
+  // live: Euroholdings (EHLD) shows "Time charter revenue" and "Voyage
+  // charter revenue" as real sub-items, then subtracts commissions down to
+  // "Net revenues" as its own real subtotal line, never labeled "Total
+  // revenues". Same shape as ocf's "net cash" preference right below --
+  // prefer whichever candidate's label starts with "net revenue(s)" when
+  // exactly one does.
+  if (concept === 'revenue') {
+    const netRevenue = distinct.filter((d) => /^net\s+revenues?\b/i.test(d.label.trim()));
+    if (netRevenue.length === 1) return { winner: netRevenue[0] };
   }
   // ocf specifically: a filer can show a pre-tax operating cash flow
   // SUBTOTAL as its own line before subtracting taxes paid down to the
