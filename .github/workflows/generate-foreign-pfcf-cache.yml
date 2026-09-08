@@ -73,6 +73,8 @@ jobs:
 
       - name: Dry-run output (debugging only)
         if: ${{ inputs.dryRun }}
+        env:
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: node -e "const d = require('./foreignPfcfCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, JSON.stringify(d[s]));"
 
       - name: Publish to gist
