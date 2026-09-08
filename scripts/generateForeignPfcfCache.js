@@ -502,6 +502,49 @@ async function main() {
         // 350-minute timeout); here it's one targeted concept, checked only
         // for tickers this loop already reached under its own rotation
         // budget.
+        // 20-F annual fallback -- fills a gap the 6-K quarterly pass below
+        // can't: a filer whose 20-F switched capex to a company-specific
+        // custom XBRL extension tag (verified live: DHT's
+        // `dht:InvestmentsInVessels`), never exposed under any standard
+        // taxonomy name in companyfacts no matter how many concept-list
+        // alternatives are added -- only parsing the 20-F document itself
+        // recovers it. Not gated behind ENABLE_20F_ANNUAL_FALLBACK the way
+        // the sibling script's daily run is -- same reasoning as the 6-K
+        // call below: one targeted concept, only for tickers this loop
+        // already reached under its own rotation budget, not a
+        // full-universe scan.
+        //
+        // Deliberately run BEFORE the 6-K quarterly pass below (this used
+        // to run after, "so a ticker the 6-K pass already fixed doesn't
+        // pay for the heavier 20-F scan" -- a real cost optimization, but
+        // verified live it caused a genuine correctness bug for DHT:
+        // extractQuarterlyFactsFromFilings's own scale-detection
+        // (detectScaleMultiplier) uses whatever annual figure is passed as
+        // its verification anchor to decide whether the 6-K table's raw
+        // "$ in thousands" values need multiplying by 1000. Anchored on
+        // capex.annual BEFORE this 20-F recovery, that anchor was DHT's
+        // stale, tiny (~$48K/year) native-XBRL figure -- coincidentally
+        // close enough in magnitude to the un-scaled thousands-figure that
+        // the detector concluded no correction was needed, silently
+        // publishing quarterly capex 1000x too small (and, joined against
+        // OCF at its correct real scale, a wildly wrong P/FCF ratio). With
+        // the real ~$50-300M/year 20-F-recovered figure available first,
+        // the SAME detector correctly identifies and applies the 1000x
+        // correction.
+        let annual20FCapexFacts = [];
+        if (needsAnnual20FBackfill(capex.annual)) {
+          try {
+            const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
+            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
+            if (annual20FFacts.capex?.length) {
+              annual20FCapexFacts = annual20FFacts.capex.map((f) => ({ ...f, val: -f.val }));
+              capex = dedupeAndClassify([...capexRaw, ...annual20FCapexFacts]);
+            }
+          } catch (err) {
+            console.log(`  20-F capex fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
+
         let capexFilingTextFacts = {};
         if (needsFilingTextBackfill(capex.quarterly, capex.annual)) {
           try {
@@ -511,44 +554,15 @@ async function main() {
             // press-release table reports it parenthesized/negative (a
             // cash outflow) -- negated here to match XBRL's sign
             // convention, same as generateForeignFilingsCache.js's own
-            // identical merge.
+            // identical merge. Also re-includes annual20FCapexFacts here --
+            // dedupeAndClassify rebuilds quarterly/annual from scratch each
+            // call, so omitting it would silently drop the 20-F recovery
+            // just applied above.
             if (capexFilingTextFacts.capex?.length) {
-              capex = dedupeAndClassify([...capexRaw, ...capexFilingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+              capex = dedupeAndClassify([...capexRaw, ...annual20FCapexFacts, ...capexFilingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
             }
           } catch (err) {
             console.log(`  capex filing-text fallback failed for ${symbol}: ${err.message}`);
-          }
-        }
-
-        // 20-F annual fallback -- fills a genuinely different gap than the
-        // 6-K one above: a filer whose 20-F switched capex to a company-
-        // specific custom XBRL extension tag (verified live: DHT's
-        // `dht:InvestmentsInVessels`), never exposed under any standard
-        // taxonomy name in companyfacts no matter how many concept-list
-        // alternatives are added -- only parsing the 20-F document itself
-        // recovers it. Re-checked on the POST-6-K-merge state so a ticker
-        // the 6-K pass already fixed doesn't pay for the heavier 20-F scan.
-        // Not gated behind ENABLE_20F_ANNUAL_FALLBACK the way the sibling
-        // script's daily run is -- same reasoning as the 6-K call above:
-        // one targeted concept, only for tickers this loop already reached
-        // under its own rotation budget, not a full-universe scan.
-        // needsAnnual20FBackfill (not needsFilingTextBackfill) -- checks
-        // whether ANNUAL itself is stale, independent of quarterly's own
-        // freshness. Verified live this distinction matters: DHT's
-        // quarterly capex is already fresh via the 6-K fallback above while
-        // annual specifically stays stuck at FY2021 -- needsFilingTextBackfill
-        // only checks quarterly staleness RELATIVE TO annual, so it never
-        // even notices annual itself needs its own fallback here. See
-        // needsAnnual20FBackfill's own comment in generateForeignFilingsCache.js.
-        if (needsAnnual20FBackfill(capex.annual)) {
-          try {
-            const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
-            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
-            if (annual20FFacts.capex?.length) {
-              capex = dedupeAndClassify([...capexRaw, ...(capexFilingTextFacts.capex || []), ...annual20FFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
-            }
-          } catch (err) {
-            console.log(`  20-F capex fallback failed for ${symbol}: ${err.message}`);
           }
         }
 
