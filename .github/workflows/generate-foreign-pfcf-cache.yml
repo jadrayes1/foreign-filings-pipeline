@@ -37,6 +37,14 @@ on:
         description: 'Optional: process only this ticker (debugging), ignoring the normal gap list/rotation'
         required: false
         type: string
+      debug:
+        description: 'Optional: set to 1 for verbose extraction/reconciliation tracing (DEBUG_FILING_EXTRACT)'
+        required: false
+        type: string
+      dryRun:
+        description: 'Optional: set to 1 to skip publishing to the gist (debugging only)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -60,9 +68,15 @@ jobs:
         env:
           TWELVEDATA_FOREIGN_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_FOREIGN_PIPELINE_API_KEY }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          DEBUG_FILING_EXTRACT: ${{ inputs.debug }}
         run: node scripts/generateForeignPfcfCache.js
 
+      - name: Dry-run output (debugging only)
+        if: ${{ inputs.dryRun }}
+        run: node -e "const d = require('./foreignPfcfCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, JSON.stringify(d[s]));"
+
       - name: Publish to gist
+        if: ${{ !inputs.dryRun }}
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
