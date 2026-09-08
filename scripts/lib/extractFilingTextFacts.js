@@ -2530,14 +2530,38 @@ function reconcilePoints(points, annualByEnd, concept) {
         const endsBeforeFyEnd = sorted[2].end < annual.end;
         if (contiguous && startsAtFyBegin && endsBeforeFyEnd) {
           const knownSum = sorted.reduce((s, p) => s + p.val, 0);
-          const derivedLastQuarter = {
-            start: sorted[2].end,
-            end: annual.end,
-            val: annual.value - knownSum,
-            filed: sorted.reduce((latest, p) => (p.filed > latest ? p.filed : latest), sorted[0].filed),
-          };
-          candidates.push(derivedLastQuarter);
-          derivedPointsToPublish.push(derivedLastQuarter);
+          // Magnitude-only arithmetic here too -- same real sign-convention
+          // mismatch Check B's own comparison below already tolerates
+          // (capex's text-extracted quarters stay in their disclosed
+          // outflow/negative convention, while annualByEnd's XBRL anchor is
+          // often a positive magnitude). A raw signed `annual.value -
+          // knownSum` silently ADDS the two instead of subtracting whenever
+          // the signs disagree -- verified live: this produced a nonsense,
+          // wrong-sign "derived Q4" for DHT (a real annual anchor that
+          // turned out to be an unrelated, differently-signed concept
+          // entirely -- see the magnitude guard below, which is what
+          // actually catches that case). Derives a MAGNITUDE, then applies
+          // the same sign the three known quarters already share (safe --
+          // they come from the same extraction pass/convention).
+          const derivedMagnitude = Math.abs(annual.value) - Math.abs(knownSum);
+          // A negative derived magnitude means the three "known" quarters
+          // already exceed the annual total on their own -- impossible for
+          // a real 4th quarter, and a strong signal this annual figure
+          // isn't actually the same concept as these quarters at all (not
+          // just a units/sign mismatch). Bail rather than fabricate a
+          // number Check B would otherwise wrongly wave through as a
+          // trivial (self-constructed) exact match.
+          if (derivedMagnitude > 0) {
+            const sign = knownSum < 0 ? -1 : 1;
+            const derivedLastQuarter = {
+              start: sorted[2].end,
+              end: annual.end,
+              val: sign * derivedMagnitude,
+              filed: sorted.reduce((latest, p) => (p.filed > latest ? p.filed : latest), sorted[0].filed),
+            };
+            candidates.push(derivedLastQuarter);
+            derivedPointsToPublish.push(derivedLastQuarter);
+          }
         }
       }
       if (candidates.length < 2) continue; // too little to meaningfully reconcile
