@@ -778,15 +778,48 @@ function buildRoicTTMTrend(ebitQuarterly, investedCapitalMap) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-// A fresh attempt can come back empty or narrower on a day where SEC has a
-// transient hiccup for this specific filer — mirrors pickTrendToPublish in
-// the main pipeline's generateSectorMetrics.js.
+// Turns a published label ("Q1 '24", "FY '24") into a comparable ordinal
+// for sorting a merged trend back into chronological order.
+function parseLabelToOrdinal(label) {
+  const q = /^Q(\d) '(\d\d)$/.exec(label || '');
+  if (q) return (2000 + Number(q[2])) * 4 + Number(q[1]);
+  const fy = /^FY '(\d\d)$/.exec(label || '');
+  if (fy) return (2000 + Number(fy[1])) * 4;
+  return null;
+}
+
+// A fresh attempt can come back empty, narrower, or subtly WRONG on a day
+// extraction/reconciliation hits an edge case for this specific filer.
+// This used to replace the ENTIRE existing array the moment fresh
+// contained even one label the existing one didn't, on the assumption
+// that fresh is normally a strict superset -- verified live (in this
+// same session, for the sibling generateForeignPfcfCache.js) that
+// assumption doesn't always hold: a single genuinely new label can ride
+// alongside several OTHER, independently wrong values for labels that
+// were already correctly published, and the old logic would swap in the
+// whole array, silently overwriting real data with wrong data despite
+// the stated "never regress to narrower" guarantee. This is a real union
+// instead: every existing point is kept forever (never dropped, never
+// overwritten by a fresh value for the same label), fresh only ever
+// contributes labels that aren't already published, and the merged
+// result is re-sorted chronologically (a genuinely new label can be
+// OLDER than some already-published ones -- gap-backfill fixes routinely
+// recover previously-missing older quarters, not just newer ones) and
+// re-capped at the same QUARTERS_OF_HISTORY rolling window the builders
+// already use.
 function pickTrendToPublish(existingPoints, freshPoints) {
-  if (!freshPoints || freshPoints.length === 0) return existingPoints || [];
-  if (!existingPoints || existingPoints.length === 0) return freshPoints;
-  const existingLabels = new Set(existingPoints.map((p) => p.label));
-  const hasNewQuarter = freshPoints.some((p) => !existingLabels.has(p.label));
-  return hasNewQuarter ? freshPoints : existingPoints;
+  if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
+  if (!freshPoints || freshPoints.length === 0) return existingPoints;
+  const merged = new Map();
+  for (const p of existingPoints) merged.set(p.label, p);
+  for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
+  return [...merged.values()]
+    .sort((a, b) => {
+      const oa = parseLabelToOrdinal(a.label);
+      const ob = parseLabelToOrdinal(b.label);
+      return oa != null && ob != null ? oa - ob : 0;
+    })
+    .slice(-QUARTERS_OF_HISTORY);
 }
 
 // Migrates a pre-cadence-caching entry (flat { revenueGrowth, profitMargin,
