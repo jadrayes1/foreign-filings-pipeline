@@ -618,6 +618,13 @@ async function main() {
         await sleep(TWELVEDATA_REQUEST_SPACING_MS);
         twelveDataCalls++;
 
+        if (process.env.DEBUG_FILING_EXTRACT) {
+          console.error('DEBUG pfcf-inputs', symbol, 'ocf.quarterly', JSON.stringify(ocf.quarterly));
+          console.error('DEBUG pfcf-inputs', symbol, 'capex.quarterly', JSON.stringify(capex.quarterly));
+          console.error('DEBUG pfcf-inputs', symbol, 'shares.quarterly', JSON.stringify(shares.quarterly));
+          console.error('DEBUG pfcf-inputs', symbol, 'monthlyPrices', JSON.stringify(monthlyPrices.slice(0, 5)), '...', monthlyPrices.length, 'total');
+        }
+
         // All three cadences reuse this SAME fetched data — no extra API
         // calls beyond the ones already made above.
         fresh = {
