@@ -78,13 +78,8 @@ async function fetchWithTimeout(url) {
 async function fetchStatement(ticker, statement, apiKey) {
   const url = `${BQ_BASE}?ticker=${encodeURIComponent(ticker)}&statement=${statement}&frequency=Quarter&period=all&api_key=${encodeURIComponent(apiKey)}`;
   const res = await fetchWithTimeout(url);
-  if (process.env.DEBUG_FILING_EXTRACT) console.error('DEBUG businessQuant', ticker, statement, 'status', res.status);
   if (!res.ok) return null;
   const json = await res.json();
-  if (process.env.DEBUG_FILING_EXTRACT) {
-    const allSections = Object.values(json?.data || {}).flatMap((cat) => Object.keys(cat.sections || {}));
-    console.error('DEBUG businessQuant', ticker, statement, 'sections', JSON.stringify(allSections));
-  }
   if (json?.error || !json?.data) return null;
   return json;
 }

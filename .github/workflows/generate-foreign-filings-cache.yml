@@ -101,7 +101,6 @@ jobs:
           ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
           BUSINESSQUANT_API_KEY: ${{ secrets.BUSINESSQUANT_API_KEY }}
           FILING_TEXT_FALLBACK_TICKERS: ${{ inputs.enableBusinessQuant && inputs.symbol || '' }}
-          DEBUG_FILING_EXTRACT: ${{ inputs.enableBusinessQuant }}
         run: node scripts/generateForeignFilingsCache.js
 
       - name: Publish to gist
