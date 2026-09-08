@@ -59,6 +59,10 @@ on:
         description: 'Optional: process only this ticker (or comma-separated list), ignoring the normal gap list/rotation'
         required: false
         type: string
+      enableBusinessQuant:
+        description: 'Optional: set to 1 to also try the BusinessQuant last-resort fallback for this run (staged manual testing only -- see the header comment above)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -94,6 +98,9 @@ jobs:
         env:
           ENABLE_FILING_TEXT_FALLBACK: '1'
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
+          BUSINESSQUANT_API_KEY: ${{ secrets.BUSINESSQUANT_API_KEY }}
+          FILING_TEXT_FALLBACK_TICKERS: ${{ inputs.enableBusinessQuant && inputs.symbol || '' }}
         run: node scripts/generateForeignFilingsCache.js
 
       - name: Publish to gist
