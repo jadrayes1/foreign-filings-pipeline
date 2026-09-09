@@ -40,6 +40,24 @@ const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
 const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignPfcfCache.json';
+// P/E rides on the SAME shared gist file the app already reads for the
+// DOMESTIC pipeline's own P/E reconstruction (stock-metrics-pipeline's
+// generatePfcfTrendCache.js) -- src/api/sectorComparison.js's
+// fetchCachedPeTrend reads `trends[symbol].pe.{cadence}` from this exact
+// file with no awareness of (or gate on) which pipeline populated a given
+// symbol's entry. Publishing foreign filers' P/E here, rather than into
+// this script's own foreignPfcfCache.json (which nothing in the app reads
+// for P/E), means zero app/client changes are needed for foreign-filer P/E
+// to show up -- the existing, already-shipped P/E UI just starts finding
+// real data for these tickers too. Deliberately NOT the same OUTPUT_FILE/
+// cache object as P/FCF above -- P/FCF for foreign filers already has its
+// own correct, working app-side fetch chain (fetchCachedForeignPfcfTrend
+// reads foreignPfcfCache.json directly), so only the `.pe` key of each
+// foreign ticker's entry in this file is ever touched; everything else
+// (domestic tickers' entries in full, and any foreign ticker's own
+// top-level ttm/quarterly/yearly P/FCF fields) is left completely alone.
+const OUTPUT_PE_FILE = path.join(__dirname, '../pfcfTrendCache.json');
+const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
 // Published weekly by discoverForeignFilers.js (see that file's header) —
 // read here so this job skips straight to its known ~374 candidates instead
 // of re-checking ifrs-full for the full ~5,067-ticker universe every run.
@@ -132,6 +150,11 @@ const CAPEX_CONCEPTS = [
   'PaymentsToAcquireOtherPropertyPlantAndEquipment',
 ];
 const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfSharesOutstandingBasic', 'WeightedAverageNumberOfDilutedSharesOutstanding'];
+// For P/E's numerator -- mirrors NET_INCOME_CONCEPTS in
+// generateForeignFilingsCache.js exactly (ProfitLoss is the ifrs-full
+// concept, NetIncomeLoss the us-gaap one, same dual-taxonomy pattern as
+// every other concept list in this file).
+const NET_INCOME_CONCEPTS = ['ProfitLoss', 'NetIncomeLoss'];
 
 // Merges facts across every matching concept rather than short-circuiting
 // on the first one -- see generateForeignFilingsCache.js's own copy of
@@ -294,6 +317,14 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
 // filer metrics use doesn't apply, matching stock-metrics-pipeline's own
 // generatePfcfTrendCache.js (which deliberately skips that clamp too).
 
+// Named for OCF (P/FCF's own numerator, where this was first found and
+// fixed) but genuinely flow-agnostic -- reused below for net income (P/E's
+// numerator), which has the exact same risk: a text-extracted income-
+// statement figure with no annual XBRL anchor is just as unverifiable in
+// scale as a cash-flow-statement one, from the SAME underlying cause
+// (detectScaleMultiplier needs an annual anchor to calibrate against,
+// regardless of which concept is being extracted).
+//
 // A text-extracted OCF figure's UNIT SCALE can't always be verified via
 // detectScaleMultiplier (extractFilingTextFacts.js) -- that requires a real
 // annual XBRL anchor to calibrate against, which some filers (verified
@@ -467,6 +498,82 @@ function buildForeignPfcfYearly(ocfAnnual, capexAnnual, sharesAnnual, monthlyPri
     .slice(-QUARTERS_OF_HISTORY);
 }
 
+// ---------------------------------------------------------------------------
+// P/E builders — mirror the P/FCF trio above exactly (buildForeignPfcfTTM/
+// Quarterly/Yearly), with net income/shares (EPS) in place of
+// (ocf-capex)/shares. Deliberately NO clamp against negative values --
+// unlike a scale-detection failure (which produces an impossible ratio the
+// isOcfScalePlausible check below catches), a real net LOSS legitimately
+// produces a negative P/E, and surfacing exactly that is the whole point:
+// the domestic pipeline's own P/E reconstruction (generatePfcfTrendCache.js)
+// was built because Finnhub's native P/E series was verified to
+// systematically omit negative-EPS periods for unprofitable companies --
+// same reasoning applies here, unchanged.
+//
+// Published into pfcfTrendCache.json (see GIST_PFCF_TREND_URL's own
+// comment), NOT this script's own foreignPfcfCache.json -- so the app's
+// existing, already-shipped fetchCachedPeTrend just starts finding real
+// data for these tickers with zero client changes.
+// ---------------------------------------------------------------------------
+
+function buildForeignPeTTM(netIncomeQuarterly, sharesQuarterly, monthlyPrices) {
+  const sharesByEnd = new Map(sharesQuarterly.map((s) => [s.end, s.value]));
+  const standalone = netIncomeQuarterly
+    .map((n) => ({ ...n, shares: sharesByEnd.get(n.end) ?? findNearestShares(sharesQuarterly, n.end) }))
+    .filter((n) => n.shares > 0)
+    .map((n) => ({ start: n.start, end: n.end, netIncome: n.value, shares: n.shares }));
+
+  return buildTrailingWindows(standalone, 4)
+    .map(({ quarters, anchor, partial }) => {
+      const price = findClosestMonthlyPrice(monthlyPrices, anchor.end);
+      if (!isOcfScalePlausible(anchor.netIncome, price, anchor.shares)) return null;
+      const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0);
+      const ttmEps = ttmNetIncome / anchor.shares;
+      const value = price != null && ttmEps !== 0 ? price / ttmEps : null;
+      return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+// Standalone (non-TTM) quarterly P/E -- annualized (x4) EPS, same
+// convention as buildForeignPfcfQuarterly above.
+function buildForeignPeQuarterly(netIncomeQuarterly, sharesQuarterly, monthlyPrices) {
+  const sharesByEnd = new Map(sharesQuarterly.map((s) => [s.end, s.value]));
+  return netIncomeQuarterly
+    .map((n) => ({ ...n, shares: sharesByEnd.get(n.end) ?? findNearestShares(sharesQuarterly, n.end) }))
+    .filter((n) => n.shares > 0)
+    .map((n) => {
+      const price = findClosestMonthlyPrice(monthlyPrices, n.end);
+      if (!isOcfScalePlausible(n.value, price, n.shares)) return null;
+      const annualizedEps = (n.value / n.shares) * 4;
+      const value = price != null && annualizedEps !== 0 ? price / annualizedEps : null;
+      return value != null ? { label: quarterLabelFromDate(n.end), value } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+// One P/E point per fiscal year, priced at that year's own period-end
+// close -- mirrors buildForeignPfcfYearly above.
+function buildForeignPeYearly(netIncomeAnnual, sharesAnnual, monthlyPrices) {
+  const sharesByEnd = new Map(sharesAnnual.map((s) => [s.end, s.value]));
+  const netIncomeByEnd = new Map(netIncomeAnnual.map((n) => [n.end, n.value]));
+  return [...netIncomeByEnd.entries()]
+    .map(([end, value]) => ({ end, value }))
+    .filter((n) => sharesByEnd.get(n.end) > 0)
+    .map((n) => {
+      const shares = sharesByEnd.get(n.end);
+      const price = findClosestMonthlyPrice(monthlyPrices, n.end);
+      if (!isOcfScalePlausible(n.value, price, shares, MIN_PLAUSIBLE_ANNUAL_OCF_FRACTION_OF_MARKET_CAP)) return null;
+      const eps = n.value / shares;
+      const value = price != null && eps !== 0 ? price / eps : null;
+      return value != null ? { label: annualLabelFromDate(n.end), value } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
 // Turns a published label ("Q1 '24", "FY '24") into a comparable ordinal
 // for sorting a merged trend back into chronological order. Quarterly
 // ordinals are year*4+quarter; annual labels get year*4 (never actually
@@ -526,14 +633,24 @@ async function main() {
   const twelveDataKey = readTwelveDataApiKey();
 
   console.log('Fetching known foreign-filer list, ticker universe + P/FCF gap list + SEC ticker->CIK map...');
-  const [foreignFilerList, metricsDataset, tickerToCik, existingCache] = await Promise.all([
+  const [foreignFilerList, metricsDataset, tickerToCik, existingCache, existingPeCache] = await Promise.all([
     fetchSecJson(GIST_FOREIGN_FILER_LIST_URL).catch(() => null),
     fetchSecJson(GIST_METRICS_URL),
     fetchTickerToCikMap(),
     fetchSecJson(GIST_FOREIGN_PFCF_URL).catch(() => null),
+    // pfcfTrendCache.json -- the DOMESTIC pipeline's own file, shared here
+    // only for the `.pe` key of foreign tickers (see GIST_PFCF_TREND_URL's
+    // own comment). Fetched fresh every run, same as the other 3 -- this
+    // repo has zero write access advantage over stock-metrics-pipeline's
+    // own runs, so this MUST be re-read at merge time, never cached
+    // locally, to never clobber whatever the domestic pipeline (or an
+    // interleaved run of this same script) published most recently for
+    // domestic tickers or for a DIFFERENT foreign ticker's `.pe` entry.
+    fetchSecJson(GIST_PFCF_TREND_URL).catch(() => null),
   ]);
 
   const cache = existingCache?.trends || {};
+  const peCache = existingPeCache?.trends || {};
 
   // The isGenuineForeignFiler check inside the loop below (before any
   // Twelve Data spend) is what actually filters out non-foreign tickers —
@@ -594,6 +711,7 @@ async function main() {
       break;
     }
     let fresh = { ttm: [], quarterly: [], yearly: [] };
+    let freshPe = { ttm: [], quarterly: [], yearly: [] };
     try {
       const companyFacts = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
       await sleep(SEC_REQUEST_SPACING_MS);
@@ -616,14 +734,18 @@ async function main() {
         const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
         const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
+        // For P/E -- same raw-XBRL-first, 20-F-recovery, 6-K-text-extraction
+        // fallback chain as capex/ocf/shares below, just for net income.
+        const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS);
         let ocf = dedupeAndClassify(ocfRaw);
         let capex = dedupeAndClassify(capexRaw);
         let shares = dedupeAndClassify(sharesRaw, 'shares');
+        let netIncome = dedupeAndClassify(netIncomeRaw);
 
         // Per-ticker, per-concept -- see computeCumulativeFallbackConcepts'
         // own comment in extractFilingTextFacts.js for why this can't be a
         // static list.
-        const cumulativeFallbackConcepts = computeCumulativeFallbackConcepts({ ocf: ocfRaw, capex: capexRaw, shares: sharesRaw });
+        const cumulativeFallbackConcepts = computeCumulativeFallbackConcepts({ ocf: ocfRaw, capex: capexRaw, shares: sharesRaw, netIncome: netIncomeRaw });
 
         // Capex is the concept that's actually gapped for this universe --
         // verified live: ASC has zero capex XBRL facts under ANY of
@@ -715,6 +837,22 @@ async function main() {
             console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
           }
         }
+        // Same 20-F recovery, for net income -- same reasoning as ocf/shares
+        // above (a filer with zero raw XBRL net income quarterly needs this
+        // to have anything to derive quarters from at all).
+        let annual20FNetIncomeFacts = [];
+        if (needsAnnual20FBackfill(netIncome.annual)) {
+          try {
+            const annualByEnd = { netIncome: new Map(netIncome.annual.map((a) => [a.end, a])) };
+            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['netIncome'], annualByEnd, SEC_USER_AGENT);
+            if (annual20FFacts.netIncome?.length) {
+              annual20FNetIncomeFacts = annual20FFacts.netIncome;
+              netIncome = dedupeAndClassify([...netIncomeRaw, ...annual20FNetIncomeFacts]);
+            }
+          } catch (err) {
+            console.log(`  20-F netIncome fallback failed for ${symbol}: ${err.message}`);
+          }
+        }
 
         // 6-K quarterly text-extraction for whichever of capex/ocf/shares
         // still needs it, requested TOGETHER in one call rather than three
@@ -737,7 +875,8 @@ async function main() {
         if (needsFilingTextBackfill(capex.quarterly, capex.annual)) trulyNeededQuarterlyConcepts.push('capex');
         if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) trulyNeededQuarterlyConcepts.push('ocf');
         if (needsFilingTextBackfill(shares.quarterly, shares.annual)) trulyNeededQuarterlyConcepts.push('shares');
-        // Once the call is worth making at all, request ALL THREE
+        if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) trulyNeededQuarterlyConcepts.push('netIncome');
+        // Once the call is worth making at all, request ALL FOUR
         // concepts together, not just whichever genuinely still needs new
         // data -- verified live this matters even after combining the
         // calls above: STNG's capex.quarterly already has real native XBRL
@@ -749,29 +888,37 @@ async function main() {
         // own real annual anchor only gets scored against extracted
         // candidates when this scan actually goes looking for that concept
         // too. Extra parsing cost only for tickers already reached by this
-        // script's own rotation, not a full-universe cost.
-        const neededQuarterlyConcepts = trulyNeededQuarterlyConcepts.length ? ['capex', 'ocf', 'shares'] : [];
+        // script's own rotation, not a full-universe cost. netIncome added
+        // alongside the original three for the same reason -- it's a
+        // distinct income-statement concept, but one more concept scored
+        // in the SAME call only strengthens (never weakens)
+        // detectScaleMultiplier's shared verdict for this filer.
+        const neededQuarterlyConcepts = trulyNeededQuarterlyConcepts.length ? ['capex', 'ocf', 'shares', 'netIncome'] : [];
 
         let capexFilingTextFacts = {};
         let ocfFilingTextFacts = {};
         let sharesFilingTextFacts = {};
+        let netIncomeFilingTextFacts = {};
         if (neededQuarterlyConcepts.length) {
           try {
             const annualByEnd = {
               capex: new Map(capex.annual.map((a) => [a.end, a])),
               ocf: new Map(ocf.annual.map((a) => [a.end, a])),
               shares: new Map(shares.annual.map((a) => [a.end, a])),
+              netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
             };
             const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, neededQuarterlyConcepts, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
             capexFilingTextFacts = { capex: filingTextFacts.capex };
             ocfFilingTextFacts = { ocf: filingTextFacts.ocf };
             sharesFilingTextFacts = { shares: filingTextFacts.shares };
+            netIncomeFilingTextFacts = { netIncome: filingTextFacts.netIncome };
             // XBRL's capex concept is a positive magnitude but the
             // press-release table reports it parenthesized/negative (a
             // cash outflow) -- negated here to match XBRL's sign
             // convention, same as generateForeignFilingsCache.js's own
-            // identical merge. OCF's and shares' text-extracted sign
-            // conventions already match XBRL's directly, no flip needed.
+            // identical merge. OCF's, shares', and net income's text-
+            // extracted sign conventions already match XBRL's directly, no
+            // flip needed.
             if (capexFilingTextFacts.capex?.length) {
               capex = dedupeAndClassify([...capexRaw, ...annual20FCapexFacts, ...capexFilingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
             }
@@ -780,6 +927,9 @@ async function main() {
             }
             if (sharesFilingTextFacts.shares?.length) {
               shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts, ...sharesFilingTextFacts.shares], 'shares');
+            }
+            if (netIncomeFilingTextFacts.netIncome?.length) {
+              netIncome = dedupeAndClassify([...netIncomeRaw, ...annual20FNetIncomeFacts, ...netIncomeFilingTextFacts.netIncome]);
             }
           } catch (err) {
             console.log(`  filing-text fallback failed for ${symbol}: ${err.message}`);
@@ -826,6 +976,7 @@ async function main() {
           console.error('DEBUG pfcf-inputs', symbol, 'ocf.quarterly', JSON.stringify(ocf.quarterly));
           console.error('DEBUG pfcf-inputs', symbol, 'capex.quarterly', JSON.stringify(capex.quarterly));
           console.error('DEBUG pfcf-inputs', symbol, 'shares.quarterly', JSON.stringify(shares.quarterly));
+          console.error('DEBUG pfcf-inputs', symbol, 'netIncome.quarterly', JSON.stringify(netIncome.quarterly));
           console.error('DEBUG pfcf-inputs', symbol, 'monthlyPrices', JSON.stringify(monthlyPrices.slice(0, 5)), '...', monthlyPrices.length, 'total');
         }
 
@@ -835,6 +986,12 @@ async function main() {
           ttm: buildForeignPfcfTTM(ocf.quarterly, capex.quarterly, shares.quarterly, monthlyPrices),
           quarterly: buildForeignPfcfQuarterly(ocf.quarterly, capex.quarterly, shares.quarterly, monthlyPrices),
           yearly: buildForeignPfcfYearly(ocf.annual, capex.annual, shares.annual, monthlyPrices),
+        };
+        // P/E -- same fetched netIncome/shares/prices, zero extra API cost.
+        freshPe = {
+          ttm: buildForeignPeTTM(netIncome.quarterly, shares.quarterly, monthlyPrices),
+          quarterly: buildForeignPeQuarterly(netIncome.quarterly, shares.quarterly, monthlyPrices),
+          yearly: buildForeignPeYearly(netIncome.annual, shares.annual, monthlyPrices),
         };
       }
     } catch (err) {
@@ -849,6 +1006,21 @@ async function main() {
       resolved++;
     }
 
+    // P/E -- merged separately into peCache (pfcfTrendCache.json), touching
+    // ONLY this symbol's `.pe` key. peCache[symbol] may already exist here
+    // (the domestic pipeline's own attempt at this same foreign ticker,
+    // almost always empty since Finnhub's financials-reported rarely has
+    // anything useful for a foreign filer -- see the CIK-mismatch class of
+    // bug documented elsewhere for why that's sometimes actively WRONG
+    // instead of just empty) -- spreading it first preserves that entry's
+    // OWN top-level ttm/quarterly/yearly (P/FCF) fields untouched; this
+    // script is never the source of truth for those (foreignPfcfCache.json
+    // is, via its own separate app-side fetch chain).
+    const peCadences = pickCadenceTrendsToPublish(peCache[symbol]?.pe, freshPe);
+    if (peCadences.ttm.length || peCadences.quarterly.length || peCadences.yearly.length) {
+      peCache[symbol] = { ...peCache[symbol], fetchedAt: new Date().toISOString(), pe: peCadences };
+    }
+
     processed++;
     if (processed % 25 === 0) {
       console.log(`  ${processed}/${withCik.length} processed (${resolved} resolved so far), ${twelveDataCalls} Twelve Data calls used`);
@@ -856,9 +1028,10 @@ async function main() {
   }
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends: cache }));
+  fs.writeFileSync(OUTPUT_PE_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends: peCache }));
   console.log(
     `Done. Processed ${processed} tickers (${resolved} resolved to at least one P/FCF trend, ${twelveDataCalls} Twelve Data calls used). ` +
-      `Cache now covers ${Object.keys(cache).length} tickers total.`
+      `Cache now covers ${Object.keys(cache).length} tickers total (P/E cache covers ${Object.keys(peCache).length} tickers total, shared with the domestic pipeline).`
   );
 }
 
@@ -873,6 +1046,10 @@ module.exports = {
   buildForeignPfcfTTM,
   buildForeignPfcfQuarterly,
   buildForeignPfcfYearly,
+  buildForeignPeTTM,
+  buildForeignPeQuarterly,
+  buildForeignPeYearly,
+  isOcfScalePlausible,
   pickTrendToPublish,
   pickCadenceTrendsToPublish,
 };

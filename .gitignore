@@ -5,3 +5,4 @@ node_modules/
 # from here on so a local test/debug run never gets swept into a commit.
 /foreignFilingsCache.json
 /foreignPfcfCache.json
+/pfcfTrendCache.json

@@ -1930,7 +1930,22 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // evidence.
   const scale = detectScaleMultiplier(pointsByConcept, annualByEnd);
   if (scale !== 1) {
-    for (const points of pointsByConcept.values()) {
+    for (const [concept, points] of pointsByConcept) {
+      // A share COUNT is never abbreviated the way a dollar figure is --
+      // verified live: STNG's earnings-release table states OCF/capex/net
+      // income "in thousands" but its weighted-average-share-count row in
+      // the SAME table is a plain, full number (e.g. "46,284,629", not
+      // "46,285"). Applying a detected dollar-scale correction to shares
+      // too silently inflated a real ~53M share count to ~53 BILLION the
+      // first time this function was ever asked to score a concept (net
+      // income) with a strong enough annual anchor to actually trigger a
+      // correction alongside shares in the same batch -- previously latent
+      // because shares had never before been batched with a concept whose
+      // annual anchor was reliable enough to move `scale` off of 1.
+      // NON_ADDITIVE_CONCEPTS is reused here as the same "not a dollar
+      // amount, don't treat it like one" classification it already
+      // provides for Check B's summing/derivation guard just below.
+      if (NON_ADDITIVE_CONCEPTS.has(concept)) continue;
       for (const p of points) {
         p.val *= scale;
         if (p.valueCumulative != null) p.valueCumulative *= scale;

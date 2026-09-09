@@ -75,7 +75,9 @@ jobs:
         if: ${{ inputs.dryRun }}
         env:
           TARGET_SYMBOL: ${{ inputs.symbol }}
-        run: node -e "const d = require('./foreignPfcfCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, JSON.stringify(d[s]));"
+        run: |
+          node -e "const d = require('./foreignPfcfCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, JSON.stringify(d[s]));"
+          node -e "const d = require('./pfcfTrendCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, 'pe:', JSON.stringify(d[s]?.pe));"
 
       - name: Publish to gist
         if: ${{ !inputs.dryRun }}
@@ -84,6 +86,23 @@ jobs:
         run: |
           gh gist edit "${{ secrets.GIST_ID }}" --filename foreignPfcfCache.json foreignPfcfCache.json || \
           gh gist edit "${{ secrets.GIST_ID }}" --add foreignPfcfCache.json
+
+      # pfcfTrendCache.json is the DOMESTIC pipeline's own file (11+MB, also
+      # published there via plain `gh gist edit`, verified to handle files
+      # well past the Gists REST API's 1MB inline-content limit since that
+      # path uploads full raw content, not through the truncating API
+      # field) -- this script only ever touches the `.pe` key of the
+      # foreign tickers it itself processed (see the script's own comments
+      # near GIST_PFCF_TREND_URL/OUTPUT_PE_FILE), so publishing it here is
+      # additive to whatever the domestic pipeline's own runs already
+      # wrote, never a wholesale replace.
+      - name: Publish P/E to gist (shared file with the domestic pipeline)
+        if: ${{ !inputs.dryRun }}
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename pfcfTrendCache.json pfcfTrendCache.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add pfcfTrendCache.json
 
       - name: Report failure
         if: failure()
