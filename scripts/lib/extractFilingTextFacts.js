@@ -341,8 +341,21 @@ const LABEL_ALIASES = {
     // revenue/ocf text-extraction all already worked and reached Q2'26;
     // capex alone returned zero candidates, which is why only fcfMargin/
     // P-FCF (not profitMargin/revenueGrowth) were stuck.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock/i,
-    exclude: /proceeds|disposal|\bsale of\b/i,
+    // Bare "(Mineral) property, plant and equipment" (no verb/preposition at
+    // all) added, anchored to the WHOLE label -- verified live: Alamos Gold
+    // (AGI) labels its real investing-section capex line just "Mineral
+    // property, plant and equipment", a SEVENTH distinct real-world
+    // phrasing with no "purchase of"/"acquisition of"/"additions to" prefix
+    // to anchor on. Deliberately anchored (^...$, not a bare substring test
+    // like every other alternative here) rather than a generic
+    // "\bproperty,? plant and equipment\b" -- that phrase also legitimately
+    // appears embedded in unrelated lines within the same cash-flow
+    // statement (e.g. "Depreciation of property, plant and equipment", an
+    // operating-activities adjustment, or "Gain on disposal of property,
+    // plant and equipment") that are NOT capex; anchoring to the full label
+    // matches only when the row's entire text IS the asset name itself.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|^(mineral )?propert(y|ies),? plant and equipment$/i,
+    exclude: /proceeds|disposal|\bsale of\b|depreciation|amortization|gain on|loss on/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
   // extractFromInstantTable/parseInstantTableColumns below. Mirrors
@@ -2414,6 +2427,55 @@ function decumulateNestedCandidates(points) {
         val: longer.val - shorter.val,
         derivedFrom: [shorter, longer],
       });
+    }
+  }
+
+  // Second pass: a derived remainder above can still fully or partially
+  // overlap OTHER, independently-disclosed standalone points that landed in
+  // a DIFFERENT start-group above -- adjacent quarters (Q2, Q3, ...) don't
+  // share a start with the fiscal-year-origin group (Q1/annual), so pass 1
+  // never recognizes them as related. Verified live: AGI (a Canadian gold
+  // miner) discloses real standalone Q1, Q2, AND Q3 revenue (each its own
+  // "Three Months Ended" column, in three separate 6-K filings), plus a
+  // real annual XBRL total. Pass 1 only pairs Q1 with the annual total
+  // (both start near Jan 1), producing a 9-month "remainder" that actually
+  // still CONTAINS the real, separately-grouped Q2 and Q3 -- naively
+  // summing everything then triple-counts Q2/Q3, overshooting the real
+  // annual total by ~50% at every scale candidate, which made
+  // detectScaleMultiplier/Check B fail outright for every concept. This
+  // walks forward from a "wide" point's own start, chaining any OTHER
+  // points that are adjacent and fall entirely within its range (the exact
+  // same "value = wide total - known piece" principle pass 1 already
+  // applies within a single start-group, just not limited to that group),
+  // and narrows the wide point down to the genuine residual gap -- or drops
+  // it entirely if the known pieces already tile its whole range. A no-op
+  // for the common case (no cross-group overlap), so this can't regress a
+  // ticker that never had this shape to begin with.
+  let narrowed = true;
+  while (narrowed) {
+    narrowed = false;
+    for (const wide of result) {
+      const others = result.filter((p) => p !== wide);
+      let cursor = wide.start;
+      let sum = 0;
+      const used = [];
+      for (;;) {
+        const next = others.find(
+          (p) => !used.includes(p) && isAdjacentDate(cursor, p.start) && new Date(p.end) <= new Date(wide.end)
+        );
+        if (!next) break;
+        used.push(next);
+        sum += next.val;
+        cursor = next.end;
+      }
+      if (!used.length) continue;
+      if (isAdjacentDate(cursor, wide.end)) {
+        result.splice(result.indexOf(wide), 1);
+      } else {
+        result.splice(result.indexOf(wide), 1, { start: cursor, end: wide.end, val: wide.val - sum, derivedFrom: [wide, ...used] });
+      }
+      narrowed = true;
+      break; // result mutated -- restart the scan
     }
   }
   return result;
