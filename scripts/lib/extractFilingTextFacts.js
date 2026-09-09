@@ -370,7 +370,15 @@ const LABEL_ALIASES = {
     // text label at all (a bare subtotal row after "Non-controlling
     // interests") — a known, accepted gap, not something this pattern can
     // reach; see the module header notes.
-    include: /total (shareholders|stockholders)('|s)? equity|total equity/i,
+    // "^equity$" (anchored to the WHOLE label, not a substring test like
+    // every other alternative here) added -- verified live: Super Group
+    // (SGHC) labels its real grand-total equity row just "EQUITY" (bare,
+    // no "Total" qualifier at all, distinct from "Equity attributable to
+    // owners of the parent" one line above it in the SAME table, which is
+    // a real but different, non-total figure). Anchoring to the full label
+    // is required here -- a generic unanchored "\bequity\b" would also
+    // match that non-total line and several others in the same section.
+    include: /total (shareholders|stockholders)('|s)? equity|total equity|^equity$/i,
     exclude: /per share/i,
   },
   debt: {
