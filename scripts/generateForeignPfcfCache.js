@@ -294,6 +294,52 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
 // filer metrics use doesn't apply, matching stock-metrics-pipeline's own
 // generatePfcfTrendCache.js (which deliberately skips that clamp too).
 
+// A text-extracted OCF figure's UNIT SCALE can't always be verified via
+// detectScaleMultiplier (extractFilingTextFacts.js) -- that requires a real
+// annual XBRL anchor to calibrate against, which some filers (verified
+// live: STNG) simply don't have for OCF/capex at all. With no evidence,
+// detectScaleMultiplier silently defaults to scale=1 -- an ASSUMPTION, not
+// a verified fact. STNG's real cash-flow-statement table is denominated
+// "$ in thousands" (a standard convention), but its share count is stated
+// in full (also standard -- share counts aren't abbreviated the way dollar
+// figures are) -- so the same batch-wide scale detection that correctly
+// leaves shares alone (scale=1 happens to be right there) silently leaves
+// OCF/capex 1000x too small too, since nothing in that batch catches the
+// mismatch. This is invisible to fcfMargin (OCF/capex divided by revenue,
+// extracted from the SAME table at the SAME wrong scale -- the ratio
+// cancels the error out) but catastrophic for P/FCF specifically, which
+// divides by an independently-and-correctly-scaled share count: a
+// 1000x-too-small OCF produces a 1000x-too-LARGE P/FCF (verified live:
+// STNG's Q1 2024 quarterly P/FCF published as 4149.14 -- at the real
+// ~$70 share price and ~50M real shares, the implied OCF is $222,130,
+// i.e. 0.006% of market cap; the same row scaled correctly per its own
+// table convention (x1000) would be $222.13M, a normal 6.3% of market cap).
+//
+// Since there's no annual anchor to verify the TRUE scale from, this
+// deliberately does NOT attempt to guess/apply a correction (that would be
+// exactly the kind of fabrication this pipeline avoids everywhere else) --
+// it only detects when the CURRENT (unverified, assumed-1x) scale is
+// implausible enough that the resulting flow can't be real, and declines
+// to publish that point at all, same "verify or leave empty" principle as
+// everywhere else in this pipeline. A real quarterly OCF this far below
+// market cap has never been observed for an operating company at any
+// scale -- even a distressed one -- so a wide margin (fractions of a
+// basis point) comfortably avoids false positives against genuinely thin
+// (but real) cash flow. The annual threshold is 4x the quarterly one,
+// matching the natural ~4x larger magnitude of a full year's flow vs one
+// quarter's -- using the same threshold for both would fail to catch an
+// annual-cadence version of the identical scale error (a 1000x-too-small
+// annual OCF still clears the quarterly-sized bar on its own).
+const MIN_PLAUSIBLE_OCF_FRACTION_OF_MARKET_CAP = 0.0001; // 1 basis point, quarterly-flow-sized
+const MIN_PLAUSIBLE_ANNUAL_OCF_FRACTION_OF_MARKET_CAP = 0.0004; // 4 basis points, annual-flow-sized
+
+function isOcfScalePlausible(ocfValue, price, shares, threshold = MIN_PLAUSIBLE_OCF_FRACTION_OF_MARKET_CAP) {
+  if (price == null || !(shares > 0)) return true; // nothing to check against -- don't block on missing inputs
+  const marketCap = price * shares;
+  if (!(marketCap > 0)) return true;
+  return Math.abs(ocfValue) >= threshold * marketCap;
+}
+
 const MAX_PRICE_MATCH_MS = 45 * 24 * 60 * 60 * 1000;
 
 function findClosestMonthlyPrice(monthlyPrices, targetDateStr) {
@@ -355,13 +401,14 @@ function buildForeignPfcfTTM(ocfQuarterly, capexQuarterly, sharesQuarterly, mont
   const standalone = ocfQuarterly
     .map((o) => ({ ...o, shares: sharesByEnd.get(o.end) ?? findNearestShares(sharesQuarterly, o.end) }))
     .filter((o) => capexByEnd.has(o.end) && o.shares > 0)
-    .map((o) => ({ start: o.start, end: o.end, fcf: o.value - capexByEnd.get(o.end), shares: o.shares }));
+    .map((o) => ({ start: o.start, end: o.end, ocf: o.value, fcf: o.value - capexByEnd.get(o.end), shares: o.shares }));
 
   return buildTrailingWindows(standalone, 4)
     .map(({ quarters, anchor, partial }) => {
+      const price = findClosestMonthlyPrice(monthlyPrices, anchor.end);
+      if (!isOcfScalePlausible(anchor.ocf, price, anchor.shares)) return null;
       const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
       const ttmFcfPerShare = ttmFcf / anchor.shares;
-      const price = findClosestMonthlyPrice(monthlyPrices, anchor.end);
       const value = price != null && ttmFcfPerShare !== 0 ? price / ttmFcfPerShare : null;
       return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
     })
@@ -379,8 +426,9 @@ function buildForeignPfcfQuarterly(ocfQuarterly, capexQuarterly, sharesQuarterly
     .map((o) => ({ ...o, shares: sharesByEnd.get(o.end) ?? findNearestShares(sharesQuarterly, o.end) }))
     .filter((o) => capexByEnd.has(o.end) && o.shares > 0)
     .map((o) => {
-      const annualizedFcfPerShare = ((o.value - capexByEnd.get(o.end)) / o.shares) * 4;
       const price = findClosestMonthlyPrice(monthlyPrices, o.end);
+      if (!isOcfScalePlausible(o.value, price, o.shares)) return null;
+      const annualizedFcfPerShare = ((o.value - capexByEnd.get(o.end)) / o.shares) * 4;
       const value = price != null && annualizedFcfPerShare !== 0 ? price / annualizedFcfPerShare : null;
       return value != null ? { label: quarterLabelFromDate(o.end), value } : null;
     })
@@ -408,8 +456,10 @@ function buildForeignPfcfYearly(ocfAnnual, capexAnnual, sharesAnnual, monthlyPri
     .map(([end, value]) => ({ end, value }))
     .filter((o) => capexByEnd.has(o.end) && sharesByEnd.get(o.end) > 0)
     .map((o) => {
-      const fcfPerShare = (o.value - capexByEnd.get(o.end)) / sharesByEnd.get(o.end);
+      const shares = sharesByEnd.get(o.end);
       const price = findClosestMonthlyPrice(monthlyPrices, o.end);
+      if (!isOcfScalePlausible(o.value, price, shares, MIN_PLAUSIBLE_ANNUAL_OCF_FRACTION_OF_MARKET_CAP)) return null;
+      const fcfPerShare = (o.value - capexByEnd.get(o.end)) / shares;
       const value = price != null && fcfPerShare !== 0 ? price / fcfPerShare : null;
       return value != null ? { label: annualLabelFromDate(o.end), value } : null;
     })
