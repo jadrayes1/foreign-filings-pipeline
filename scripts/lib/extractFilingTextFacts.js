@@ -683,7 +683,7 @@ function monthSpanToQuarterMonths(startMonth, startDay, endMonth, endDay, year) 
 // than published wrong.
 const CALENDAR_QUARTER_END_BY_MONTHS = { 3: 'March 31', 6: 'June 30', 9: 'September 30', 12: 'December 31' };
 
-function parseTableColumns($, table, externalPeriodPhrase) {
+function parseTableColumns($, table, externalPeriodPhrases = []) {
   const rows = $(table).find('tr').toArray();
   // A NINTH header shape, verified live: CPA's real cash-flow statement
   // states its period entirely OUTSIDE the <table> -- "Consolidated
@@ -696,11 +696,16 @@ function parseTableColumns($, table, externalPeriodPhrase) {
   // a phrase that lives in a preceding sibling <div> no matter how the
   // row-by-row search below is extended. The caller (extractStatement)
   // scans the elements between the heading and this table for exactly
-  // this shape and passes the phrase text through here; seeding
-  // periodPhrases with it up front is equivalent to the table having
-  // disclosed that phrase in its own first row, so every existing
-  // pendingMonthDays/dateCells branch below needs no further change.
-  let periodPhrases = externalPeriodPhrase ? [externalPeriodPhrase] : null;
+  // this shape and passes the phrase(s) through here (see
+  // findExternalPeriodPhrases' own comment for why this can be more than
+  // one distinct phrase — SGHC's mid-year cash-flow caption states "for
+  // the six months ended June 30, 2026" AND "and twelve months ended
+  // December 31, 2025" as two separate phrases, each already carrying its
+  // own date); seeding periodPhrases with them up front is equivalent to
+  // the table having disclosed them in its own first row, so every
+  // existing pendingMonthDays/dateCells branch below needs no further
+  // change.
+  let periodPhrases = externalPeriodPhrases.length ? externalPeriodPhrases : null;
   // A FOURTH header shape, verified live: Eldorado Gold (EGO) splits the
   // date across its OWN separate row - a bare "June 30," with no year at
   // all - sitting between the period-length row ("Three months ended")
@@ -1143,8 +1148,8 @@ function resolveConceptCandidates(list, concept, valueKey) {
   return null;
 }
 
-function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS, externalPeriodPhrase = null) {
-  const parsed = parseTableColumns($, table, externalPeriodPhrase);
+function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS, externalPeriodPhrases = []) {
+  const parsed = parseTableColumns($, table, externalPeriodPhrases);
   if (!parsed) return null;
   const { columns, dataStartRowIdx } = parsed;
 
@@ -1381,7 +1386,7 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap) {
 // <Day>, <Year>" shape parseDateHeaderCell already recognizes (reused
 // as-is, unchanged) — just with no preceding period-length phrase to
 // combine with, since each date IS its own complete instant column.
-function parseInstantTableColumns($, table) {
+function parseInstantTableColumns($, table, externalColumnDates = null) {
   const rows = $(table).find('tr').toArray();
   for (let i = 0; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
@@ -1391,7 +1396,61 @@ function parseInstantTableColumns($, table) {
       return { columns, dataStartRowIdx: i + 1 };
     }
   }
+  // Fallback shape, verified live: SGHC's real balance-sheet caption states
+  // both dates entirely in prose OUTSIDE the table -- "as at June 30, 2026"
+  // and "and December 31, 2025 in $ millions" sit in two sibling <font>
+  // leaves above the table, which itself is left with just a bare
+  // "2026 | 2025" year-pair header row. Every date cell above has
+  // d.monthDay === null for a bare year (isYearCell branch of
+  // parseDateHeaderCell), so the loop above can never resolve real column
+  // dates from the table alone -- same shape as parseTableColumns' own
+  // external-period-phrase fix, applied here to instant/balance-sheet
+  // columns instead of duration columns. The caller (extractInstantStatement)
+  // gathers these dates from the heading-to-table gap and passes them
+  // through; matched here by finding the row whose bare-year-cell COUNT
+  // equals the hint's length (position-order pairing, same convention as
+  // every other multi-column header shape in this file).
+  if (externalColumnDates && externalColumnDates.length >= 2) {
+    for (let i = 0; i < rows.length; i++) {
+      const cells = nonEmptyCells($, rows[i]);
+      const yearCells = cells.filter((c) => isYearCell(c.text));
+      if (yearCells.length === externalColumnDates.length) {
+        return { columns: externalColumnDates, dataStartRowIdx: i + 1 };
+      }
+    }
+  }
   return null;
+}
+
+// Scans arbitrary text for every "<Month> <Day>, <Year>" (or "<Month>
+// <Day> <Year>") occurrence, in order -- the unanchored sibling of
+// parseDateHeaderCell's own compound-date branch, for pulling MULTIPLE
+// real dates out of a whole caption/sentence rather than matching one
+// whole cell exactly. Deliberately does not strip an "as of/as at" prefix
+// here (unlike parseDateHeaderCell) -- callers scan a whole caption that
+// may embed that phrase anywhere, not just at the very start of the text
+// being tested.
+function findDatesInText(text) {
+  const matches = [...text.matchAll(/([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})/g)];
+  return matches.map((m) => ({ endMonthDay: `${m[1]} ${m[2]}`, year: m[3] }));
+}
+
+// Sibling of findExternalPeriodPhrase (see its own comment) for the
+// instant/balance-sheet case -- scans the elements between a heading and
+// its matched table for real dates stated in prose, accumulating matches
+// across every leaf in range (a caption is often split across several
+// sibling <font> elements, e.g. SGHC's "as at June 30, 2026" / "and
+// December 31, 2025 in $ millions" as two separate leaves under one
+// wrapping, non-leaf <div>).
+function findExternalInstantColumnDates($, allEls, startIdx, endIdx) {
+  const dates = [];
+  for (let i = startIdx; i < endIdx; i++) {
+    const $el = $(allEls[i]);
+    const text = $el.text();
+    if (!isHeadingLeaf($, $el) || text.length > MAX_HEADING_TEXT_LENGTH) continue;
+    dates.push(...findDatesInText(text));
+  }
+  return dates;
 }
 
 // Parses every date column in an already-located balance-sheet <table> —
@@ -1400,8 +1459,8 @@ function parseInstantTableColumns($, table) {
 // prior-year-comparative snapshots are both real, previously-undisclosed-
 // elsewhere data points), so this returns one result per column rather than
 // a single target period.
-function extractFromInstantTable($, table, aliasMap) {
-  const parsed = parseInstantTableColumns($, table);
+function extractFromInstantTable($, table, aliasMap, externalColumnDates = null) {
+  const parsed = parseInstantTableColumns($, table, externalColumnDates);
   if (!parsed) return [];
   const { columns, dataStartRowIdx } = parsed;
 
@@ -1510,22 +1569,38 @@ function findStatementTables($, allEls, headingIdx) {
 }
 
 // Scans the elements strictly between a statement's heading and its data
-// table for a standalone period-phrase leaf (e.g. CPA's own separate "For
+// table for standalone period-phrase leaves (e.g. CPA's own separate "For
 // the six months ended" <div>, sitting between the "Consolidated statement
 // of cash flows" heading and the table itself) -- see parseTableColumns'
 // own comment on why a phrase living outside the table can never be found
 // by that function's row-by-row search alone. Same leaf-ness/length rule
 // as the heading search above, so an unrelated container that merely
 // CONTAINS this wording somewhere deep inside doesn't false-match.
-function findExternalPeriodPhrase($, allEls, startIdx, endIdx) {
+//
+// Returns EVERY matching phrase found, not just the first -- verified
+// live: SGHC's real mid-year cash-flow caption states TWO distinct
+// phrases, each already carrying its own embedded date -- "for the six
+// months ended June 30, 2026" and "and twelve months ended December 31,
+// 2025" (a mid-year release comparing H1 2026 against the PRIOR FULL
+// YEAR's cash flow, not just prior H1). A single-phrase hint applied
+// uniformly across both table columns (CPA's own shape, where one bare
+// phrase with no date of its own covers both years identically) would be
+// WRONG here -- the two years need two different (months, endMonthDay)
+// pairs. Returning both in document order lets the caller's existing
+// positional periodPhrases[Math.floor(idx/yearsPerPeriod)] pairing (see
+// parseTableColumns) resolve this exactly like any other same-row
+// multi-phrase header, with yearsPerPeriod naturally settling to 1 when
+// the phrase count already matches the date-cell count 1:1.
+function findExternalPeriodPhrases($, allEls, startIdx, endIdx) {
+  const phrases = [];
   for (let i = startIdx; i < endIdx; i++) {
     const $el = $(allEls[i]);
     const text = $el.text();
     if (!isHeadingLeaf($, $el) || text.length > MAX_HEADING_TEXT_LENGTH || !PERIOD_PHRASE_INDICATOR.test(text)) continue;
     const parsed = parsePeriodPhrase(text);
-    if (parsed) return parsed;
+    if (parsed) phrases.push(parsed);
   }
-  return null;
+  return phrases;
 }
 
 // Locates a statement's heading + immediately-following <table> in a big
@@ -1564,8 +1639,8 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap, cumulativeFa
   for (const headingIdx of headingIdxs) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
       const tableIdx = allEls.indexOf(table);
-      const externalPeriodPhrase = tableIdx > headingIdx ? findExternalPeriodPhrase($, allEls, headingIdx + 1, tableIdx) : null;
-      const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts, externalPeriodPhrase);
+      const externalPeriodPhrases = tableIdx > headingIdx ? findExternalPeriodPhrases($, allEls, headingIdx + 1, tableIdx) : [];
+      const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts, externalPeriodPhrases);
       if (!result) continue;
       if (!merged) merged = result;
       else merged = { period: merged.period, facts: { ...result.facts, ...merged.facts } };
@@ -1595,7 +1670,9 @@ function extractInstantStatement($, headingRegex, aliasMap) {
   let bestFactCount = 0;
   for (const headingIdx of headingIdxs) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
-      const result = extractFromInstantTable($, table, aliasMap);
+      const tableIdx = allEls.indexOf(table);
+      const externalColumnDates = tableIdx > headingIdx ? findExternalInstantColumnDates($, allEls, headingIdx + 1, tableIdx) : [];
+      const result = extractFromInstantTable($, table, aliasMap, externalColumnDates);
       const factCount = result.reduce((sum, r) => sum + Object.keys(r.facts).length, 0);
       if (result.length && factCount > bestFactCount) {
         best = result;
