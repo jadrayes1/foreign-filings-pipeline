@@ -118,8 +118,21 @@ const STATEMENT_HEADINGS = {
   // also has a separate, real "...Statements of Comprehensive Income"
   // heading that satisfied the coarse whole-page hasIncome check while
   // the actual statement with revenue/net-income lines was never located.
+  // Every word-boundary space below is \s+ (or \s* where the space is
+  // meant to be optional), not a literal " " -- verified live: Haoxin
+  // Holdings (HXHX)'s real cash-flow heading is wrapped mid-phrase in its
+  // own source HTML, "Unaudited Condensed Consolidated Statement\nof Cash
+  // Flows" (a genuine line-wrap artifact inside one <B> tag, not a
+  // rendering quirk cheerio introduces) -- a literal space between
+  // "Statement" and "of" never matches a literal newline there, so hasCashflow
+  // was false for HXHX despite the real heading being present verbatim.
+  // The leading "CONSOLIDATED\s+STATEMENTS?" gap was already \s+-tolerant
+  // (fixed earlier for DHT's own "CONSOLIDATED\nSTATEMENT OF CASH FLOW"),
+  // but that fix was never extended to the OTHER internal spaces in these
+  // same patterns -- inconsistent, and exactly what HXHX's real document
+  // tripped on next.
   income:
-    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS? OF (COMPREHENSIVE |NET )?INCOME|STATEMENTS? OF OPERATIONS|STATEMENTS? OF OPERATING RESULTS|STATEMENTS? OF EARNINGS|INCOME STATEMENTS?|STATEMENTS? OF PROFIT OR LOSS)/i,
+    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS)/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
@@ -128,14 +141,14 @@ const STATEMENT_HEADINGS = {
   // mandatory-plural right next to it. hasCashflow was false for every one
   // of DHT's real documents as a result, so capex/ocf extraction never
   // even attempted to run for this filer.
-  cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS? OF CASH ?FLOWS?/i,
+  cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS?\s+OF\s+CASH\s*FLOWS?/i,
   // Not anchored on "CONSOLIDATED" needing to be the very first word — same
   // reasoning as income/cashflow above (the regex isn't `^`-anchored, so
   // "Condensed Consolidated Balance Sheets" still matches via the
   // "Consolidated Balance Sheets" substring). Verified live: STNG uses
   // "Condensed Consolidated Balance Sheets", IAG uses plain "Consolidated
   // Balance Sheets" with no extra qualifiers.
-  balanceSheet: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(BALANCE SHEETS?|STATEMENTS? OF FINANCIAL POSITION)/i,
+  balanceSheet: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(BALANCE\s+SHEETS?|STATEMENTS?\s+OF\s+FINANCIAL\s+POSITION)/i,
   // Weighted-average share count lives in its OWN note, not under the main
   // income-statement heading -- verified live: TNK's real income
   // statement table has no share-count row at all; the actual "Weighted
@@ -145,7 +158,7 @@ const STATEMENT_HEADINGS = {
   // a leading number (varies by filer) or "CONSOLIDATED" -- this is a note
   // title, not a primary statement title, so it doesn't share those
   // primary statements' naming convention.
-  earningsPerShare: /EARNINGS PER (COMMON )?SHARE/i,
+  earningsPerShare: /EARNINGS\s+PER\s+(COMMON\s+)?SHARE/i,
 };
 
 // A real statement title is always short - verified live this matters:
@@ -2142,21 +2155,39 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   const scale = detectScaleMultiplier(pointsByConcept, annualByEnd);
   if (scale !== 1) {
     for (const [concept, points] of pointsByConcept) {
-      // A share COUNT is never abbreviated the way a dollar figure is --
-      // verified live: STNG's earnings-release table states OCF/capex/net
-      // income "in thousands" but its weighted-average-share-count row in
-      // the SAME table is a plain, full number (e.g. "46,284,629", not
-      // "46,285"). Applying a detected dollar-scale correction to shares
-      // too silently inflated a real ~53M share count to ~53 BILLION the
-      // first time this function was ever asked to score a concept (net
-      // income) with a strong enough annual anchor to actually trigger a
-      // correction alongside shares in the same batch -- previously latent
-      // because shares had never before been batched with a concept whose
-      // annual anchor was reliable enough to move `scale` off of 1.
-      // NON_ADDITIVE_CONCEPTS is reused here as the same "not a dollar
-      // amount, don't treat it like one" classification it already
-      // provides for Check B's summing/derivation guard just below.
-      if (NON_ADDITIVE_CONCEPTS.has(concept)) continue;
+      // A share COUNT is USUALLY never abbreviated the way a dollar figure
+      // is -- verified live: STNG's earnings-release table states OCF/
+      // capex/net income "in thousands" but its weighted-average-share-
+      // count row in the SAME table is a plain, full number (e.g.
+      // "46,284,629", not "46,285"). Applying a detected dollar-scale
+      // correction to shares too silently inflated a real ~53M share count
+      // to ~53 BILLION the first time this function was ever asked to
+      // score a concept (net income) with a strong enough annual anchor to
+      // actually trigger a correction alongside shares in the same batch.
+      //
+      // USUALLY, though, not always -- verified live: CNI (Canadian
+      // National Railway) states its real "Weighted-average basic shares
+      // outstanding" as "606.5" (606.5 MILLION, matching the SAME
+      // in-millions convention as the rest of that table), directly
+      // contradicting the STNG-derived assumption above for this filer.
+      // A blanket exemption left CNI's shares 1,000,000x too small,
+      // corrupting every P/FCF-per-share and EPS figure built from it
+      // (both divide by shares) into a near-zero garbage ratio even after
+      // the reconciled OCF/capex/netIncome feeding the same calculation
+      // were correctly scaled. Detected here per-filer instead of assumed
+      // either way: no real public company has a weighted-average share
+      // count under MIN_PLAUSIBLE_RAW_SHARES -- if the RAW extracted value
+      // already clears that bar (STNG's case), leave it alone; only apply
+      // the same correction when the raw value is implausibly tiny AND
+      // scaling it lands in a plausible range (CNI's case). Falls through
+      // to the ordinary scale-everything path below when true; NON_ADDITIVE_
+      // CONCEPTS' OTHER meaning (not summable across quarters, Check B's
+      // guard just below) is untouched by this.
+      if (NON_ADDITIVE_CONCEPTS.has(concept)) {
+        const maxRaw = Math.max(0, ...points.map((p) => Math.abs(p.val)));
+        const impliesScalingNeeded = maxRaw > 0 && maxRaw < MIN_PLAUSIBLE_RAW_SHARES && maxRaw * scale >= MIN_PLAUSIBLE_RAW_SHARES;
+        if (!impliesScalingNeeded) continue;
+      }
       for (const p of points) {
         p.val *= scale;
         if (p.valueCumulative != null) p.valueCumulative *= scale;
@@ -2484,6 +2515,13 @@ const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
 // still apply (Check C's cross-filing corroboration in particular is
 // exactly the right verification method for a snapshot value).
 const NON_ADDITIVE_CONCEPTS = new Set(['shares']);
+
+// No real public company has a weighted-average share count below this --
+// used only to decide whether a filer's raw extracted shares value needs
+// the SAME dollar-scale correction its other concepts got (see the scale-
+// application block above, CNI's real case) or is already a genuine full
+// count (STNG's real case) that a blanket correction would over-inflate.
+const MIN_PLAUSIBLE_RAW_SHARES = 100000;
 
 // Instant-fact counterpart to reconcilePoints below. Deliberately NOT the
 // same function with a branch inside it: reconcilePoints' Check A/B are
