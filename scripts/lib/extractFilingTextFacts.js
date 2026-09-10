@@ -747,13 +747,40 @@ function parseTableColumns($, table) {
     // how the VALUES on each row (which similarly interleave 3 real dollar
     // figures with 2 percent-change figures) get pared back down to just
     // the 3 matching these real columns.
+    //
+    // CPA's real Q2 header goes one step further and also appends a same-
+    // row YTD cumulative pair -- "2Q26 | 2Q25 | Change% | 1Q26 | Change% |
+    // YTD26 | YTD25 | Change%". Unlike "Change", a YTD value has no
+    // adjacent "%" marker cell for parseDataRow to strip it by -- so
+    // leaving "YTDyy" unrecognized (as if it were noise like "Change")
+    // left 5 real numeric values per data row matching only 3 recognized
+    // columns, and parseDataRow's exact-count check silently rejected
+    // every row. Fix: recognize "YTDyy" as a real column too, typed by
+    // the SAME quarter number as the row's own leading "NQyy" cell (the
+    // filing's current reporting quarter -- e.g. "2Q26" tells us YTD26 is
+    // cumulative Jan 1 - Jun 30 2026, the same end date as 2Q26 itself,
+    // just 6 months long instead of 3; YTD through Q4 is naturally 12
+    // months, i.e. the annual figure). Once typed with months > 3 for the
+    // matching year, it's picked up automatically -- no other code change
+    // needed -- by extractFromTable's existing cumulativeIdx pairing
+    // (`c.months > 3 && c.year === targetEndYear`), giving CPA's own
+    // quarter an extra same-document Check A reconciliation for free, via
+    // the identical generic mechanism every other filer's 3mo+cumulative
+    // row shape already uses.
     if (!periodPhrases) {
+      const QUARTER_END_MONTH_DAYS = ['March 31', 'June 30', 'September 30', 'December 31'];
+      const primaryQuarterMatch = cells.map((c) => c.text.trim().match(/^([1-4])Q(\d{2})$/)).find(Boolean);
+      const primaryQuarterNum = primaryQuarterMatch ? Number(primaryQuarterMatch[1]) : null;
       const compactQuarterCells = cells
         .map((c) => {
-          const m = c.text.trim().match(/^([1-4])Q(\d{2})$/);
-          if (!m) return null;
-          const endMonthDay = ['March 31', 'June 30', 'September 30', 'December 31'][Number(m[1]) - 1];
-          return { months: 3, endMonthDay, year: `20${m[2]}` };
+          const text = c.text.trim();
+          const q = text.match(/^([1-4])Q(\d{2})$/);
+          if (q) return { months: 3, endMonthDay: QUARTER_END_MONTH_DAYS[Number(q[1]) - 1], year: `20${q[2]}` };
+          const ytd = primaryQuarterNum ? text.match(/^YTD(\d{2})$/) : null;
+          if (ytd) {
+            return { months: primaryQuarterNum * 3, endMonthDay: QUARTER_END_MONTH_DAYS[primaryQuarterNum - 1], year: `20${ytd[1]}` };
+          }
+          return null;
         })
         .filter(Boolean);
       if (compactQuarterCells.length >= 1) {
