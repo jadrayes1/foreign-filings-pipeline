@@ -413,7 +413,13 @@ const LABEL_ALIASES = {
   // gap. Left unaddressed by design -- a prose parser is a different
   // mechanism with no infrastructure to reuse here.
   shares: {
-    include: /weighted average (number of )?(common )?shares?( outstanding)?/i,
+    // "weighted[-]average" tolerates a hyphen, not just a space -- verified
+    // live: CNI (Canadian National Railway) labels its real rows
+    // "Weighted-average basic shares outstanding"/"...diluted shares
+    // outstanding", hyphenated, which the space-only pattern never matched
+    // -- same class of gap as parsePeriodPhrase's own "[\s-]months?" fix
+    // (BRP/DOO's "Three-month periods ended"), just never applied here too.
+    include: /weighted[\s-]average (number of )?(common )?shares?( outstanding)?/i,
     exclude: /dilutive effect|per share/i,
   },
 };
@@ -1177,6 +1183,16 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
   const rows = $(table).find('tr').toArray();
   const candidates = {}; // concept -> [{label, value3mo, valueCumulative}]
   let currentSection = null;
+  // Most recent header-only row's own text (a row with no numeric values --
+  // parseDataRow returns null for it below) -- disambiguates a BARE
+  // "Basic"/"Diluted" subrow, which carries no meaning on its own. Verified
+  // live: CNI (Canadian National Railway) discloses "Weighted-average
+  // number of shares (Note 7)" as its own header-only row immediately
+  // followed by separate "Basic"/"Diluted" data rows -- structurally
+  // IDENTICAL to its neighboring "Earnings per share (Note 7)" section,
+  // whose own "Basic"/"Diluted" subrows hold the $ EPS figures instead.
+  // Neither subrow's bare label alone says which one it is.
+  let pendingSectionLabel = null;
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
@@ -1198,9 +1214,22 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     else if (/investing activities/i.test(rowText)) currentSection = 'investing';
     else if (/financing activities/i.test(rowText)) currentSection = 'financing';
     const row = parseDataRow(cells, columns.length);
-    if (!row) continue;
+    if (!row) {
+      if (rowText.trim()) pendingSectionLabel = rowText.trim();
+      continue;
+    }
+    // A bare "Basic"/"Diluted" label means nothing by itself -- match
+    // against it PREFIXED with the most recent header-only row's text
+    // instead (see pendingSectionLabel's own comment above), so CNI's real
+    // "Weighted-average number of shares" + "Basic" combination matches the
+    // shares concept while the neighboring "Earnings per share" + "Basic"
+    // combination correctly does NOT (it has no "weighted" in it at all).
+    // The ORIGINAL bare label is still what gets stored on the candidate
+    // below -- resolveConceptCandidates' own basic/diluted tiebreak already
+    // depends on that exact bare wording.
+    const effectiveLabel = /^(basic|diluted)$/i.test(row.label.trim()) && pendingSectionLabel ? `${pendingSectionLabel} ${row.label}` : row.label;
     for (const concept of Object.keys(aliasMap)) {
-      if (!matchesConcept(row.label, concept)) continue;
+      if (!matchesConcept(effectiveLabel, concept)) continue;
       const requiredSection = SECTION_RESTRICTED_CONCEPTS[concept];
       if (requiredSection && currentSection !== requiredSection) continue;
       // value3mo actually means "the value for whatever period we ended up
@@ -1899,7 +1928,14 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const reports = await fetchFilingSummaryReports(cik, filing.accessionNumber, userAgent);
       if (reports.length) {
         const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
-        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome }).filter(([, v]) => v));
+        // shares included here too, not just in its own dedicated pass below
+        // -- verified live: CNI (Canadian National Railway) discloses its
+        // "Weighted-average number of shares" row INSIDE the income
+        // statement's own table (right after "Earnings per share"), not in
+        // a genuinely separate note the way TNK does. Purely additive: a
+        // filer whose shares row really is separate (TNK) still finds
+        // nothing extra here and is unaffected.
+        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, shares: aliasMap.shares }).filter(([, v]) => v));
         const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
         // Balance-sheet (equity/debt/cash) R-files -- previously only ever
         // attempted via the slower exhibit-scan fallback below, even when
@@ -1987,7 +2023,9 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
 
       for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow, STATEMENT_HEADINGS.earningsPerShare]) {
-        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome };
+        // shares included in incomeAliases too -- see the identical addition
+        // (and its own comment) in the FilingSummary/R-file branch above.
+        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, shares: aliasMap.shares };
         const cashflowAliases = { ocf: aliasMap.ocf, capex: aliasMap.capex };
         const sharesAliases = { shares: aliasMap.shares };
         const relevantAliases =
@@ -2228,7 +2266,9 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
     }
   }
 
-  const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome }).filter(([, v]) => v));
+  // shares included in incomeAliases too -- see the identical addition (and
+  // its own comment) in extractQuarterlyFactsFromFilings' R-file branch.
+  const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, shares: aliasMap.shares }).filter(([, v]) => v));
   const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
   const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
   const sharesAliases = Object.fromEntries(Object.entries({ shares: aliasMap.shares }).filter(([, v]) => v));
