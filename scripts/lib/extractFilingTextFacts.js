@@ -2322,11 +2322,20 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
 
   const r = submissions.filings.recent;
   const filings = [];
-  // Exact form-type match ('20-F', not '20-F/A') -- same reasoning as the
-  // 6-K path excluding '6-K/A': two entries must be genuinely independent
-  // filings for cross-filing corroboration (Check C) to mean anything.
+  // Exact form-type match ('20-F'/'40-F', not their '/A' amendments) --
+  // same reasoning as the 6-K path excluding '6-K/A': two entries must be
+  // genuinely independent filings for cross-filing corroboration (Check C)
+  // to mean anything. '40-F' added alongside '20-F' -- verified live for
+  // OGI (a Canadian MJDS filer, 40-F not 20-F): its 40-F filings carry the
+  // exact same FilingSummary.xml/R-file structure this function already
+  // parses, just under a different form-type label -- this function was
+  // ONLY ever gated on '20-F' though, so every 40-F filer (all Canadian
+  // MJDS foreign filers -- CN railways, cannabis, mining, etc. -- a real,
+  // sizeable chunk of foreignFilerList.json) was silently excluded from a
+  // mechanism that works identically for them.
+  const ANNUAL_RECOVERY_FORM_TYPES = new Set(['20-F', '40-F']);
   for (let i = 0; i < r.form.length && filings.length < MAX_20F_FILINGS_TO_SCAN; i++) {
-    if (r.form[i] === '20-F') filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
+    if (ANNUAL_RECOVERY_FORM_TYPES.has(r.form[i])) filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
   }
   if (!filings.length) return {};
 
