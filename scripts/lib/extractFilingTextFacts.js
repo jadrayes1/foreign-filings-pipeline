@@ -561,7 +561,14 @@ function nonEmptyCells($, row) {
   const cells = $(row)
     .find('td,th')
     .toArray()
-    .map((c) => ({ text: $(c).text().replace(/\s+/g, ' ').trim(), colspan: parseInt($(c).attr('colspan') || '1', 10) }))
+    // ​ (zero-width space) added alongside \s -- verified live: NBIS's
+    // real HTML uses a lone zero-width space as an invisible spacer cell
+    // between real data cells ("Net cash...|<ZWSP>|(184.1)|<ZWSP>|2,258.0"),
+    // rendering as visually empty but NOT matched by JS's own \s character
+    // class (unlike a real space/tab/nbsp), so it survived as a "non-empty"
+    // cell and inflated every row's cell count past columns.length --
+    // silently rejecting every data row in the table as malformed.
+    .map((c) => ({ text: $(c).text().replace(/[\s​]+/g, ' ').trim(), colspan: parseInt($(c).attr('colspan') || '1', 10) }))
     .filter((c) => c.text.length > 0);
   // Merge a lone ")" cell into the immediately preceding one -- verified
   // live: CANG's Q4/full-year release renders a negative value's closing
@@ -1697,6 +1704,53 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap, cumulativeFa
   return merged;
 }
 
+// A TENTH shape, verified live: NBIS (Nebius Group N.V., formerly Yandex
+// N.V.) discloses its real standalone-quarter cash-flow figures ONLY
+// inside an MD&A-style "Cash Flows" summary subsection -- its real 6-K
+// exhibits never carry a formal "Consolidated Statement of Cash Flows"
+// heading anywhere at all (confirmed live: extractStatement above finds
+// nothing for STATEMENT_HEADINGS.cashflow in the whole document). The
+// real summary reads: a short, standalone "Cash Flows" heading (bold+
+// italic <font>, not a formal statement title) immediately followed by a
+// sentence "Set out below is a summary of cash flows from continuing
+// operations for the three months ended March 31, 2025 and 2026.", then
+// an ordinarily-shaped table (period-phrase + bare-year-row header,
+// already handled by the existing parseTableColumns machinery -- no new
+// date parsing needed here, just a new way to LOCATE the table).
+//
+// Deliberately gated behind BOTH the exact, whole-string "Cash Flows"
+// heading text AND the specific "summary of cash flows" confirmatory
+// sentence immediately after it -- a bare "Cash Flows" heading alone is
+// far too generic a phrase to trust on its own, given how widely this
+// function's caller applies (every foreign filer's every exhibit, not
+// just NBIS's). Tried unconditionally alongside the formal heading
+// search, not instead of it -- harmless for a filer that already has a
+// real formal statement, since any resulting duplicate candidate for the
+// same period still has to independently pass reconcilePoints below like
+// any other candidate; this only ever ADDS a real, verifiable candidate
+// where none existed before.
+function extractMdaCashFlowSummary($, targetEndYear, aliasMap, cumulativeFallbackConcepts) {
+  const allEls = $('body *').toArray();
+  let merged = null;
+  for (let i = 0; i < allEls.length; i++) {
+    const $el = $(allEls[i]);
+    const text = $el.text().trim();
+    if (!isHeadingLeaf($, $el) || text.length > 40 || !/^cash\s+flows?$/i.test(text)) continue;
+    let confirmed = false;
+    for (let j = i + 1; j < Math.min(i + 6, allEls.length); j++) {
+      if (/summary of (the )?cash\s*flows?/i.test($(allEls[j]).text())) { confirmed = true; break; }
+    }
+    if (!confirmed) continue;
+    for (const table of findStatementTables($, allEls, i)) {
+      const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts);
+      if (!result) continue;
+      if (!merged) merged = result;
+      else merged = { period: merged.period, facts: { ...result.facts, ...merged.facts } };
+    }
+  }
+  return merged;
+}
+
 // Same heading-location shape as extractStatement above, but for the
 // balance sheet: every date column is independently useful (see
 // extractFromInstantTable), so this returns an ARRAY of results (one per
@@ -2061,6 +2115,27 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
             continue;
           }
           if (debug) console.error('DEBUG extractStatement result', url, year, JSON.stringify(extracted));
+          recordExtracted(extracted, filing);
+        }
+      }
+
+      // MD&A "Cash Flows" summary fallback -- see extractMdaCashFlowSummary's
+      // own comment (built for NBIS). Tried unconditionally alongside the
+      // formal heading search above, not gated on hasCashflow having come
+      // back false -- cheap, and harmless for a filer whose formal
+      // statement already worked (any resulting duplicate still has to
+      // independently pass reconcilePoints below).
+      const mdaCashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+      if (Object.keys(mdaCashflowAliases).length) {
+        for (const year of candidateYears) {
+          let extracted;
+          try {
+            extracted = extractMdaCashFlowSummary($, year, mdaCashflowAliases, cumulativeFallbackConcepts);
+          } catch (e) {
+            if (debug) console.error('DEBUG extractMdaCashFlowSummary threw', url, year, e.message);
+            continue;
+          }
+          if (debug) console.error('DEBUG extractMdaCashFlowSummary result', url, year, JSON.stringify(extracted));
           recordExtracted(extracted, filing);
         }
       }
@@ -2935,6 +3010,7 @@ module.exports = {
   parseTableColumns,
   parseDataRow,
   extractStatement,
+  extractMdaCashFlowSummary,
   subtractThreeMonths,
   monthDayYearToIso,
   reconcilePoints,
