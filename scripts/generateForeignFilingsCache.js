@@ -1558,7 +1558,21 @@ async function main() {
       }
 
       processed++;
-      if (processed % 50 === 0) console.log(`  ${processed}/${withCik.length} processed (${resolved} resolved so far)`);
+      if (processed % 50 === 0) {
+        // heapUsed logged alongside the existing progress line -- added
+        // after a real scheduled run OOM-crashed at ~500/767 tickers
+        // (2026-09-10, heap pinned near Node's ~4GB default ceiling with
+        // GC unable to reclaim much, consistent with something being
+        // retained across iterations rather than a one-off per-ticker
+        // spike). No leak source was pinned down via static reading alone
+        // -- this gives real data on the NEXT run (successful or not) to
+        // confirm whether growth is roughly linear in tickers processed,
+        // without needing full heap-profiling tooling in CI.
+        const mem = process.memoryUsage();
+        console.log(
+          `  ${processed}/${withCik.length} processed (${resolved} resolved so far), heapUsed=${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB rss=${(mem.rss / 1024 / 1024).toFixed(0)}MB`
+        );
+      }
     }
   }
 

@@ -101,6 +101,17 @@ jobs:
           ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
           BUSINESSQUANT_API_KEY: ${{ secrets.BUSINESSQUANT_API_KEY }}
           FILING_TEXT_FALLBACK_TICKERS: ${{ inputs.enableBusinessQuant && inputs.symbol || '' }}
+          # The scheduled 2026-09-10 run OOM-crashed at ~500/767 tickers,
+          # Node's heap pinned near its own ~4GB default ceiling (confirmed
+          # via the run's crash log) -- well under this runner's real 16GB
+          # RAM (standard ubuntu-latest spec), so raising V8's own ceiling
+          # gives real headroom without risking the container's physical
+          # limit. A stopgap, not a fix for whatever's actually growing
+          # across the run (see the per-50-ticker heapUsed/rss logging
+          # added alongside this -- gives real data to root-cause the
+          # underlying growth on a future run without needing full
+          # heap-profiling tooling in CI).
+          NODE_OPTIONS: '--max-old-space-size=12288'
         run: node scripts/generateForeignFilingsCache.js
 
       - name: Publish to gist
