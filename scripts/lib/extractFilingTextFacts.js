@@ -282,7 +282,13 @@ const LABEL_ALIASES = {
     // subtotals "Net operating cash flow"/"Net financing cash flow"/"Net
     // investing cash flow" -- the sibling "financing"/"investing" lines
     // are still safely excluded below since they contain those words.
-    include: /cash (flows? )?(from|provided by|generated (from|by)|used in|inflow|outflow).*operating|operating cash flow/i,
+    // Tolerant of a "(used in)"/"(loss)"-style parenthetical wedged
+    // between "cash" and the action verb -- verified live: HXHX (Haoxin
+    // Holdings) labels this line "Net cash (used in) provided by
+    // operating activities", the SAME dual-framing convention already
+    // handled for pretaxIncome's own "(loss)" parenthetical just above,
+    // never applied here too.
+    include: /cash (flows? )?(\([^)]*\)\s*)?(from|provided by|generated (from|by)|used in|inflow|outflow).*operating|operating cash flow/i,
     exclude: /investing|financing|discontinued/i,
   },
   capex: {
