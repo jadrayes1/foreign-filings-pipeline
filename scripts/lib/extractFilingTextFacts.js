@@ -674,9 +674,33 @@ function monthSpanToQuarterMonths(startMonth, startDay, endMonth, endDay, year) 
   return null;
 }
 
-function parseTableColumns($, table) {
+// Standard calendar-aligned quarter/year end for a known duration, used as
+// a LAST-RESORT fallback (see both call sites below) when a header gives a
+// real duration but no way to date it at all. Never applied blindly for a
+// non-calendar fiscal year (e.g. BMO's Oct 31 year end) -- a wrong guess
+// here just lands the point at a date real annual XBRL has no match for,
+// so it fails Check A/B/C reconciliation and is silently dropped rather
+// than published wrong.
+const CALENDAR_QUARTER_END_BY_MONTHS = { 3: 'March 31', 6: 'June 30', 9: 'September 30', 12: 'December 31' };
+
+function parseTableColumns($, table, externalPeriodPhrase) {
   const rows = $(table).find('tr').toArray();
-  let periodPhrases = null;
+  // A NINTH header shape, verified live: CPA's real cash-flow statement
+  // states its period entirely OUTSIDE the <table> -- "Consolidated
+  // statement of cash flows" / "For the six months ended" / "(In US$
+  // thousands)" are three separate sibling <div>s sitting BEFORE the
+  // table even starts, whose own first row is already the bare "2026 |
+  // 2025" year pair. Every other phrase-based shape this function already
+  // handles has the phrase living in one of the TABLE's own rows -- this
+  // function only ever looks at $(table)'s own <tr>s, so it can never see
+  // a phrase that lives in a preceding sibling <div> no matter how the
+  // row-by-row search below is extended. The caller (extractStatement)
+  // scans the elements between the heading and this table for exactly
+  // this shape and passes the phrase text through here; seeding
+  // periodPhrases with it up front is equivalent to the table having
+  // disclosed that phrase in its own first row, so every existing
+  // pendingMonthDays/dateCells branch below needs no further change.
+  let periodPhrases = externalPeriodPhrase ? [externalPeriodPhrase] : null;
   // A FOURTH header shape, verified live: Eldorado Gold (EGO) splits the
   // date across its OWN separate row - a bare "June 30," with no year at
   // all - sitting between the period-length row ("Three months ended")
@@ -768,17 +792,16 @@ function parseTableColumns($, table) {
     // the identical generic mechanism every other filer's 3mo+cumulative
     // row shape already uses.
     if (!periodPhrases) {
-      const QUARTER_END_MONTH_DAYS = ['March 31', 'June 30', 'September 30', 'December 31'];
       const primaryQuarterMatch = cells.map((c) => c.text.trim().match(/^([1-4])Q(\d{2})$/)).find(Boolean);
       const primaryQuarterNum = primaryQuarterMatch ? Number(primaryQuarterMatch[1]) : null;
       const compactQuarterCells = cells
         .map((c) => {
           const text = c.text.trim();
           const q = text.match(/^([1-4])Q(\d{2})$/);
-          if (q) return { months: 3, endMonthDay: QUARTER_END_MONTH_DAYS[Number(q[1]) - 1], year: `20${q[2]}` };
+          if (q) return { months: 3, endMonthDay: CALENDAR_QUARTER_END_BY_MONTHS[Number(q[1]) * 3], year: `20${q[2]}` };
           const ytd = primaryQuarterNum ? text.match(/^YTD(\d{2})$/) : null;
           if (ytd) {
-            return { months: primaryQuarterNum * 3, endMonthDay: QUARTER_END_MONTH_DAYS[primaryQuarterNum - 1], year: `20${ytd[1]}` };
+            return { months: primaryQuarterNum * 3, endMonthDay: CALENDAR_QUARTER_END_BY_MONTHS[primaryQuarterNum * 3], year: `20${ytd[1]}` };
           }
           return null;
         })
@@ -840,7 +863,24 @@ function parseTableColumns($, table) {
       const columns = dateCells.map((date, idx) => {
         const phrase = periodPhrases[Math.floor(idx / yearsPerPeriod)];
         const pendingMonthDay = pendingMonthDays ? pendingMonthDays[Math.floor(idx / yearsPerPeriod)] : null;
-        const endMonthDay = date.monthDay || pendingMonthDay || phrase.endMonthDay;
+        // CPA's real cash-flow-statement header, verified live: "For the six
+        // months ended" sits on its own row with no trailing date at all
+        // ("ended" is followed by nothing, not "ended June 30"), and the
+        // ONLY other header row is a bare "2026 | 2025" year pair -- no
+        // month/day ever appears anywhere in this header, unlike every
+        // other phrase-based filer already handled (which either states the
+        // date inline in the phrase itself, or carries a separate bare-
+        // month-day row). Without a last-resort fallback here, endMonthDay
+        // stays null for every column and this whole table (and every
+        // concept it holds -- OCF/capex here) is silently unextractable.
+        // Falling back to the phrase's own stated duration's standard
+        // calendar-aligned end (3mo->Mar 31, 6mo->Jun 30, etc.) is safe to
+        // guess here specifically because it's the LAST option tried, after
+        // every stronger real-date source already failed -- a wrong guess
+        // for a non-calendar fiscal year just can't match any real annual
+        // XBRL date and fails Check A/B/C reconciliation harmlessly, same
+        // as any other unverified candidate in this file.
+        const endMonthDay = date.monthDay || pendingMonthDay || phrase.endMonthDay || CALENDAR_QUARTER_END_BY_MONTHS[phrase.months];
         return endMonthDay ? { months: phrase.months, endMonthDay, year: date.year } : null;
       });
       if (columns.some((c) => !c)) continue; // neither row carries a date for some column — bail on this row, try the next
@@ -1103,8 +1143,8 @@ function resolveConceptCandidates(list, concept, valueKey) {
   return null;
 }
 
-function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS) {
-  const parsed = parseTableColumns($, table);
+function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS, externalPeriodPhrase = null) {
+  const parsed = parseTableColumns($, table, externalPeriodPhrase);
   if (!parsed) return null;
   const { columns, dataStartRowIdx } = parsed;
 
@@ -1469,6 +1509,25 @@ function findStatementTables($, allEls, headingIdx) {
   return candidates;
 }
 
+// Scans the elements strictly between a statement's heading and its data
+// table for a standalone period-phrase leaf (e.g. CPA's own separate "For
+// the six months ended" <div>, sitting between the "Consolidated statement
+// of cash flows" heading and the table itself) -- see parseTableColumns'
+// own comment on why a phrase living outside the table can never be found
+// by that function's row-by-row search alone. Same leaf-ness/length rule
+// as the heading search above, so an unrelated container that merely
+// CONTAINS this wording somewhere deep inside doesn't false-match.
+function findExternalPeriodPhrase($, allEls, startIdx, endIdx) {
+  for (let i = startIdx; i < endIdx; i++) {
+    const $el = $(allEls[i]);
+    const text = $el.text();
+    if (!isHeadingLeaf($, $el) || text.length > MAX_HEADING_TEXT_LENGTH || !PERIOD_PHRASE_INDICATOR.test(text)) continue;
+    const parsed = parsePeriodPhrase(text);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
 // Locates a statement's heading + immediately-following <table> in a big
 // combined document (press release or formal financial-statements exhibit
 // — STNG/IAG/CNQ/AEM style), then delegates to extractFromTable.
@@ -1504,7 +1563,9 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap, cumulativeFa
   let merged = null;
   for (const headingIdx of headingIdxs) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
-      const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts);
+      const tableIdx = allEls.indexOf(table);
+      const externalPeriodPhrase = tableIdx > headingIdx ? findExternalPeriodPhrase($, allEls, headingIdx + 1, tableIdx) : null;
+      const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts, externalPeriodPhrase);
       if (!result) continue;
       if (!merged) merged = result;
       else merged = { period: merged.period, facts: { ...result.facts, ...merged.facts } };
