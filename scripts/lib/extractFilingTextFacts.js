@@ -2807,9 +2807,36 @@ function decumulateNestedCandidates(points) {
   // it entirely if the known pieces already tile its whole range. A no-op
   // for the common case (no cross-group overlap), so this can't regress a
   // ticker that never had this shape to begin with.
+  //
+  // MAX_NARROW_ITERATIONS is a hard safety valve, not a normal control-flow
+  // bound -- verified live this is a REAL, not theoretical, risk: GIL
+  // (Gildan Activewear, 25 years of 40-F/6-K filings -- an order of
+  // magnitude more candidate points per concept than a typical filer this
+  // was designed against) OOM-crashed the whole pipeline (confirmed via
+  // local reproduction: RSS climbed from ~330MB to 2GB+ in under 3 minutes,
+  // no plateau) because this loop restarts its ENTIRE scan from scratch on
+  // every single mutation, and for a large-enough candidate set with real,
+  // messy overlap (restated/re-disclosed figures across dozens of filings),
+  // it never reliably reaches a fixed point where nothing narrows further.
+  // Each restart also allocates a new object whose `derivedFrom` chains
+  // back through every prior iteration, so a stuck loop grows memory, not
+  // just CPU time. Bounded relative to input size (every point should need
+  // narrowing at most a small constant number of times in the sane case
+  // this was actually designed for) so normal filers are completely
+  // unaffected -- hitting the cap just means whatever's left unresolved
+  // stays as-is and falls through to reconcilePoints' own checks below,
+  // same as if pass 2 had never run at all (safe: this can only mean a
+  // point that COULD have been recovered doesn't get published, never that
+  // something wrong gets published).
+  const MAX_NARROW_ITERATIONS = Math.max(50, points.length * 4);
+  let narrowIterations = 0;
   let narrowed = true;
   while (narrowed) {
     narrowed = false;
+    if (++narrowIterations > MAX_NARROW_ITERATIONS) {
+      console.error(`decumulateNestedCandidates: hit MAX_NARROW_ITERATIONS (${MAX_NARROW_ITERATIONS}) with ${result.length} points remaining -- stopping early rather than risk an unbounded loop.`);
+      break;
+    }
     for (const wide of result) {
       const others = result.filter((p) => p !== wide);
       let cursor = wide.start;
