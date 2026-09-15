@@ -1209,7 +1209,7 @@ async function processTicker(symbol, cik, isBank) {
           capex: capexRaw,
         });
         try {
-          filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts);
+          filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts, symbol);
         } catch (err) {
           console.warn(`  filing-text fallback failed for ${symbol}: ${err.message}`);
         }

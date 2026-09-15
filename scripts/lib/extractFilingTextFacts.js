@@ -74,6 +74,23 @@ const MAX_20F_FILINGS_TO_SCAN = 3;
 // (the highest routine ceiling seen so far) while now also comfortably
 // below IMPP's real ~189-190K filings.
 const MIN_SUBSTANTIVE_FILING_BYTES = 160000;
+// Per-filer override for the global threshold above -- needed because a
+// single byte cutoff can't always separate one filer's real filings from
+// another's routine ones when their size profiles overlap. Verified live:
+// CAAS's real Q3'25 (146,056-byte exhibit) and Q2'26 (136,014-byte exhibit)
+// earnings releases -- both confirmed genuine via real "Three/Nine Months
+// Ended"/"Net income" tables -- sit BELOW the global threshold entirely
+// (submission totals 157,276 and 148,382 bytes), while its own routine
+// filings (merger/listing notices) top out at 55,388 bytes -- a clean gap,
+// just one this filer's real filings don't clear the shared 160,000 floor
+// tuned for CMBT's higher 149,098-byte routine ceiling. Only add an entry
+// after confirming (like CAAS above) that the filer's own real filings and
+// routine filings are cleanly separable at the chosen value -- same
+// hand-verified-only philosophy as CIK_CONTINUITY_ALIASES/FDIC_BANK_CERTS
+// elsewhere in this codebase, never an automatic per-filer heuristic.
+const MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES = {
+  CAAS: 100000, // comfortably above its 55,388-byte routine ceiling, below its 146,056-byte real floor
+};
 const FILING_LOOKBACK_ENTRIES = 400; // how far into submissions.json's 'recent' list to look for size-qualifying candidates
 const MIN_EXHIBIT_BYTES = 20000; // cover-page heuristic — verified live: STNG's 6-K cover page was 11,450 bytes, its real earnings exhibit 733,171 bytes
 const RECONCILE_TOLERANCE = 0.02; // 2%
@@ -1906,15 +1923,16 @@ async function fetchFilingSummaryReports(cik, accessionNumber, userAgent) {
  * extractFactSeries, ready to merge into the caller's raw fact arrays
  * before dedupeAndClassify runs.
  */
-async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd, userAgent, cumulativeFallbackConcepts) {
+async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd, userAgent, cumulativeFallbackConcepts, symbol) {
   const submissions = await fetchJsonSec(`${SEC_SUBMISSIONS_BASE}/CIK${cik}.json`, userAgent);
   if (!submissions?.filings?.recent) return {};
 
+  const minSubstantiveBytes = MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES[symbol] ?? MIN_SUBSTANTIVE_FILING_BYTES;
   const r = submissions.filings.recent;
   const filings = [];
   for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN; i++) {
     const size = r.size?.[i];
-    if (r.form[i] === '6-K' && (size == null || size >= MIN_SUBSTANTIVE_FILING_BYTES)) {
+    if (r.form[i] === '6-K' && (size == null || size >= minSubstantiveBytes)) {
       filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
     }
   }
