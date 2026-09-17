@@ -502,7 +502,21 @@ const FETCH_TIMEOUT_MS = 30000;
 // to be in flight simultaneously (a slow response from one ticker's
 // request no longer blocks a totally independent one), while still
 // enforcing a safe minimum spacing between request starts.
-const MIN_REQUEST_INTERVAL_MS = 150; // ~6.7 req/sec aggregate — comfortable margin under SEC's ~10 req/sec fair-use guidance
+// Widened from 150 -- root-caused live 2026-09-17: the scheduled full run
+// (generate-foreign-filings-cache.yml) has been hitting its 350-minute
+// timeout on real, observed pace (700/764 tickers processed before
+// cancellation, both 2026-09-15 and 2026-09-16 runs) — 350 is already
+// within ~10 minutes of GitHub Actions' own 360-minute hard ceiling for a
+// single job on standard runners, so raising timeout-minutes further isn't
+// a real option. This IS the dominant bottleneck (per this function's own
+// design note above: workers spend most of their time blocked here, not on
+// other CPU-bound work), so tightening it directly cuts wall-clock time
+// roughly proportionally. 120ms -> ~8.3 req/sec, still a real ~17% margin
+// under SEC's own ~10 req/sec fair-use guidance (previously ~33% margin at
+// 150ms) -- a deliberate, modest trade of unused headroom for enough extra
+// throughput (~20%) to comfortably clear the full 764-ticker universe
+// within the existing timeout, without ever exceeding SEC's stated limit.
+const MIN_REQUEST_INTERVAL_MS = 120; // ~8.3 req/sec aggregate — still a real margin under SEC's ~10 req/sec fair-use guidance
 let requestChain = Promise.resolve();
 let lastRequestStartedAt = 0;
 
