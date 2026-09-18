@@ -1419,6 +1419,10 @@ async function processTicker(symbol, cik, isBank) {
   const ttm = {};
 
   if (revenue.quarterly.length) {
+    if (process.env.DEBUG_TTM_REVENUE === symbol) {
+      console.error('DEBUG revenue.quarterly for', symbol, JSON.stringify(revenue.quarterly.map((q) => ({ start: q.start, end: q.end, value: q.value }))));
+      console.error('DEBUG trailing windows for', symbol, JSON.stringify(buildTrailingWindows(revenue.quarterly, 4).map((w) => ({ anchorEnd: w.anchor.end, partial: w.partial, n: w.quarters.length }))));
+    }
     const rgQ = buildRevenueGrowthTrend(revenue.quarterly);
     if (rgQ.length) quarterly.revenueGrowth = rgQ;
     const rgTtm = buildRevenueGrowthTTMTrend(revenue.quarterly);
