@@ -30,6 +30,19 @@ on:
 permissions:
   contents: read
 
+# Shares a concurrency group with every other gist-publisher in this repo --
+# see generate-foreign-filings-cache.yml's own header for the full
+# root-cause history (verified live 2026-09-18: a bare `gh gist edit`, this
+# workflow's own publish step until now, was found to silently revert a
+# verified-successful git push from a DIFFERENT repository's publisher,
+# since its REST-API read-modify-write has no compare-and-swap the way
+# git's own force-with-lease does). The git-clone + force-with-lease +
+# retry pattern below is the actual cross-repo-safe mechanism; this group
+# is just an optimization against same-repo contention.
+concurrency:
+  group: foreign-filings-gist-publish
+  cancel-in-progress: false
+
 jobs:
   discover:
     runs-on: ubuntu-latest
@@ -49,7 +62,34 @@ jobs:
 
       - name: Publish to gist
         env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          gh gist edit "${{ secrets.GIST_ID }}" --filename foreignFilerList.json foreignFilerList.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add foreignFilerList.json
+          set -e
+          CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
+          attempt=1
+          while true; do
+            rm -rf gist-clone
+            git clone --depth 1 "$CLONE_URL" gist-clone
+            if diff -q foreignFilerList.json gist-clone/foreignFilerList.json >/dev/null 2>&1; then
+              echo "No changes to publish."
+              break
+            fi
+            EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+            cp foreignFilerList.json gist-clone/foreignFilerList.json
+            ( cd gist-clone
+              git config user.email "actions@github.com"
+              git config user.name "foreign-filings-pipeline"
+              git checkout --orphan latest-snapshot
+              git add -A
+              git commit -m "Update foreign filer list $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              git branch -M main
+              git push --force-with-lease="main:${EXPECTED_SHA}" origin main
+            ) && { echo "Published on attempt $attempt."; break; }
+            attempt=$((attempt + 1))
+            if [ "$attempt" -gt 5 ]; then
+              echo "::error::Publish rejected 5 times in a row -- the gist kept changing underneath this run. Not forcing; re-dispatch once things settle."
+              exit 1
+            fi
+            echo "Push rejected (remote moved since clone) — retrying (attempt ${attempt}/5)..."
+          done

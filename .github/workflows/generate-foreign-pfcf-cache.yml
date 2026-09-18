@@ -50,6 +50,20 @@ permissions:
   contents: read
   issues: write
 
+# Shares a concurrency group with every other gist-publisher in this repo --
+# see generate-foreign-filings-cache.yml's own header for the full
+# root-cause history of why a bare `gh gist edit` (both this workflow's
+# publish steps, until now) could silently revert a fresher publish from
+# any other writer -- especially relevant here, since pfcfTrendCache.json
+# below is SHARED with stock-metrics-pipeline's own generate-pfcf-trend-
+# cache.yml (a DIFFERENT repository -- a same-repo concurrency group alone
+# could never have protected that file). The git-clone + force-with-lease +
+# retry pattern below is the actual cross-repo-safe mechanism; this group
+# is just an optimization against same-repo contention.
+concurrency:
+  group: foreign-filings-gist-publish
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest
@@ -79,30 +93,49 @@ jobs:
           node -e "const d = require('./foreignPfcfCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, JSON.stringify(d[s]));"
           node -e "const d = require('./pfcfTrendCache.json').trends; for (const s of (process.env.TARGET_SYMBOL || '').split(',').filter(Boolean)) console.log(s, 'pe:', JSON.stringify(d[s]?.pe));"
 
+      # pfcfTrendCache.json is the DOMESTIC pipeline's own file (11+MB) --
+      # this script only ever touches the `.pe` key of the foreign tickers
+      # it itself processed (see the script's own comments near
+      # GIST_PFCF_TREND_URL/OUTPUT_PE_FILE), so publishing it here is
+      # additive to whatever the domestic pipeline's own runs already
+      # wrote, never a wholesale replace. Both files committed together so
+      # a rejected push retries both from the same fresh clone.
       - name: Publish to gist
         if: ${{ !inputs.dryRun }}
         env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          gh gist edit "${{ secrets.GIST_ID }}" --filename foreignPfcfCache.json foreignPfcfCache.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add foreignPfcfCache.json
-
-      # pfcfTrendCache.json is the DOMESTIC pipeline's own file (11+MB, also
-      # published there via plain `gh gist edit`, verified to handle files
-      # well past the Gists REST API's 1MB inline-content limit since that
-      # path uploads full raw content, not through the truncating API
-      # field) -- this script only ever touches the `.pe` key of the
-      # foreign tickers it itself processed (see the script's own comments
-      # near GIST_PFCF_TREND_URL/OUTPUT_PE_FILE), so publishing it here is
-      # additive to whatever the domestic pipeline's own runs already
-      # wrote, never a wholesale replace.
-      - name: Publish P/E to gist (shared file with the domestic pipeline)
-        if: ${{ !inputs.dryRun }}
-        env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
-        run: |
-          gh gist edit "${{ secrets.GIST_ID }}" --filename pfcfTrendCache.json pfcfTrendCache.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add pfcfTrendCache.json
+          set -e
+          CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
+          attempt=1
+          while true; do
+            rm -rf gist-clone
+            git clone --depth 1 "$CLONE_URL" gist-clone
+            if diff -q foreignPfcfCache.json gist-clone/foreignPfcfCache.json >/dev/null 2>&1 && \
+               diff -q pfcfTrendCache.json gist-clone/pfcfTrendCache.json >/dev/null 2>&1; then
+              echo "No changes to publish."
+              break
+            fi
+            EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+            cp foreignPfcfCache.json gist-clone/foreignPfcfCache.json
+            cp pfcfTrendCache.json gist-clone/pfcfTrendCache.json
+            ( cd gist-clone
+              git config user.email "actions@github.com"
+              git config user.name "foreign-filings-pipeline"
+              git checkout --orphan latest-snapshot
+              git add -A
+              git commit -m "Update foreign P/FCF + P/E cache $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              git branch -M main
+              git push --force-with-lease="main:${EXPECTED_SHA}" origin main
+            ) && { echo "Published on attempt $attempt."; break; }
+            attempt=$((attempt + 1))
+            if [ "$attempt" -gt 5 ]; then
+              echo "::error::Publish rejected 5 times in a row -- the gist kept changing underneath this run. Not forcing; re-dispatch once things settle."
+              exit 1
+            fi
+            echo "Push rejected (remote moved since clone) — retrying with a fresh fetch (attempt ${attempt}/5)..."
+          done
 
       - name: Report failure
         if: failure()
