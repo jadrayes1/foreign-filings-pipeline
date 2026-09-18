@@ -255,10 +255,20 @@ const DERIVE_EBIT_FROM_EXPENSES_TICKERS = new Set(['HELP']);
 // looked at, even though every downstream consumer of this function
 // already dedupes overlapping (start,end) periods by most-recently-filed
 // (see dedupeAndClassify's byPeriod Map) -- exactly the mechanism needed
-// to safely merge here too. Currency doesn't matter for the merge -- every
-// ratio computed below is dimensionless or a self-relative percentage, so
-// no cross-currency conversion is ever needed as long as a single
-// company's own concepts share one currency, which they do.
+// to safely merge here too.
+//
+// That original assumption -- "a single company's own concepts share one
+// currency" -- turned out to be FALSE for at least one real filer: verified
+// live for HTLM (HomesToLife Ltd, Singapore), whose Revenues concept is
+// tagged under BOTH SGD (its native currency, e.g. 3,333,058 for H1 2023)
+// AND USD (a translated convenience figure, e.g. 325,984,469 for FY2023) --
+// blindly merging every unit meant a ratio (like revenueGrowth) computed
+// across two periods could silently divide a USD-denominated value by an
+// SGD-denominated one, a >100x-magnitude currency mismatch masquerading as
+// a real percentage. Fixed by picking ONE unit per concept -- USD when
+// tagged (the natural comparison currency for a US-listed security),
+// falling back to whichever single unit IS present otherwise -- rather
+// than merging every currency a filer happens to also tag.
 function extractFactSeries(companyFacts, conceptCandidates) {
   const merged = [];
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
@@ -267,9 +277,10 @@ function extractFactSeries(companyFacts, conceptCandidates) {
     for (const concept of conceptCandidates) {
       const entry = facts[concept];
       if (!entry?.units) continue;
-      for (const unitFacts of Object.values(entry.units)) {
-        if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
-      }
+      const unitKeys = Object.keys(entry.units);
+      const preferredUnit = unitKeys.includes('USD') ? 'USD' : unitKeys[0];
+      const unitFacts = entry.units[preferredUnit];
+      if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
     }
   }
   return merged;
