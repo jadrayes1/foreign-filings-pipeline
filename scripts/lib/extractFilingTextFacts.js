@@ -294,6 +294,22 @@ const LABEL_ALIASES = {
     include: /(income|profit|earnings)\s*(\(loss\))?\s*before (income )?tax|pre-?tax (income|loss)/i,
     exclude: /per share|margin|growth/i,
   },
+  // EBIT proxy of last resort, ONLY requested for a hand-curated allowlist
+  // (DERIVE_EBIT_FROM_EXPENSES_TICKERS in generateForeignFilingsCache.js)
+  // -- a filer with genuinely zero revenue whose statement has no
+  // operating-income/pretax-income line at all (verified live: Cybin Inc./
+  // HELP goes straight from TOTAL EXPENSES to NET LOSS FOR THE PERIOD, via
+  // a non-operating "OTHER INCOME (EXPENSES)" section in between). For a
+  // company with $0 revenue, -(TOTAL EXPENSES) IS the operating loss
+  // exactly, not an approximation -- but that equivalence only holds when
+  // revenue is genuinely absent, so this concept is deliberately never
+  // requested for a ticker not on that allowlist (each entry individually
+  // verified to have zero revenue before being added), rather than folded
+  // into ebit/pretaxIncome's own broader, ungated patterns.
+  totalExpenses: {
+    include: /total expenses?/i,
+    exclude: /per share|margin|growth/i,
+  },
   ocf: {
     // "inflow"/"outflow" added -- verified live: Scorpio Tankers (STNG,
     // Marshall Islands-domiciled) labels this line "Net cash inflow from
@@ -1973,7 +1989,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // identically in the filing that reports it AND, a year later, in the
   // filing that shows it as the prior-year comparative column - literal
   // agreement between two independent real documents.
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), totalExpenses: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -2049,7 +2065,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         // a genuinely separate note the way TNK does. Purely additive: a
         // filer whose shares row really is separate (TNK) still finds
         // nothing extra here and is unaffected.
-        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, shares: aliasMap.shares }).filter(([, v]) => v));
+        const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, totalExpenses: aliasMap.totalExpenses, shares: aliasMap.shares }).filter(([, v]) => v));
         const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
         // Balance-sheet (equity/debt/cash) R-files -- previously only ever
         // attempted via the slower exhibit-scan fallback below, even when
@@ -2139,7 +2155,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow, STATEMENT_HEADINGS.earningsPerShare]) {
         // shares included in incomeAliases too -- see the identical addition
         // (and its own comment) in the FilingSummary/R-file branch above.
-        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, shares: aliasMap.shares };
+        const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, totalExpenses: aliasMap.totalExpenses, shares: aliasMap.shares };
         const cashflowAliases = { ocf: aliasMap.ocf, capex: aliasMap.capex };
         const sharesAliases = { shares: aliasMap.shares };
         const relevantAliases =
@@ -2380,7 +2396,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
   }
   if (!filings.length) return {};
 
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), totalExpenses: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -2430,7 +2446,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
 
   // shares included in incomeAliases too -- see the identical addition (and
   // its own comment) in extractQuarterlyFactsFromFilings' R-file branch.
-  const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, shares: aliasMap.shares }).filter(([, v]) => v));
+  const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, totalExpenses: aliasMap.totalExpenses, shares: aliasMap.shares }).filter(([, v]) => v));
   const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
   const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
   const sharesAliases = Object.fromEntries(Object.entries({ shares: aliasMap.shares }).filter(([, v]) => v));

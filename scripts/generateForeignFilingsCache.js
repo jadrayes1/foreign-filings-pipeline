@@ -220,6 +220,23 @@ const DEBT_CONCEPTS = [
 ];
 const ROIC_ASSUMED_TAX_RATE = 0.21; // matches the main pipeline's own default simplification
 
+// Hand-curated allowlist, NOT a general pattern -- deriving EBIT as
+// -(TOTAL EXPENSES) is only mathematically exact when a filer's real
+// revenue is genuinely zero (no revenue to net against expenses in the
+// first place), and this pipeline can't verify that's true for every
+// ticker that might hit the same "no operating-income line" shape.
+// Verified live before adding: Cybin Inc. (HELP), a pre-revenue clinical-
+// stage psychedelic drug developer -- its real statement goes straight
+// from TOTAL EXPENSES to NET LOSS FOR THE PERIOD via a non-operating
+// "OTHER INCOME (EXPENSES)" section, with no operating-income or pretax-
+// income line anywhere (confirmed: EBIT_CONCEPTS/TAX_EXPENSE_CONCEPTS-
+// style patterns and this file's own ebit/pretaxIncome text-extraction
+// both come back empty). Add a ticker here only after independently
+// confirming (a) it has zero real revenue and (b) its real statement has
+// no usable operating-income/pretax-income line -- same verification bar
+// as generateSectorMetrics.js's own TIER1_ALSO_CORRUPTED_SYMBOLS.
+const DERIVE_EBIT_FROM_EXPENSES_TICKERS = new Set(['HELP']);
+
 // Searches ifrs-full first (what every foreign filer verified so far uses),
 // then us-gaap as a defensive fallback in case a filer mixes taxonomies —
 // returns the MERGED raw fact array (list of {start,end,val,filed,accn,
@@ -1152,6 +1169,11 @@ async function processTicker(symbol, cik, isBank) {
       // costs nothing extra -- same filings already being scanned either way.
       const ebitNeeded = needsFilingTextBackfill(ebit.quarterly, ebit.annual);
       if (ebitNeeded) needed.push('ebit', 'pretaxIncome');
+      // See DERIVE_EBIT_FROM_EXPENSES_TICKERS' own comment -- last-resort
+      // tier below ebit/pretaxIncome, only requested at all for the small
+      // hand-verified allowlist.
+      const deriveEbitFromExpenses = ebitNeeded && DERIVE_EBIT_FROM_EXPENSES_TICKERS.has(symbol.toUpperCase());
+      if (deriveEbitFromExpenses) needed.push('totalExpenses');
       if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) needed.push('ocf');
       if (needsFilingTextBackfill(capex.quarterly, capex.annual)) needed.push('capex');
 
@@ -1221,6 +1243,16 @@ async function processTicker(symbol, cik, isBank) {
         // have found nothing to merge, so this is the sole source for it.
         if (ebitNeeded && needsFilingTextBackfill(ebit.quarterly, ebit.annual) && filingTextFacts.pretaxIncome?.length) {
           ebit = dedupeAndClassify([...ebitRaw, ...filingTextFacts.pretaxIncome]);
+        }
+        // Last-resort tier below the pretaxIncome fallback just above --
+        // only reached when a DERIVE_EBIT_FROM_EXPENSES_TICKERS-allowlisted
+        // filer has NEITHER a real operating-income NOR pretax-income line
+        // (verified live: HELP). -(TOTAL EXPENSES) is real arithmetic, not
+        // an estimate, for a filer with genuinely zero revenue -- already
+        // went through the exact same reconcilePoints verification as
+        // every other text-extracted concept before reaching here.
+        if (deriveEbitFromExpenses && needsFilingTextBackfill(ebit.quarterly, ebit.annual) && filingTextFacts.totalExpenses?.length) {
+          ebit = dedupeAndClassify([...ebitRaw, ...filingTextFacts.totalExpenses.map((f) => ({ ...f, val: -f.val }))]);
         }
         if (filingTextFacts.ocf?.length) ocf = dedupeAndClassify([...ocfRaw, ...filingTextFacts.ocf]);
         // XBRL's capex concept is a positive magnitude (verified live:
