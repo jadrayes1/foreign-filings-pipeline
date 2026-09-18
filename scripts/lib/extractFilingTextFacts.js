@@ -148,8 +148,17 @@ const STATEMENT_HEADINGS = {
   // but that fix was never extended to the OTHER internal spaces in these
   // same patterns -- inconsistent, and exactly what HXHX's real document
   // tripped on next.
+  // "STATEMENTS OF LOSS (AND COMPREHENSIVE LOSS)?" added -- verified live:
+  // Cybin Inc. (HELP), a pre-revenue clinical-stage biotech, titles its
+  // real primary statement "Condensed Interim Consolidated Statements of
+  // Loss and Comprehensive Loss" -- a genuinely different phrase from
+  // "...of Profit or Loss" (already covered) or any "...INCOME" variant,
+  // since this filer never has income to report at all. Same misleading-
+  // hasIncome shape as BBUC/DOO above if left unfixed (a real net-loss
+  // figure sitting right there, unreachable because no heading pattern
+  // recognized its own statement's title).
   income:
-    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS)/i,
+    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
