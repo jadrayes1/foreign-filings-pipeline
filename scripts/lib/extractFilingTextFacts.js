@@ -771,6 +771,34 @@ function monthSpanToQuarterMonths(startMonth, startDay, endMonth, endDay, year) 
 // than published wrong.
 const CALENDAR_QUARTER_END_BY_MONTHS = { 3: 'March 31', 6: 'June 30', 9: 'September 30', 12: 'December 31' };
 
+// Returns a flat array of length itemCount, where result[idx] is the
+// period-phrase object that real date column idx belongs to — evenly
+// distributed when the count divides cleanly across periodPhrases (the
+// common case, matches the original "N years each" assumption exactly),
+// or proportionally by each phrase's own colspan when it doesn't (see
+// parseTableColumns' own call site for the real iQIYI case this exists
+// for). The proportional path requires EVERY phrase to carry a real
+// colspan > 1 — externalPeriodPhrases (a phrase stated outside the table
+// entirely, see extractStatement's own external-phrase handling) never
+// has one, and guessing a split for those would be a real regression
+// versus their current safe bail-out; requiring a genuine colspan keeps
+// this fallback scoped to phrases that actually came from a table
+// header cell. Returns null (caller treats as malformed, same as before
+// this fallback existed) whenever a clean division or a valid
+// proportional split isn't possible.
+function allocateItemsToPhrases(itemCount, periodPhrases) {
+  if (itemCount % periodPhrases.length === 0) {
+    const perPhrase = itemCount / periodPhrases.length;
+    return periodPhrases.flatMap((phrase) => Array(perPhrase).fill(phrase));
+  }
+  if (periodPhrases.some((p) => !(p.colspan > 1))) return null;
+  const totalColspan = periodPhrases.reduce((sum, p) => sum + p.colspan, 0);
+  const counts = periodPhrases.map((p) => Math.round((p.colspan / totalColspan) * itemCount));
+  counts[counts.length - 1] += itemCount - counts.reduce((a, b) => a + b, 0); // force exact total, absorb rounding drift in the last phrase
+  if (counts.some((c) => c <= 0)) return null;
+  return periodPhrases.flatMap((phrase, idx) => Array(counts[idx]).fill(phrase));
+}
+
 function parseTableColumns($, table, externalPeriodPhrases = []) {
   const rows = $(table).find('tr').toArray();
   // A NINTH header shape, verified live: CPA's real cash-flow statement
@@ -926,7 +954,7 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
     if (!periodPhrases) {
       const phraseCells = cells.filter((c) => PERIOD_PHRASE_INDICATOR.test(c.text));
       if (phraseCells.length) {
-        const parsed = phraseCells.map((c) => parsePeriodPhrase(c.text)).filter(Boolean);
+        const parsed = phraseCells.map((c) => ({ ...parsePeriodPhrase(c.text), colspan: c.colspan })).filter((p) => p.months != null);
         // A "years ended"/"twelve months ended" phrase in a Q4+FY combined
         // table often doesn't repeat its own end date -- verified live:
         // CANG's "For the years ended" carries no date at all, unlike its
@@ -943,7 +971,7 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
     }
     if (!pendingMonthDays) {
       const monthDayCells = cells.map((c) => parseBareMonthDayCell(c.text)).filter(Boolean);
-      if (monthDayCells.length === periodPhrases.length) {
+      if (monthDayCells.length) {
         pendingMonthDays = monthDayCells;
         continue;
       }
@@ -951,11 +979,48 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
 
     const dateCells = cells.map((c) => parseDateHeaderCell(c.text)).filter(Boolean);
     if (dateCells.length >= 2) {
-      if (dateCells.length % periodPhrases.length !== 0) continue; // malformed — try a later row rather than guess
-      const yearsPerPeriod = dateCells.length / periodPhrases.length;
+      // Assigns each real date column to its period phrase — evenly when
+      // possible (the common case), or proportionally by each phrase's own
+      // colspan when a phrase genuinely spans more real columns than its
+      // siblings. Verified live: iQIYI's real income statement has "Three
+      // Months Ended" (colspan 10) spanning THREE real date columns (June
+      // 30 2024, March 31 2025, June 30 2025 — a genuine same-document
+      // current/sequential/YoY quarterly comparison) alongside "Six Months
+      // Ended" (colspan 6) spanning only two (June 30 2024, June 30 2025) —
+      // 5 real columns across 2 phrases, not evenly divisible, previously
+      // rejected outright as malformed and silently blocking this table's
+      // extraction entirely (likely the same shape for other major Chinese
+      // ADRs using this same earnings-release convention — BABA/JD/PDD/NIO
+      // among them). Deliberately NOT a colspan-GRID-POSITION
+      // reconstruction (already tried and rejected elsewhere in this file
+      // for exactly this class of table — see parseBareMonthDayCell's own
+      // comment: real filers' rows have inconsistent leading/spacer cell
+      // counts that break naive position alignment even when both rows sum
+      // to the same total grid width) — this only uses each phrase's
+      // colspan as a relative WEIGHT to split real columns proportionally,
+      // which needs no spacer-cell alignment at all.
+      const phraseByIdx = allocateItemsToPhrases(dateCells.length, periodPhrases);
+      if (!phraseByIdx) continue; // can't sensibly assign — malformed, try a later row rather than guess
+
+      // pendingMonthDays carries one of two real shapes: (a) one bare
+      // month-day PER REAL DATE COLUMN already (iQIYI's case above — three
+      // columns under "Three Months Ended" genuinely have three DIFFERENT
+      // end-dates, so each is used directly, 1:1); or (b) the original,
+      // more common shape — one month-day SHARED per phrase (e.g. a filer
+      // whose "3mo"/"6mo" columns each share ONE period-end across all
+      // their years) — expanded across every column belonging to that
+      // phrase via the SAME phraseByIdx assignment used for duration.
+      let monthDayByIdx = null;
+      if (pendingMonthDays?.length === dateCells.length) {
+        monthDayByIdx = pendingMonthDays;
+      } else if (pendingMonthDays?.length === periodPhrases.length) {
+        const monthDayByPhrase = new Map(periodPhrases.map((p, idx) => [p, pendingMonthDays[idx]]));
+        monthDayByIdx = phraseByIdx.map((phrase) => monthDayByPhrase.get(phrase));
+      }
+
       const columns = dateCells.map((date, idx) => {
-        const phrase = periodPhrases[Math.floor(idx / yearsPerPeriod)];
-        const pendingMonthDay = pendingMonthDays ? pendingMonthDays[Math.floor(idx / yearsPerPeriod)] : null;
+        const phrase = phraseByIdx[idx];
+        const pendingMonthDay = monthDayByIdx ? monthDayByIdx[idx] : null;
         // CPA's real cash-flow-statement header, verified live: "For the six
         // months ended" sits on its own row with no trailing date at all
         // ("ended" is followed by nothing, not "ended June 30"), and the
