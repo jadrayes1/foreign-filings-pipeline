@@ -48,7 +48,7 @@
 # repository secret (already added) and set ENABLE_BUSINESSQUANT_FALLBACK=1
 # as an env var on the "Generate foreign filings cache" step below.
 #
-# SHARD 1 of 3 -- split from a single daily run 2026-09-18 after
+# SHARD 3 of 3 -- split from a single daily run 2026-09-18 after
 # foreignFilerList.json grew from 764 to 1108 tickers (+45%, a direct
 # side-effect of stock-metrics-pipeline's own ADR-universe fix finally
 # landing durably) pushed the real full-list runtime to ~11 hours at
@@ -67,11 +67,11 @@
 # header documents GitHub's observed 10-14hr scheduling-delay variance),
 # applied here preemptively rather than after a real collision.
 
-name: Generate foreign filings cache
+name: Generate foreign filings cache (shard 3/3)
 
 on:
   schedule:
-    - cron: '0 14 * * *'
+    - cron: '30 21 * * *'
   workflow_dispatch:
     inputs:
       symbol:
@@ -120,7 +120,7 @@ jobs:
       - name: Generate foreign filings cache
         env:
           ENABLE_FILING_TEXT_FALLBACK: '1'
-          SHARD_INDEX: '1'
+          SHARD_INDEX: '3'
           SHARD_COUNT: '3'
           TARGET_SYMBOL: ${{ inputs.symbol }}
           ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
@@ -151,7 +151,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const label = 'pipeline-failure';
+            const label = 'pipeline-failure-shard3';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const { data: open } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
@@ -170,7 +170,7 @@ jobs:
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: 'Foreign filings pipeline failed',
+                title: 'Foreign filings pipeline (shard 3/3) failed',
                 body: `The daily generation run failed.\n\nRun: ${runUrl}\n\nCheck the GIST_TOKEN and GIST_ID secrets, and SEC EDGAR's API status.`,
                 labels: [label],
               });
@@ -181,7 +181,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const label = 'pipeline-failure';
+            const label = 'pipeline-failure-shard3';
             const { data: open } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,

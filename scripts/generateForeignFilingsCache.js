@@ -1487,6 +1487,30 @@ async function main() {
     console.log(`${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK.`);
   }
 
+  // Shard the full list across multiple scheduled runs -- root-caused live
+  // 2026-09-18: foreignFilerList.json grew from 764 to 1108 tickers (+45%)
+  // almost overnight, a direct side-effect of stock-metrics-pipeline's own
+  // ADR-universe fix finally landing durably (its own gist-publish race
+  // fixed the same day -- see that repo's commit 107cc70) and feeding
+  // hundreds of newly-tracked ADR tickers into discoverForeignFilers.js's
+  // weekly sweep. At the observed real pace (500/1108 in 5 hours, one
+  // single-shard run), the full list would need ~11 hours -- nowhere near
+  // fitting in this job's 350-minute budget (already near GitHub Actions'
+  // own 360-minute hard ceiling for a standard-runner job), regardless of
+  // how much the request throttle is tuned (see MIN_REQUEST_INTERVAL_MS's
+  // own comment in extractFilingTextFacts.js -- that fix alone was correct
+  // but insufficient once the workload itself nearly doubled). Skipped
+  // entirely (no-op) whenever TARGET_SYMBOL is set, since a targeted debug/
+  // backfill dispatch must always be able to reach its requested ticker
+  // regardless of which shard it would otherwise fall into.
+  if (!process.env.TARGET_SYMBOL && process.env.SHARD_COUNT) {
+    const shardCount = Number(process.env.SHARD_COUNT);
+    const shardIndex = Number(process.env.SHARD_INDEX); // 1-based
+    const beforeShard = withCik.length;
+    withCik = withCik.filter((_, i) => i % shardCount === shardIndex - 1);
+    console.log(`SHARD_INDEX=${shardIndex}/${shardCount} — processing ${withCik.length} of ${beforeShard} tickers this run.`);
+  }
+
   // Manual single/multi-symbol override, same TARGET_SYMBOL pattern used
   // throughout this repo's sibling scripts -- bypasses the normal gap
   // list/rotation for fast, isolated debugging of specific tickers.
