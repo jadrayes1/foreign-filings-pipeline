@@ -83,7 +83,7 @@ on:
         required: false
         type: string
       debugFilingExtract:
-        description: 'Optional: set to 1 to trace per-filing discovery/extraction (DEBUG_FILING_EXTRACT) -- diagnostic only, temporary'
+        description: 'Optional: set to 1 to trace per-filing discovery/extraction (DEBUG_FILING_EXTRACT) -- useful when diagnosing why a specific ticker isn'"'"'t producing results'
         required: false
         type: string
 
