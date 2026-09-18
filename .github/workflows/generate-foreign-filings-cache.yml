@@ -82,6 +82,10 @@ on:
         description: 'Optional: set to 1 to also try the BusinessQuant last-resort fallback for this run (staged manual testing only -- see the header comment above)'
         required: false
         type: string
+      debugFilingExtract:
+        description: 'Optional: set to 1 to trace per-filing discovery/extraction (DEBUG_FILING_EXTRACT) -- diagnostic only, temporary'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -123,6 +127,7 @@ jobs:
           SHARD_INDEX: '1'
           SHARD_COUNT: '3'
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          DEBUG_FILING_EXTRACT: ${{ inputs.debugFilingExtract }}
           ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
           BUSINESSQUANT_API_KEY: ${{ secrets.BUSINESSQUANT_API_KEY }}
           FILING_TEXT_FALLBACK_TICKERS: ${{ inputs.enableBusinessQuant && inputs.symbol || '' }}
