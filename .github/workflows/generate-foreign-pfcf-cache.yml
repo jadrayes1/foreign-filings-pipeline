@@ -50,19 +50,21 @@ permissions:
   contents: read
   issues: write
 
-# Shares a concurrency group with every other gist-publisher in this repo --
-# see generate-foreign-filings-cache.yml's own header for the full
-# root-cause history of why a bare `gh gist edit` (both this workflow's
-# publish steps, until now) could silently revert a fresher publish from
-# any other writer -- especially relevant here, since pfcfTrendCache.json
-# below is SHARED with stock-metrics-pipeline's own generate-pfcf-trend-
-# cache.yml (a DIFFERENT repository -- a same-repo concurrency group alone
-# could never have protected that file). The git-clone + force-with-lease +
-# retry pattern below is the actual cross-repo-safe mechanism; this group
-# is just an optimization against same-repo contention.
-concurrency:
-  group: foreign-filings-gist-publish
-  cancel-in-progress: false
+# Deliberately NOT sharing the foreign-filings-gist-publish concurrency
+# group the other workflows in this repo use. Tried that first, but it
+# backfired live: GitHub Actions only keeps the NEWEST queued (not yet
+# started) run in a concurrency group, cancelling older queued ones -- and
+# this job's own daily schedule can land while a 3+ hour foreign-filings-
+# cache shard is running, so it got silently cancelled instead of just
+# delayed the very first time this happened (2026-09-19, the same day the
+# group was added). This job doesn't actually need that same-repo
+# serialization the way the other workflows do -- the git-clone +
+# force-with-lease + retry pattern below is what actually protects against
+# a real collision (including the cross-repo one with stock-metrics-
+# pipeline's own generate-pfcf-trend-cache.yml, which a same-repo group
+# could never have covered anyway), so running ungated here costs nothing
+# in safety and avoids this job being starved by unrelated, much longer
+# jobs in the same repo.
 
 jobs:
   generate:
