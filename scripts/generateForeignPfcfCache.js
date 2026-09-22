@@ -83,7 +83,25 @@ const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
 // constants, scaled to this workflow's 60-minute timeout (vs. that one's
 // 7-hour budget) and this universe's smaller size (~769 vs 1,500+).
 const MAX_TWELVEDATA_CALLS_PER_RUN = 700; // leaves buffer under Twelve Data's 800/day free-tier cap for this key
-const TIME_BUDGET_MS = 50 * 60 * 1000; // safety net alongside the call cap above; leaves headroom under the workflow's 60-minute timeout
+// Lowered from 50 to 40 minutes after a real 2026-09-22 incident: per-
+// ticker cost has been climbing run over run (50 tickers/run on 09-19 ->
+// 45 -> 32 -> 17) as the never-attempted queue increasingly consists of
+// tickers needing the expensive filing-text-extraction fallback rather
+// than a fast structured companyfacts call -- confirmed live via
+// discoverForeignFilers.js's own foreignFilerList.json entries for BILI/
+// CAN/NIU/VIPS/UXIN and 30+ other real tickers sitting at "never
+// attempted" despite being sorted first in every run's priority queue.
+// On 09-22 the 50-minute mark left too little headroom: the script's own
+// loop didn't even reach its internal check before the workflow's hard
+// 60-minute timeout killed the job outright -- verified via the run's own
+// step timeline, where "Generate foreign P/FCF cache" itself shows
+// conclusion "cancelled" and "Publish to gist" shows "skipped", meaning
+// that entire run's 17 processed tickers (16 resolved) were computed and
+// then silently discarded, never reaching the gist. A tighter budget
+// can't fully fix a single ticker being slow, but it reliably leaves the
+// install+publish steps (observed well under a minute in every normal
+// run) enough room to still execute even on a day this bad.
+const TIME_BUDGET_MS = 40 * 60 * 1000; // safety net alongside the call cap above; leaves headroom under the workflow's 60-minute timeout
 
 function readTwelveDataApiKey() {
   if (process.env.TWELVEDATA_FOREIGN_PIPELINE_API_KEY) return process.env.TWELVEDATA_FOREIGN_PIPELINE_API_KEY;
