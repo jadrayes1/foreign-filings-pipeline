@@ -746,7 +746,13 @@ function investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank) {
     const cash = isBank ? 0 : cashByEnd.get(e.end) || 0;
     const debt = debtByEnd.get(e.end) || 0;
     const investedCapital = debt + e.value - cash;
-    if (investedCapital > 0) map.set(e.end, investedCapital);
+    // Published even when negative (e.g. accumulated losses pushing book
+    // equity deeply negative with no offsetting debt) rather than excluded
+    // — see computeInvestedCapital's identical comment in the main
+    // pipeline's generateSectorMetrics.js. Every consumer below divides by
+    // Math.abs(...) so EBIT's own sign drives ROIC's sign. Only skip a
+    // genuine division-by-zero (exactly 0).
+    if (investedCapital !== 0) map.set(e.end, investedCapital);
   }
   return map;
 }
@@ -760,7 +766,8 @@ function buildRoicQuarterlyTrend(ebitQuarterly, investedCapitalMap) {
       // balance-sheet snapshot that doesn't shrink with it; see the
       // identical note in the main pipeline's buildRoicQuarterlyFromFilings.
       const annualizedNopat = q.value * (1 - ROIC_ASSUMED_TAX_RATE) * 4;
-      const value = clampImplausible(annualizedNopat / investedCapitalMap.get(q.end));
+      // Math.abs — see investedCapitalByEnd's own comment.
+      const value = clampImplausible(annualizedNopat / Math.abs(investedCapitalMap.get(q.end)));
       return value != null ? { label: quarterLabelFromDate(q.end), value } : null;
     })
     .filter(Boolean)
@@ -772,7 +779,8 @@ function buildRoicYearlyTrend(ebitAnnual, investedCapitalMap) {
     .filter((a) => investedCapitalMap.has(a.end))
     .map((a) => {
       const nopat = a.value * (1 - ROIC_ASSUMED_TAX_RATE);
-      const value = clampImplausible(nopat / investedCapitalMap.get(a.end));
+      // Math.abs — see investedCapitalByEnd's own comment.
+      const value = clampImplausible(nopat / Math.abs(investedCapitalMap.get(a.end)));
       return value != null ? { label: annualLabelFromDate(a.end), value } : null;
     })
     .filter(Boolean)
@@ -799,7 +807,8 @@ function buildRoicTTMTrend(ebitQuarterly, investedCapitalMap) {
       // that let a misleadingly-labeled "TTM" figure survive as the only
       // cadence with data for that ticker.
       const ttmNopat = partial ? rawNopat * (4 / quarters.length) : rawNopat;
-      const value = clampImplausible(ttmNopat / anchor.investedCapital);
+      // Math.abs — see investedCapitalByEnd's own comment.
+      const value = clampImplausible(ttmNopat / Math.abs(anchor.investedCapital));
       return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
     })
     .filter(Boolean)
