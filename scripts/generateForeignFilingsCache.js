@@ -67,6 +67,7 @@ const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 // identification; see https://www.sec.gov/os/webmaster-faq#developers
 const SEC_USER_AGENT = 'stock-analyzer-app foreign-filings-pipeline contact:jadrayescpp@gmail.com';
 const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
+const RECENCY_CUTOFF_MONTHS = 18; // mirrors the identical constant in stock-metrics-pipeline's generateSectorMetrics.js
 
 // A network interruption mid-request can leave a bare `fetch()` (no
 // default timeout) hanging forever rather than erroring — verified live
@@ -913,11 +914,56 @@ function sanitizeCadencePoints(cadence, points) {
   return points.filter((p) => !p.label || !p.label.startsWith("FY '"));
 }
 
+// Inverse of quarterLabelFromDate/annualLabelFromDate — turns a published
+// label back into an approximate date, for the staleness check below.
+// Mirrors the identical function in stock-metrics-pipeline's
+// generateSectorMetrics.js exactly.
+function parseLabelToApproxDate(label) {
+  if (!label) return null;
+  const yearMatch = label.match(/'(\d{2})$/);
+  if (!yearMatch) return null;
+  const year = 2000 + Number(yearMatch[1]);
+  const quarterMatch = label.match(/^Q([1-4])\s/);
+  if (quarterMatch) {
+    const quarterEndMonth = { 1: 2, 2: 5, 3: 8, 4: 11 }[Number(quarterMatch[1])]; // 0-indexed month of quarter-end
+    return new Date(Date.UTC(year, quarterEndMonth + 1, 0)); // last real day of that month
+  }
+  if (label.startsWith("FY '")) return new Date(Date.UTC(year, 11, 31));
+  return null;
+}
+
+// A label that fails to parse fails OPEN (treated as recent) — never
+// silently drop real data over a parsing gap. Mirrors the identical
+// function (and its reasoning) in generateSectorMetrics.js.
+function isRecentEnough(points, cutoffMonths = RECENCY_CUTOFF_MONTHS) {
+  if (!Array.isArray(points) || !points.length) return false;
+  const dates = points.map((p) => parseLabelToApproxDate(p.label)).filter(Boolean);
+  if (!dates.length) return true;
+  const cutoff = new Date();
+  cutoff.setUTCMonth(cutoff.getUTCMonth() - cutoffMonths);
+  return Math.max(...dates.map((d) => d.getTime())) >= cutoff.getTime();
+}
+
 // Per-(cadence, metric) merge-protection — a fresh run that comes back
 // empty or narrower for one specific cadence/metric combo (a transient SEC
 // hiccup for this filer) never overwrites a previously-published better
 // result for that same combo, mirroring pickCadenceTrendsToPublish in the
 // main pipeline's generatePfcfTrendCache.js.
+//
+// Verified live 2026-09-23: PDD's quarterly/ttm profitMargin/fcfMargin/roic
+// sat frozen at Q4 '20/Q4 '21 for years — pickTrendToPublish's union merge
+// (see its own comment) deliberately never drops an already-published
+// point, so once fresh extraction stopped finding anything newer for this
+// filer, the same handful of ancient points just kept re-publishing
+// forever with nothing to ever flag it as stale. No recency check existed
+// in this file at all (unlike generateSectorMetrics.js, which had one
+// built but disconnected from its real publish path — see that file's own
+// fix). Added here as a final gate on the MERGED result only (not a
+// pre-gate on existingPoints the way the domestic pipeline needs one):
+// this file's union merge already preserves any already-recent tail
+// untouched when fresh has nothing new, and correctly surfaces a fresh
+// recent point the moment extraction recovers, so checking only the final
+// picked array's own recency is sufficient here.
 function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   const existing = migrateLegacyEntry(existingEntry);
   const out = {};
@@ -926,7 +972,7 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
     for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin', 'roic']) {
       const existingPoints = sanitizeCadencePoints(cadence, existing[cadence]?.[key]);
       const picked = pickTrendToPublish(existingPoints, freshEntry?.[cadence]?.[key]);
-      if (picked.length) merged[key] = picked;
+      if (picked.length && isRecentEnough(picked)) merged[key] = picked;
     }
     if (Object.keys(merged).length) out[cadence] = merged;
   }
