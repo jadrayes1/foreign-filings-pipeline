@@ -1223,6 +1223,7 @@ async function processTicker(symbol, cik, isBank) {
       : null;
     if (!allowlist || allowlist.has(symbol.toUpperCase())) {
       const needed = [];
+      if (process.env.DEBUG_FILING_EXTRACT) console.error('DEBUG needed-check', symbol, 'revenue.quarterly=', JSON.stringify(revenue.quarterly), 'revenue.annual.length=', revenue.annual.length, 'lastAnnualEnd=', revenue.annual[revenue.annual.length - 1]?.end, 'needsFilingTextBackfill=', needsFilingTextBackfill(revenue.quarterly, revenue.annual));
       if (needsFilingTextBackfill(revenue.quarterly, revenue.annual)) needed.push('revenue');
       if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) needed.push('netIncome');
       // pretaxIncome requested WHENEVER ebit is, not just when ebit's own
