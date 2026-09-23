@@ -2328,6 +2328,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         const relevantAliases =
           heading === STATEMENT_HEADINGS.income ? incomeAliases : heading === STATEMENT_HEADINGS.cashflow ? cashflowAliases : sharesAliases;
         const filtered = Object.fromEntries(Object.entries(relevantAliases).filter(([, v]) => v));
+        if (debug) console.error('DEBUG filtered-aliases', url, 'heading===income', heading === STATEMENT_HEADINGS.income, 'aliasMap.revenue', !!aliasMap.revenue, 'filtered keys', Object.keys(filtered));
         if (!Object.keys(filtered).length) continue;
 
         for (const year of candidateYears) {
