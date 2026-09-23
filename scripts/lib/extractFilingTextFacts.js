@@ -251,7 +251,18 @@ const LABEL_ALIASES = {
     // AMBIGUOUS guard. Any company that periodically disposes of assets
     // (ships, mines, real estate, equipment) can have this exact same
     // "Gain on sale(s) of X" phrasing - not specific to STNG.
-    exclude: /cost of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on/i,
+    // "costs? of" (not just singular "cost of") -- verified live: PDD
+    // Holdings' real income statement labels its COGS line "Costs of
+    // revenues" (plural "Costs"), which /cost of/i does NOT match as a
+    // substring ("costs of" != "cost of") -- so this row survived as an
+    // unexcluded second candidate alongside the real "Revenues" line,
+    // making revenue AMBIGUOUS (2 different-valued candidates, no way to
+    // resolve) and silently dropping it entirely -- for every single
+    // quarter across 5 years, since this is PDD's standard label on every
+    // filing. The same earnings-release template is shared by VIPS/ZTO/
+    // likely other major Chinese ADRs (see the dual-currency table header
+    // fix's own comment on this file for the same shared-template pattern).
+    exclude: /costs? of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on/i,
   },
   netIncome: {
     // "net profit" added -- verified live: Copa Holdings (CPA) labels its
@@ -2328,7 +2339,12 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         const relevantAliases =
           heading === STATEMENT_HEADINGS.income ? incomeAliases : heading === STATEMENT_HEADINGS.cashflow ? cashflowAliases : sharesAliases;
         const filtered = Object.fromEntries(Object.entries(relevantAliases).filter(([, v]) => v));
-        if (debug) console.error('DEBUG filtered-aliases', url, 'heading===income', heading === STATEMENT_HEADINGS.income, 'aliasMap.revenue', !!aliasMap.revenue, 'filtered keys', Object.keys(filtered));
+        // Which concepts actually got REQUESTED for this heading -- useful
+        // when a concept was confirmed needed (see the caller's own
+        // 'needed-check' trace) but never shows up in this loop's
+        // extractStatement results below, narrowing whether the gap is in
+        // the request itself or in extractStatement's own label matching.
+        if (debug) console.error('DEBUG filtered-aliases', url, 'heading', heading === STATEMENT_HEADINGS.income ? 'income' : heading === STATEMENT_HEADINGS.cashflow ? 'cashflow' : 'shares', 'requested', Object.keys(filtered));
         if (!Object.keys(filtered).length) continue;
 
         for (const year of candidateYears) {

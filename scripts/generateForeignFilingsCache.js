@@ -1223,8 +1223,17 @@ async function processTicker(symbol, cik, isBank) {
       : null;
     if (!allowlist || allowlist.has(symbol.toUpperCase())) {
       const needed = [];
-      if (process.env.DEBUG_FILING_EXTRACT) console.error('DEBUG needed-check', symbol, 'revenue.quarterly=', JSON.stringify(revenue.quarterly), 'revenue.annual.length=', revenue.annual.length, 'lastAnnualEnd=', revenue.annual[revenue.annual.length - 1]?.end, 'needsFilingTextBackfill=', needsFilingTextBackfill(revenue.quarterly, revenue.annual));
-      if (needsFilingTextBackfill(revenue.quarterly, revenue.annual)) needed.push('revenue');
+      const revenueNeedsBackfill = needsFilingTextBackfill(revenue.quarterly, revenue.annual);
+      // Set DEBUG_FILING_EXTRACT=1 to see why a specific ticker's flow
+      // concepts are (or aren't) triggering the 6-K text fallback -- useful
+      // when a concept looks like it should need backfilling but the
+      // per-document extraction attempts never mention it (see
+      // extractQuarterlyFactsFromFilings' own 'filtered-aliases' trace for
+      // the next layer down).
+      if (process.env.DEBUG_FILING_EXTRACT) {
+        console.error('DEBUG needed-check', symbol, 'revenue.quarterly=', JSON.stringify(revenue.quarterly), 'revenue.annual.length=', revenue.annual.length, 'lastAnnualEnd=', revenue.annual[revenue.annual.length - 1]?.end, 'needsFilingTextBackfill=', revenueNeedsBackfill);
+      }
+      if (revenueNeedsBackfill) needed.push('revenue');
       if (needsFilingTextBackfill(netIncome.quarterly, netIncome.annual)) needed.push('netIncome');
       // pretaxIncome requested WHENEVER ebit is, not just when ebit's own
       // extraction fails -- verified live: Ardmore Shipping (ASC) has no
