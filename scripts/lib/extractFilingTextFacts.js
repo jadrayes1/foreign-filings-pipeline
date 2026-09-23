@@ -185,8 +185,23 @@ const STATEMENT_HEADINGS = {
   // hasIncome shape as BBUC/DOO above if left unfixed (a real net-loss
   // figure sitting right there, unreachable because no heading pattern
   // recognized its own statement's title).
+  // "SUMMARY OF ... INCOME DATA" / "... CASH FLOW DATA" added below --
+  // verified live: ZTO Express (ZTO)'s real quarterly earnings-release
+  // exhibit (a shared template with PDD/VIPS -- see the "costs? of" fix's
+  // own comment above) never uses a "STATEMENT(S) OF ..." caption at all
+  // for its primary tables -- they're titled "Summary of Unaudited
+  // Consolidated Comprehensive Income Data" and "Summary of Unaudited
+  // Consolidated Cash Flow Data" instead, a genuinely different word order
+  // ("Summary of ... Data" wrapping the statement name, not "Statement(s)
+  // of ..."). Without this, extractStatement's own per-heading search
+  // never located either table, even though the coarse whole-page
+  // hasIncome/hasCashflow flags happened to read true from unrelated text
+  // elsewhere in the same document -- the same misleading-hasIncome shape
+  // already documented above for BBUC/DOO. The real table gives ZTO's
+  // standalone "Three Months Ended" figures directly, side by side with
+  // the "Six Months Ended" cumulative column -- no decumulation needed.
   income:
-    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)/i,
+    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+(?:COMPREHENSIVE\s+)?INCOME\s+DATA/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
@@ -195,7 +210,8 @@ const STATEMENT_HEADINGS = {
   // mandatory-plural right next to it. hasCashflow was false for every one
   // of DHT's real documents as a result, so capex/ocf extraction never
   // even attempted to run for this filer.
-  cashflow: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS?\s+OF\s+CASH\s*FLOWS?/i,
+  cashflow:
+    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS?\s+OF\s+CASH\s*FLOWS?|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+CASH\s*FLOWS?\s+DATA/i,
   // Not anchored on "CONSOLIDATED" needing to be the very first word — same
   // reasoning as income/cashflow above (the regex isn't `^`-anchored, so
   // "Condensed Consolidated Balance Sheets" still matches via the
@@ -1352,6 +1368,23 @@ function resolveConceptCandidates(list, concept, valueKey) {
   if (concept === 'netIncome') {
     const nonComprehensive = distinct.filter((d) => !/comprehensive/i.test(d.label));
     if (nonComprehensive.length === 1) return { winner: nonComprehensive[0] };
+    // "attributable to" (the parent/ordinary-shareholders figure, excluding
+    // non-controlling interests) preferred over a plain whole-entity total
+    // -- verified live: ZTO Express (ZTO) shows both "Net income" (the
+    // whole-entity figure) and "Net income attributable to ZTO Express
+    // (Cayman) Inc." / "...attributable to ordinary shareholders" (the
+    // same real, smaller figure under two labels, already collapsed to one
+    // distinct candidate by the value-based dedup above) as two genuinely
+    // different values in the same statement. The parent-attributable
+    // figure is the one every profitMargin/EPS-style ratio conventionally
+    // means by "net income" (NCI's share isn't available to ordinary
+    // shareholders) -- a universal pattern for any filer with a
+    // non-wholly-owned subsidiary, not specific to ZTO. The exclude list
+    // above already drops an "...attributable to non-controlling
+    // interests" row before it ever reaches here; the negative lookahead
+    // is just a second, cheap guard against the same thing.
+    const attributableToParent = distinct.filter((d) => /attributable to (?!(non|minority))/i.test(d.label));
+    if (attributableToParent.length === 1) return { winner: attributableToParent[0] };
   }
   // revenue specifically: a filer can break revenue into several
   // sub-lines that don't roll up into a "Total ..."-prefixed row -- verified
