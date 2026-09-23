@@ -95,6 +95,34 @@ const FILING_LOOKBACK_ENTRIES = 400; // how far into submissions.json's 'recent'
 const MIN_EXHIBIT_BYTES = 20000; // cover-page heuristic — verified live: STNG's 6-K cover page was 11,450 bytes, its real earnings exhibit 733,171 bytes
 const RECONCILE_TOLERANCE = 0.02; // 2%
 
+// A TENTH header shape, verified live: PDD Holdings (and, by the same
+// filing-agent earnings-release template, VIPS/ZTO/likely many other major
+// Chinese ADRs) discloses each period in a real currency triple -- prior-
+// year RMB, current-year RMB, current-year US$ (a "for convenience only"
+// translation, standard SEC boilerplate for a foreign private issuer whose
+// functional currency isn't USD) -- under ONE shared year cell for the
+// current year: "2025"(colspan=2) "2026"(colspan=6)" | "RMB"(colspan=2)
+// "RMB"(colspan=2) "US$"(colspan=2)" -- so the date row's own cell COUNT
+// (2 per phrase) undercounts the real column count (3 per phrase) by
+// exactly the convenience-translation column, and every data row's real
+// value count (matching the 3-per-phrase reality) mismatches
+// parseDataRow's columns.length check, silently rejecting the entire
+// table. CURRENCY_CODE_CELL only matches a cell whose ENTIRE text is a
+// bare currency code/symbol -- never fires on ordinary label or value
+// cells, which always carry more than just a currency marker.
+const CURRENCY_CODE_CELL = /^(RMB|US\$|USD|HK\$|HKD|CN¥|CNY|EUR|€|GBP|£|JPY|¥|CAD|AUD|SGD|S\$)$/i;
+// The standard SEC "reader convenience" translation currency for a foreign
+// private issuer -- always the derived, secondary figure, mathematically
+// redundant with the native-currency column it's translated from. Verified
+// live: PDD's own document states this explicitly elsewhere ("translation
+// of Renminbi amounts into U.S. dollars...for the convenience of the
+// reader"). Dropped rather than kept since every downstream reconciliation
+// check in this file already assumes one consistent currency per concept
+// (see extractFactSeries' own currency-mixing fix in the sibling XBRL
+// path) -- keeping BOTH would silently blend RMB and USD magnitudes under
+// the same (months, year) key.
+const CONVENIENCE_TRANSLATION_CURRENCY = /^(US\$|USD)$/i;
+
 // "Earnings" as an income-statement synonym verified live: CNQ titles its
 // real income statement "CONSOLIDATED STATEMENTS OF EARNINGS" (distinct
 // from its separate "...OF COMPREHENSIVE INCOME" table, which only carries
@@ -786,16 +814,31 @@ const CALENDAR_QUARTER_END_BY_MONTHS = { 3: 'March 31', 6: 'June 30', 9: 'Septem
 // header cell. Returns null (caller treats as malformed, same as before
 // this fallback existed) whenever a clean division or a valid
 // proportional split isn't possible.
-function allocateItemsToPhrases(itemCount, periodPhrases) {
-  if (itemCount % periodPhrases.length === 0) {
-    const perPhrase = itemCount / periodPhrases.length;
-    return periodPhrases.flatMap((phrase) => Array(perPhrase).fill(phrase));
+// Splits itemCount real items across groups weighted by each group's own
+// colspan, either evenly (the common case) or proportionally when it
+// doesn't divide cleanly. Returns null when neither a clean division nor a
+// valid proportional split is possible (every weight must be > 1, and no
+// resulting count may be <= 0). Factored out of allocateItemsToPhrases
+// (behavior-preserving — identical checks/math, just returning counts
+// instead of already-expanded items) so the currency-triple expansion in
+// parseTableColumns below can reuse the exact same algorithm one level
+// deeper in the same header hierarchy (currency columns -> date columns,
+// same shape as date columns -> period phrases).
+function proportionalCounts(itemCount, weights) {
+  if (itemCount % weights.length === 0) {
+    return weights.map(() => itemCount / weights.length);
   }
-  if (periodPhrases.some((p) => !(p.colspan > 1))) return null;
-  const totalColspan = periodPhrases.reduce((sum, p) => sum + p.colspan, 0);
-  const counts = periodPhrases.map((p) => Math.round((p.colspan / totalColspan) * itemCount));
-  counts[counts.length - 1] += itemCount - counts.reduce((a, b) => a + b, 0); // force exact total, absorb rounding drift in the last phrase
+  if (weights.some((w) => !(w > 1))) return null;
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  const counts = weights.map((w) => Math.round((w / total) * itemCount));
+  counts[counts.length - 1] += itemCount - counts.reduce((a, b) => a + b, 0); // force exact total, absorb rounding drift in the last group
   if (counts.some((c) => c <= 0)) return null;
+  return counts;
+}
+
+function allocateItemsToPhrases(itemCount, periodPhrases) {
+  const counts = proportionalCounts(itemCount, periodPhrases.map((p) => p.colspan));
+  if (!counts) return null;
   return periodPhrases.flatMap((phrase, idx) => Array(counts[idx]).fill(phrase));
 }
 
@@ -977,7 +1020,17 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
       }
     }
 
-    const dateCells = cells.map((c) => parseDateHeaderCell(c.text)).filter(Boolean);
+    // colspan carried alongside each successfully-parsed date (not re-
+    // derived from `cells` by post-filter index, which would misalign the
+    // moment any cell in the row fails to parse as a date) -- unused by
+    // every existing code path below, only read by the currency-triple
+    // expansion further down.
+    const dateCells = cells
+      .map((c) => {
+        const d = parseDateHeaderCell(c.text);
+        return d ? { ...d, colspan: c.colspan } : null;
+      })
+      .filter(Boolean);
     if (dateCells.length >= 2) {
       // Assigns each real date column to its period phrase — evenly when
       // possible (the common case), or proportionally by each phrase's own
@@ -1042,6 +1095,45 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
         return endMonthDay ? { months: phrase.months, endMonthDay, year: date.year } : null;
       });
       if (columns.some((c) => !c)) continue; // neither row carries a date for some column — bail on this row, try the next
+
+      // Currency-triple expansion — see CURRENCY_CODE_CELL's own comment.
+      // Only the row IMMEDIATELY following the date row is checked (real
+      // filers always place the currency row directly under it, never with
+      // an intervening row), and only when EVERY cell in it is a bare
+      // currency code (never fires on an ordinary label/data row) with MORE
+      // of them than date columns (confirming a genuine undercounted split,
+      // not a coincidental currency-shaped label elsewhere).
+      const nextRowCells = i + 1 < rows.length ? nonEmptyCells($, rows[i + 1]) : [];
+      if (nextRowCells.length > columns.length && nextRowCells.every((c) => CURRENCY_CODE_CELL.test(c.text))) {
+        const distinctCurrencies = new Set(nextRowCells.map((c) => c.text.toUpperCase()));
+        const expandCounts =
+          distinctCurrencies.size >= 2 ? proportionalCounts(nextRowCells.length, dateCells.map((d) => d.colspan || 1)) : null;
+        if (expandCounts) {
+          const expandedColumns = [];
+          const keepIndices = [];
+          let cursor = 0;
+          for (let colIdx = 0; colIdx < columns.length; colIdx++) {
+            for (let k = 0; k < expandCounts[colIdx]; k++) {
+              const isConvenience = CONVENIENCE_TRANSLATION_CURRENCY.test(nextRowCells[cursor].text);
+              expandedColumns.push(columns[colIdx]);
+              if (!isConvenience) keepIndices.push(cursor);
+              cursor++;
+            }
+          }
+          // Degenerate case: every sub-column is USD (a foreign issuer
+          // whose functional/native currency actually IS USD already) —
+          // nothing real to drop, keep every expanded column rather than
+          // discarding all real data.
+          const finalKeepIndices = keepIndices.length ? keepIndices : expandedColumns.map((_, idx) => idx);
+          return {
+            columns: finalKeepIndices.map((idx) => expandedColumns[idx]),
+            dataStartRowIdx: i + 1,
+            rawColumnCount: nextRowCells.length,
+            valueIndices: finalKeepIndices,
+          };
+        }
+      }
+
       return { columns, dataStartRowIdx: i + 1 };
     }
   }
@@ -1304,7 +1396,12 @@ function resolveConceptCandidates(list, concept, valueKey) {
 function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS, externalPeriodPhrases = []) {
   const parsed = parseTableColumns($, table, externalPeriodPhrases);
   if (!parsed) return null;
-  const { columns, dataStartRowIdx } = parsed;
+  const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
+  // rawColumnCount/valueIndices are only ever set by parseTableColumns'
+  // currency-triple expansion (see CURRENCY_CODE_CELL) -- absent for every
+  // other header shape, where this is exactly the pre-existing behavior
+  // (parseDataRow validated against columns.length, values used as-is).
+  const parsedRowColumnCount = rawColumnCount ?? columns.length;
 
   const targetIdx3mo = columns.findIndex((c) => c.months === 3 && c.year === targetEndYear);
   // Same fiscal year's cumulative (6mo/9mo) column, if this table has one —
@@ -1360,11 +1457,12 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     if (/operating activities/i.test(rowText)) currentSection = 'operating';
     else if (/investing activities/i.test(rowText)) currentSection = 'investing';
     else if (/financing activities/i.test(rowText)) currentSection = 'financing';
-    const row = parseDataRow(cells, columns.length);
+    const row = parseDataRow(cells, parsedRowColumnCount);
     if (!row) {
       if (rowText.trim()) pendingSectionLabel = rowText.trim();
       continue;
     }
+    if (valueIndices) row.values = valueIndices.map((idx) => row.values[idx]);
     // A bare "Basic"/"Diluted" label means nothing by itself -- match
     // against it PREFIXED with the most recent header-only row's text
     // instead (see pendingSectionLabel's own comment above), so CNI's real
@@ -1463,7 +1561,10 @@ function detectTableScale($, table) {
 function extractAllAnnualColumnsFromTable($, table, aliasMap) {
   const parsed = parseTableColumns($, table);
   if (!parsed) return [];
-  const { columns, dataStartRowIdx } = parsed;
+  const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
+  // See extractFromTable's identical handling — only set by
+  // parseTableColumns' currency-triple expansion, a no-op otherwise.
+  const parsedRowColumnCount = rawColumnCount ?? columns.length;
   const annualIdxs = columns.map((c, i) => (c.months === 12 ? i : -1)).filter((i) => i !== -1);
   if (!annualIdxs.length) return [];
   const scale = detectTableScale($, table);
@@ -1487,8 +1588,9 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap) {
       else if (/investing activities/i.test(rowText)) currentSection = 'investing';
       else if (/financing activities/i.test(rowText)) currentSection = 'financing';
     }
-    const row = parseDataRow(cells, columns.length);
+    const row = parseDataRow(cells, parsedRowColumnCount);
     if (!row) continue;
+    if (valueIndices) row.values = valueIndices.map((idx) => row.values[idx]);
     if (scale !== 1) row.values = row.values.map((v) => v * scale);
 
     if (isSubtotalRow && currentSection) {
