@@ -293,7 +293,29 @@ const LABEL_ALIASES = {
     // before financial results and income tax", both real lines earlier
     // in the same statement.
     include: /net (income|earnings|loss|profit)\b|\bprofit \(loss\)\b|\bprofit for the (period|year)\b|\bincome for the (period|year)\b/i,
-    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b/i,
+    // "non-gaap" added -- verified live: Vipshop (VIPS)'s earnings release
+    // includes a real GAAP-to-non-GAAP reconciliation table with its own
+    // row, "Non-GAAP net income attributable to Vipshop's shareholders" --
+    // a genuinely different (adjusted) figure from the real GAAP "Net
+    // income attributable to Vipshop's shareholders" line, but one that
+    // matches BOTH the base include pattern AND the "attributable to
+    // (parent)" tiebreak below just as well, recreating the exact same
+    // ambiguity that tiebreak exists to resolve. Non-GAAP net income
+    // (excludes share-based comp, one-time items, etc.) is never the right
+    // input for a GAAP-basis profitMargin ratio regardless -- this is a
+    // routine disclosure for any Chinese ADR that reports a non-GAAP
+    // adjusted figure alongside GAAP, not specific to VIPS.
+    // "\bbasic\b|\bdiluted\b" added -- verified live: VIPS's real EPS rows
+    // are labeled "Net income attributable to Vipshop's shareholders--
+    // Basic"/"...--Diluted" (per-ADS dollar figures, e.g. 44.74) -- the
+    // existing "shares?\b" exclude doesn't catch these (the label says
+    // "shareholders", not "shares"/"share", and \b never matches mid-word
+    // after "share" in "shareholders"). Each Basic/Diluted row carries a
+    // genuinely different numeric value from the real aggregate net-income
+    // row and from each other, so without this they multiply the
+    // "attributable to (parent)" tiebreak's candidate count well past 1,
+    // defeating that tiebreak even after the non-GAAP exclude above.
+    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b|non-gaap|\bbasic\b|\bdiluted\b/i,
   },
   // ROIC's numerator (mirrors EBIT_CONCEPTS in generateForeignFilingsCache.js
   // -- ProfitLossFromOperatingActivities/ProfitLossBeforeTax). Verified
@@ -1536,6 +1558,7 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
   const results = {};
   for (const [concept, list] of Object.entries(candidates)) {
     const resolved = resolveConceptCandidates(list, concept, 'value3mo');
+    if (process.env.DEBUG_FILING_EXTRACT_CANDIDATES) console.error('DEBUG candidates', concept, JSON.stringify(list), '-> resolved:', JSON.stringify(resolved));
     if (!resolved) continue;
     if (resolved.winner) { results[concept] = resolved.winner; continue; }
     // capex-only sum (debt has no value3mo/valueCumulative shape — that's
