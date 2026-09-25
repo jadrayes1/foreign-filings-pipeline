@@ -150,6 +150,20 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
           set -e
+          # A crash the JS-level uncaughtException handler can't catch (a
+          # hard SIGKILL, most likely an OOM kill -- see generateForeignFilingsCache.js's
+          # own comment on its periodic mid-loop checkpoint write) could in
+          # principle still leave this file missing entirely if it happens
+          # before the very first checkpoint. Fail with a clear message here
+          # instead of letting `cp` crash on a missing source file with a
+          # confusing raw error -- verified live 2026-09-24/25: exactly this
+          # `cp: cannot stat 'foreignFilingsCache.json': No such file or
+          # directory` failure, with no indication anywhere in the log of
+          # what actually went wrong upstream.
+          if [ ! -f foreignFilingsCache.json ]; then
+            echo "::error::foreignFilingsCache.json was never written this run (the generate step likely crashed before its first checkpoint, e.g. an OOM kill -- see generateForeignFilingsCache.js's own comment). Nothing to publish; failing loudly (via the existing Report-failure issue) instead of the confusing raw 'cp: cannot stat' error, and instead of silently reporting success with nothing published."
+            exit 1
+          fi
           CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
           attempt=1
           while true; do

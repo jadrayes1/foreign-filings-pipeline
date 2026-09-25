@@ -1704,6 +1704,22 @@ async function main() {
         console.log(
           `  ${processed}/${withCik.length} processed (${resolved} resolved so far), heapUsed=${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB rss=${(mem.rss / 1024 / 1024).toFixed(0)}MB`
         );
+        // Checkpoint to disk here too, not just once at the very end --
+        // verified live 2026-09-25: a run reached 350/369 tickers with zero
+        // errors logged (no "skip X" lines, no uncaughtException message --
+        // onUncaught below never even fired) and then just stopped, the
+        // step still reporting success. The uncaughtException handler only
+        // guards what it can actually receive; a hard SIGKILL (the likely
+        // cause -- this repo's own OOM history: a 2026-09-10 crash at
+        // ~500/767 tickers with heap pinned near Node's default ceiling) is
+        // never delivered to ANY JS-level handler, so globalStop's own
+        // write-what-we-have-so-far path never got a chance to run either.
+        // A periodic write here means the worst case is losing only the
+        // last <=50 tickers' worth of work instead of the entire multi-hour
+        // run -- and it's what turns "Publish to gist" crashing on a
+        // missing file (cp: cannot stat...) into a merge of real, if
+        // slightly stale, data instead.
+        fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends }));
       }
     }
   }
