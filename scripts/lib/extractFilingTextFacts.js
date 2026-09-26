@@ -122,6 +122,22 @@ const CURRENCY_CODE_CELL = /^(RMB|US\$|USD|HK\$|HKD|CN¥|CNY|EUR|€|GBP|£|JPY|
 // path) -- keeping BOTH would silently blend RMB and USD magnitudes under
 // the same (months, year) key.
 const CONVENIENCE_TRANSLATION_CURRENCY = /^(US\$|USD)$/i;
+// An ELEVENTH header shape, verified live: IRSA Inversiones y
+// Representaciones (IRS) discloses each period in a real currency pair --
+// native ARS and a USD convenience translation -- but unlike PDD's shape
+// above (a shared year cell UNDERCOUNTING real columns, needing
+// expansion), IRSA's date row already has the CORRECT number of separate
+// cells (three: "2025" "2025" "2024", no colspan-sharing) -- the row right
+// below instead carries a GROUP label per currency, "(in millions of
+// USD)"(colspan=1) "(in millions of ARS)"(colspan=2), fewer cells than
+// date columns rather than more. Nothing distinguished the two same-
+// (months,year) "2025" columns, so targetIdx3mo's own findIndex just
+// grabbed the FIRST one (USD, ~94) over the real ARS figure (~129,259)
+// every time. Captures just the currency code, not a fixed alternation
+// list -- CONVENIENCE_TRANSLATION_CURRENCY below is what actually decides
+// USD vs. not, so this only needs to isolate the code, never validate
+// which native currency it is.
+const UNIT_CURRENCY_LABEL_CELL = /\(in\s+(?:thousands|millions|billions)\s+of\s+([A-Z][A-Z$€£¥]{1,4})\)/i;
 
 // "Earnings" as an income-statement synonym verified live: CNQ titles its
 // real income statement "CONSOLIDATED STATEMENTS OF EARNINGS" (distinct
@@ -1120,6 +1136,9 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
         monthDayByIdx = phraseByIdx.map((phrase) => monthDayByPhrase.get(phrase));
       }
 
+      if (process.env.DEBUG_PARSE_TABLE_COLUMNS) {
+        console.error('DEBUG parseTableColumns row', i, 'dateCells', JSON.stringify(dateCells), 'nextRow', i + 1 < rows.length ? JSON.stringify(nonEmptyCells($, rows[i + 1])) : 'N/A');
+      }
       const columns = dateCells.map((date, idx) => {
         const phrase = phraseByIdx[idx];
         const pendingMonthDay = monthDayByIdx ? monthDayByIdx[idx] : null;
@@ -1178,6 +1197,43 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
             columns: finalKeepIndices.map((idx) => expandedColumns[idx]),
             dataStartRowIdx: i + 1,
             rawColumnCount: nextRowCells.length,
+            valueIndices: finalKeepIndices,
+          };
+        }
+      }
+
+      // Currency GROUP-LABEL row — see UNIT_CURRENCY_LABEL_CELL's own
+      // comment for how this differs from the currency-triple expansion
+      // just above (fewer cells than date columns, using colspan to cover
+      // a group, rather than more cells needing expansion). columns.length
+      // is already correct here — this only ever DROPS columns, never
+      // expands them.
+      if (
+        nextRowCells.length &&
+        nextRowCells.length < columns.length &&
+        nextRowCells.every((c) => UNIT_CURRENCY_LABEL_CELL.test(c.text)) &&
+        nextRowCells.reduce((sum, c) => sum + (c.colspan || 1), 0) === columns.length
+      ) {
+        const keepIndices = [];
+        let cursor = 0;
+        for (const cell of nextRowCells) {
+          const span = cell.colspan || 1;
+          const isConvenience = CONVENIENCE_TRANSLATION_CURRENCY.test(cell.text.match(UNIT_CURRENCY_LABEL_CELL)[1]);
+          for (let k = 0; k < span; k++) {
+            if (!isConvenience) keepIndices.push(cursor);
+            cursor++;
+          }
+        }
+        // Degenerate case: every group is USD — nothing real to drop.
+        const finalKeepIndices = keepIndices.length ? keepIndices : columns.map((_, idx) => idx);
+        if (process.env.DEBUG_PARSE_TABLE_COLUMNS) {
+          console.error('DEBUG unit-currency-group MATCHED', JSON.stringify({ finalKeepIndices, columns }));
+        }
+        if (finalKeepIndices.length < columns.length) {
+          return {
+            columns: finalKeepIndices.map((idx) => columns[idx]),
+            dataStartRowIdx: i + 1,
+            rawColumnCount: columns.length,
             valueIndices: finalKeepIndices,
           };
         }
@@ -1958,6 +2014,17 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap, cumulativeFa
     const $el = $(allEls[i]);
     const text = $el.text();
     if (isHeadingLeaf($, $el) && text.length <= MAX_HEADING_TEXT_LENGTH && headingRegex.test(text)) headingIdxs.push(i);
+  }
+  if (process.env.DEBUG_EXTRACT_STATEMENT) {
+    console.error(
+      'DEBUG extractStatement headingIdxs',
+      headingIdxs.length,
+      headingIdxs.map((i) => JSON.stringify($(allEls[i]).text().trim().slice(0, 80)))
+    );
+    for (const headingIdx of headingIdxs) {
+      const tables = findStatementTables($, allEls, headingIdx);
+      console.error('DEBUG extractStatement headingIdx', headingIdx, 'tables found:', tables.length);
+    }
   }
   // A heading can appear more than once, for two different real reasons —
   // verified live for both: (1) IAG's financial-statements exhibit has a
