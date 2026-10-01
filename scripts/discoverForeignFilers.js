@@ -39,6 +39,7 @@ const path = require('path');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignFilerList.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
+const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignFilerList.json';
 const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
 const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 const SEC_USER_AGENT = 'stock-analyzer-app foreign-filings-pipeline contact:jadrayescpp@gmail.com';
@@ -121,30 +122,76 @@ async function detectForeignFilerTaxonomy(cik) {
 
 async function main() {
   console.log('Fetching ticker universe from the published sector-metrics feed and SEC ticker->CIK map...');
-  const [metricsDataset, tickerToCik] = await Promise.all([fetchJson(GIST_METRICS_URL), fetchTickerToCikMap()]);
+  // previousList is fetched and MERGED into this run's result rather than
+  // being replaced wholesale -- verified live 2026-10-01: SBS and CEPU, both
+  // genuine ifrs-full foreign filers with rich real SEC data going back over
+  // a decade, had silently vanished from a prior week's published list even
+  // though generateForeignFilingsCache.js's own hard filter (`withCik =
+  // foreignFilerList.foreignFilers`) means ANY ticker missing here is
+  // permanently excluded from all foreign-filings processing, not just that
+  // one week -- until pure chance re-includes it in some future run. The
+  // candidate set below is built from a live snapshot of marketMetrics.json
+  // (via `metricsDataset.metrics`), so a ticker that's merely absent or
+  // mid-recovery in `staleSymbols` at the exact moment this weekly job
+  // happens to run -- or a single transient SEC fetch failure for its CIK --
+  // was enough to drop it from `candidates`/`withCik` and therefore from the
+  // unconditional overwrite this used to do. Same "never silently regress"
+  // principle already applied everywhere else in these pipelines via
+  // pickTrendToPublish/pickMetricValue, just never applied to this list
+  // before, even though it's the master gate the entire daily pipeline's
+  // ticker universe depends on.
+  const [metricsDataset, tickerToCik, previousList] = await Promise.all([
+    fetchJson(GIST_METRICS_URL),
+    fetchTickerToCikMap(),
+    fetchJson(GIST_FOREIGN_FILER_LIST_URL).catch(() => null),
+  ]);
+  const previousBySymbol = new Map((previousList?.foreignFilers || []).map((f) => [f.symbol, f]));
+  console.log(`Previous list (generated ${previousList?.generatedAt || 'unknown'}) had ${previousBySymbol.size} foreign filers.`);
 
   const candidates = Object.entries(metricsDataset.metrics || {}).map(([symbol, data]) => ({ symbol, industry: data.industry }));
   const withCik = candidates.map((c) => ({ ...c, cik: tickerToCik.get(c.symbol) })).filter((c) => c.cik);
   console.log(`${candidates.length} tickers in the covered universe; ${withCik.length} of those have a matching SEC CIK. Checking each for real IFRS data...`);
 
-  const foreignFilers = [];
+  // Only a ticker that was ACTUALLY checked this run and conclusively found
+  // non-qualifying (detectForeignFilerTaxonomy returned null without
+  // throwing -- i.e. real companyFacts were fetched and either show a
+  // disqualifying 10-K/10-Q or no usable taxonomy at all) is treated as a
+  // genuine disqualification. A ticker that threw (network blip, SEC rate
+  // limit, timeout) or was never a candidate this run (absent from the
+  // current marketMetrics.json snapshot) makes NO determination either way
+  // -- its previous entry, if any, is carried forward unchanged below.
+  const disqualifiedThisRun = new Set();
+  const freshBySymbol = new Map();
   let processed = 0;
   for (const { symbol, cik, industry } of withCik) {
     try {
       const taxonomy = await detectForeignFilerTaxonomy(cik);
-      if (taxonomy) foreignFilers.push({ symbol, cik, industry, taxonomy });
+      if (taxonomy) {
+        freshBySymbol.set(symbol, { symbol, cik, industry, taxonomy });
+      } else {
+        disqualifiedThisRun.add(symbol);
+      }
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
     }
     await sleep(REQUEST_SPACING_MS);
 
     processed++;
-    if (processed % 250 === 0) console.log(`  ${processed}/${withCik.length} processed (${foreignFilers.length} confirmed foreign filers so far)`);
+    if (processed % 250 === 0) console.log(`  ${processed}/${withCik.length} processed (${freshBySymbol.size} confirmed foreign filers so far)`);
   }
+
+  let carriedForward = 0;
+  for (const [symbol, entry] of previousBySymbol) {
+    if (!freshBySymbol.has(symbol) && !disqualifiedThisRun.has(symbol)) {
+      freshBySymbol.set(symbol, entry);
+      carriedForward++;
+    }
+  }
+  const foreignFilers = [...freshBySymbol.values()];
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), foreignFilers }));
   const gaapCount = foreignFilers.filter((f) => f.taxonomy === 'us-gaap').length;
-  console.log(`Done. Processed ${processed} tickers, ${foreignFilers.length} confirmed foreign filers (${foreignFilers.length - gaapCount} ifrs-full, ${gaapCount} us-gaap).`);
+  console.log(`Done. Processed ${processed} tickers, ${foreignFilers.length} total foreign filers (${foreignFilers.length - gaapCount} ifrs-full, ${gaapCount} us-gaap), ${carriedForward} carried forward from the previous list (not reconfirmed this run, but not disqualified either), ${disqualifiedThisRun.size} explicitly disqualified this run.`);
 }
 
 main().catch((err) => {
