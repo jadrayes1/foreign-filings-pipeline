@@ -976,6 +976,25 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
     }
     if (Object.keys(merged).length) out[cadence] = merged;
   }
+  // A real signal the app can use to explain WHY a ticker's Quarterly/TTM
+  // tabs are empty, instead of the generic "not yet available" copy that
+  // implies a gap that'll close on its own -- verified live for BTI/CEPU/
+  // IAG and others: a genuine foreign private issuer that discloses only
+  // half-year + full-year results has ZERO real standalone-quarter facts
+  // for ANY of the 4 metrics here, even after every fallback this pipeline
+  // has (6-K text extraction, 20-F annual-only reads) -- not a gap that
+  // more data or a future run will ever close. Deliberately requires ALL
+  // FOUR metrics' quarterly AND ttm to be empty (not just one) -- a ticker
+  // missing only SOME metrics' quarterly data is much more likely a real,
+  // closeable gap, not this structural case, and should keep getting the
+  // existing "not yet available" messaging instead. P/FCF and P/E (a
+  // separate pipeline/file) aren't checked directly here, but share the
+  // same root fact about the ticker (no quarterly disclosure exists at
+  // all), so the app applies this one ticker-level flag across every
+  // metric rather than recomputing it per pipeline.
+  if (!out.quarterly && !out.ttm && out.yearly) {
+    out.annualOnlyFiler = true;
+  }
   return out;
 }
 
