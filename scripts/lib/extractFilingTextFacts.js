@@ -676,8 +676,21 @@ async function fetchJsonSec(url, userAgent) {
 
 // "408,734" / "$408,734" / "(64,827)" (negative) / "—" or "-" (blank = 0).
 // Returns null for genuinely non-numeric text (a label, not a value).
+//
+// Non-USD currency prefix (e.g. "R$ 38,092,050" on SBS's own R-file row,
+// Brazilian Real) is stripped BEFORE the old `[()$,\s]`-only cleanup --
+// verified live: that cleanup only ever stripped a bare "$", so "R$" left
+// a stray leading "R" that failed the digits-only regex below and silently
+// dropped the whole value (the row's LABEL still matched fine, just with
+// no parseable number -- same failure shape as a missing concept, not an
+// obviously-wrong one, which is why it went unnoticed). Only the FIRST
+// value row of an R-file statement typically carries the symbol at all
+// (a rendering convention, not per-row) -- other currency symbols that
+// appear across this pipeline's known foreign-filer universe are covered
+// the same way (C$/A$/HK$/NT$/S$ two-or-three-letter-code-plus-$, plus
+// bare £/€/¥ for filers that use those instead of a letter-code form).
 function parseNumericCell(text) {
-  const t = text.trim();
+  const t = text.trim().replace(/^(\()?[A-Z]{0,3}\$/, '$1').replace(/^(\()?[£€¥]/, '$1').trim();
   if (t === '' || /^[-—–]$/.test(t)) return 0;
   const negative = /^\(.*\)$/.test(t);
   const cleaned = t.replace(/[()$,\s]/g, '');
