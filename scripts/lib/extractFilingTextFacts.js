@@ -1877,6 +1877,19 @@ function extractFromInstantTable($, table, aliasMap, externalColumnDates = null)
   const parsed = parseInstantTableColumns($, table, externalColumnDates);
   if (!parsed) return [];
   const { columns, dataStartRowIdx } = parsed;
+  // See extractAllAnnualColumnsFromTable's identical call -- this table's
+  // own header ("$ in Thousands"/"in Millions") applies here too, and
+  // without it a balance-sheet concept comes out 1000x too SMALL relative
+  // to an income-statement concept from the SAME filing's duration tables
+  // (which already gets this correction), silently inflating any ratio
+  // that divides one by the other. Verified live: ASR's real "Total
+  // stockholders' equity" row literally reads "46,406,366" under a "$ in
+  // Thousands" header (so its real value is ~46.4 BILLION pesos, not 46.4
+  // million) while its EBIT for the same year had already been correctly
+  // scaled to ~17 billion -- without this fix, roic (NOPAT ÷ invested
+  // capital, which uses this unscaled equity) computed to 306.83 (a
+  // nonsensical 30,683%) instead of a real, plausible figure.
+  const scale = detectTableScale($, table);
 
   const rows = $(table).find('tr').toArray();
   const candidatesByColumn = columns.map(() => ({})); // concept -> [{label, value}]
@@ -1885,6 +1898,7 @@ function extractFromInstantTable($, table, aliasMap, externalColumnDates = null)
     if (!cells.length) continue;
     const row = parseDataRow(cells, columns.length);
     if (!row) continue;
+    if (scale !== 1) row.values = row.values.map((v) => v * scale);
     for (const concept of Object.keys(aliasMap)) {
       if (!matchesConcept(row.label, concept)) continue;
       for (let c = 0; c < columns.length; c++) {
@@ -2878,8 +2892,8 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
   for (const [concept, points] of pointsByConcept) {
     if (debug) console.error('DEBUG 20-F points before reconcile', concept, JSON.stringify(points.map((p) => ({ end: p.end, val: p.val, corroborations: p.corroborations, sectionVerified: p.sectionVerified }))));
     const verified = INSTANT_CONCEPTS.has(concept)
-      ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept))
-      : reconcilePoints(points, annualByEnd?.[concept] || new Map(), concept);
+      ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept), true)
+      : reconcilePoints(points, annualByEnd?.[concept] || new Map(), concept, true);
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
@@ -3020,8 +3034,14 @@ const MIN_PLAUSIBLE_RAW_SHARES = 100000;
 //      for periods that used to compute fine. Checking per-point against
 //      its own real anchor, independent of whatever the flow concepts
 //      decided, catches this the way a single borrowed global scale can't.
-function reconcileInstantPoints(points, knownByEnd, accessionToDates) {
+function reconcileInstantPoints(points, knownByEnd, accessionToDates, trustSingleSource = false) {
   const verified = new Set();
+  // See reconcilePoints' own comment on trustSingleSource -- same product
+  // decision, same 20-F-annual-only scope, applied here for balance-sheet
+  // (instant) concepts like equity/debt/cash.
+  if (trustSingleSource) {
+    for (const p of points) if (p.corroborations >= 1) verified.add(p);
+  }
   for (const p of points) if (p.corroborations >= 2) verified.add(p);
   for (const p of points) {
     const known = knownByEnd.get(p.end);
@@ -3241,7 +3261,7 @@ function decumulateNestedCandidates(points) {
   return result;
 }
 
-function reconcilePoints(points, annualByEnd, concept) {
+function reconcilePoints(points, annualByEnd, concept, trustSingleSource = false) {
   const verified = new Set();
 
   // Check D — same-document section-subtotal self-check (20-F annual
@@ -3254,6 +3274,24 @@ function reconcilePoints(points, annualByEnd, concept) {
   // extraction time, the document already corroborates itself -- no
   // arithmetic assumption beyond what the filer itself disclosed.
   for (const p of points) if (p.sectionVerified) verified.add(p);
+
+  // trustSingleSource (new) -- set ONLY by the 20-F annual path (never by
+  // 6-K prose extraction, which stays at the stricter >= 2 bar below). Per
+  // explicit product decision: a fact pulled from the issuer's own official
+  // annual report (a structured XBRL R-file table, not free text) is
+  // reliable on its own, even with no second filing to cross-corroborate it
+  // yet. Verified live this was a real, systemic gap, not just a PAC/OMAB/
+  // ASR-specific one: all three have a real FY'25 figure from their actual
+  // 20-F (filed months ago), rejected only because Check D's section-
+  // subtotal self-check doesn't apply to every statement type (income
+  // statement/balance-sheet concepts have no equivalent "section subtotal"
+  // row the way cash-flow's investing-activities section does) and no
+  // SECOND 20-F has restated FY'25 as a comparative column yet -- the same
+  // shape will recur for every foreign filer's newest fiscal year, every
+  // year, for any concept Check D doesn't cover.
+  if (trustSingleSource) {
+    for (const p of points) if (p.corroborations >= 1) verified.add(p);
+  }
 
   // Check C — cross-filing corroboration: the SAME real value for this
   // exact period was independently disclosed in 2+ separate 6-K filings
