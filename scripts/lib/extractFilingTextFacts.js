@@ -1102,6 +1102,7 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
         const knownEndMonthDay = parsed.find((p) => p.endMonthDay)?.endMonthDay;
         if (knownEndMonthDay) for (const p of parsed) if (!p.endMonthDay) p.endMonthDay = knownEndMonthDay;
         if (parsed.length) periodPhrases = parsed;
+        if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG periodPhrases-resolved', JSON.stringify(periodPhrases));
       }
       continue;
     }
@@ -1557,6 +1558,7 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
   // Same fiscal year's cumulative (6mo/9mo) column, if this table has one —
   // normally just used for the within-filing reconciliation check below.
   const cumulativeIdx = columns.findIndex((c) => c.months > 3 && c.year === targetEndYear);
+  if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG cumulativeIdx-trace', 'targetEndYear', JSON.stringify(targetEndYear), 'columns', JSON.stringify(columns), 'targetIdx3mo', targetIdx3mo, 'cumulativeIdx', cumulativeIdx);
   const eligibleForCumulativeFallback = Object.keys(aliasMap).every((c) => cumulativeFallbackConcepts.has(c));
   // Fallback for a filer whose statement only ever discloses a cumulative
   // (H1/9mo) column, never a standalone 3-month one -- verified live:
@@ -2034,12 +2036,36 @@ function findStatementTables($, allEls, headingIdx) {
 // parseTableColumns) resolve this exactly like any other same-row
 // multi-phrase header, with yearsPerPeriod naturally settling to 1 when
 // the phrase count already matches the date-cell count 1:1.
+// A compound caption naming TWO different durations before a single
+// "month(s) ended" suffix -- verified live: ASR's real caption reads "For
+// the six and three-month periods ended June 30, 2026 and 2025" (one
+// sentence covering BOTH its six-month and three-month columns, unlike
+// SGHC's two fully separate phrases above, each with its own "months
+// ended"). parsePeriodPhrase has no way to represent two durations in one
+// {months, endMonthDay} result -- it matched only "three-month" (the
+// first OR-branch "six[\s-]months?" requires "six" immediately followed by
+// "month", not "six and three-month"), silently discarding the six-month
+// half entirely. Treating this single, WRONG-duration phrase as
+// authoritative then preempted the table's own correct in-row "Six months
+// period ended"/"Three months period ended" header (parseTableColumns
+// never reaches its own row-scanning once externalPeriodPhrases is
+// non-empty) -- collapsing 4 real columns (6mo-2026, 6mo-2025, 3mo-2026,
+// 3mo-2025) down to 4 WRONGLY-labeled 3-month columns with duplicate
+// years, silently swapping the real standalone quarter for the six-month
+// cumulative total under its label. Safer to recognize this shape and
+// skip it entirely than to guess which duration is "primary" -- the table
+// almost always spells out each duration separately in its own header
+// when a caption like this combines them, so deferring to that is
+// strictly more informative than a wrong single-duration hint.
+const COMPOUND_DURATION_CAPTION = /(three|six|nine|twelve|3|6|9|12)[\s-]and[\s-](three|six|nine|twelve|3|6|9|12)[\s-]month/i;
+
 function findExternalPeriodPhrases($, allEls, startIdx, endIdx) {
   const phrases = [];
   for (let i = startIdx; i < endIdx; i++) {
     const $el = $(allEls[i]);
     const text = $el.text();
     if (!isHeadingLeaf($, $el) || text.length > MAX_HEADING_TEXT_LENGTH || !PERIOD_PHRASE_INDICATOR.test(text)) continue;
+    if (COMPOUND_DURATION_CAPTION.test(text)) continue;
     const parsed = parsePeriodPhrase(text);
     if (parsed) phrases.push(parsed);
   }
@@ -2592,6 +2618,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     const accessionToDates = new Map();
     for (const [end, list] of grouped) {
       if (!list.length) continue;
+      if (process.env.DEBUG_CUMULATIVE_IDX && concept === 'revenue' && end.startsWith('2025-03')) console.error('DEBUG revenue-list-2025Q1', JSON.stringify(list));
       for (const l of list) {
         if (!accessionToDates.has(l.accessionNumber)) accessionToDates.set(l.accessionNumber, new Set());
         accessionToDates.get(l.accessionNumber).add(end);
@@ -2610,7 +2637,28 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         if (!best || occurrences.length > best.length) best = occurrences;
       }
       const rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
-      points.push({ ...rep, corroborations: new Set(best.map((o) => o.accessionNumber)).size, accessionNumbers: new Set(best.map((o) => o.accessionNumber)) });
+      // hasConflict -- true when independent filings disagree on this
+      // period's value (byValue has more than one distinct value, not just
+      // one value with multiple corroborating copies). Verified live: DEFi
+      // Technologies/DEFT's own Q1'25 "Total revenues" reads $62.66M in its
+      // own Q1'25 earnings release but $43.79M in a LATER release's
+      // comparative column -- a real disagreement between two independent
+      // filings, not a parsing bug. Under the old >= 2 bar this correctly
+      // never published (neither number repeats, so neither gets 2
+      // corroborations) -- but trustSingleSource's corroborations >= 1
+      // check would otherwise verify WHICHEVER of the two disagreeing
+      // values happened to win the tiebreak above, silently presenting one
+      // arbitrary pick as fact. Gating trustSingleSource on `!hasConflict`
+      // keeps it applying only when a period has exactly one candidate
+      // value with nothing to disagree with (ASR's Q2'26 case -- only ever
+      // reported once, period) while still requiring real 2-source
+      // agreement whenever multiple filings actively disagree.
+      points.push({
+        ...rep,
+        corroborations: new Set(best.map((o) => o.accessionNumber)).size,
+        accessionNumbers: new Set(best.map((o) => o.accessionNumber)),
+        hasConflict: byValue.size > 1,
+      });
     }
     points.sort((a, b) => new Date(a.end) - new Date(b.end));
     if (points.length) pointsByConcept.set(concept, points);
@@ -2682,11 +2730,31 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     }
   }
 
+  // trustSingleSource now also passed here (previously 20-F-annual-path
+  // only -- see reconcilePoints' own comment). Per explicit product
+  // decision: Check A (same-document cumulative self-check) was the
+  // preferred safer alternative, but verified live it structurally cannot
+  // help a filer like ASR, which only ever discloses ONE standalone
+  // quarter per year (its H1 release breaks out Q2 alone, with no Q1/Q3/Q4
+  // counterpart ever disclosed) -- Check A's own sum-of-consecutive-
+  // quarters logic requires at least 2 real quarters to chain, so a
+  // single quarter can never self-verify no matter how correctly it's
+  // extracted. Rather than leave these filers waiting up to a year for a
+  // second filing to happen to repeat the same figure, trust a single 6-K
+  // extraction the same way a single 20-F extraction already is. This is
+  // a real step down in safety vs. the 20-F case (free-text/HTML table
+  // parsing, not structured XBRL -- this file's own history this session
+  // includes several real extraction bugs: ASR's own external-caption
+  // duration-collapsing bug just above, BTI's array-position bug, NBIS's
+  // zero-width-space bug, OMAB's dual-currency columns), accepted
+  // knowingly rather than overlooked.
   const result = {};
   for (const [concept, points] of pointsByConcept) {
+    if (process.env.DEBUG_CUMULATIVE_IDX && concept === 'revenue') console.error('DEBUG points-before-reconcile revenue', JSON.stringify(points.map((p) => ({ end: p.end, val: p.val, corroborations: p.corroborations, hasConflict: p.hasConflict }))));
     const verified = INSTANT_CONCEPTS.has(concept)
-      ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept))
-      : reconcilePoints(points, annualByEnd?.[concept] || new Map(), concept);
+      ? reconcileInstantPoints(points, annualByEnd?.[concept] || new Map(), accessionToDatesByConcept.get(concept), true)
+      : reconcilePoints(points, annualByEnd?.[concept] || new Map(), concept, true);
+    if (process.env.DEBUG_CUMULATIVE_IDX && concept === 'revenue') console.error('DEBUG verified-after-reconcile revenue', JSON.stringify(verified.map((p) => ({ end: p.end, val: p.val }))));
     if (verified.length) {
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
@@ -2891,10 +2959,13 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
         if (!best || occurrences.length > best.length) best = occurrences;
       }
       const rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+      // hasConflict -- see the sibling collection loop's own comment above
+      // (same disagreement risk, same fix, for the 20-F annual path).
       points.push({
         ...rep,
         corroborations: new Set(best.map((o) => o.accessionNumber)).size,
         accessionNumbers: new Set(best.map((o) => o.accessionNumber)),
+        hasConflict: byValue.size > 1,
         sectionVerified: best.some((o) => o.sectionVerified),
       });
     }
@@ -3052,10 +3123,12 @@ const MIN_PLAUSIBLE_RAW_SHARES = 100000;
 function reconcileInstantPoints(points, knownByEnd, accessionToDates, trustSingleSource = false) {
   const verified = new Set();
   // See reconcilePoints' own comment on trustSingleSource -- same product
-  // decision, same 20-F-annual-only scope, applied here for balance-sheet
+  // decision (now applied to both the 20-F annual AND 6-K quarterly
+  // paths), same !hasConflict guard against two independent filings
+  // disagreeing on the same period, applied here for balance-sheet
   // (instant) concepts like equity/debt/cash.
   if (trustSingleSource) {
-    for (const p of points) if (p.corroborations >= 1) verified.add(p);
+    for (const p of points) if (p.corroborations >= 1 && !p.hasConflict) verified.add(p);
   }
   for (const p of points) if (p.corroborations >= 2) verified.add(p);
   for (const p of points) {
@@ -3290,22 +3363,26 @@ function reconcilePoints(points, annualByEnd, concept, trustSingleSource = false
   // arithmetic assumption beyond what the filer itself disclosed.
   for (const p of points) if (p.sectionVerified) verified.add(p);
 
-  // trustSingleSource (new) -- set ONLY by the 20-F annual path (never by
-  // 6-K prose extraction, which stays at the stricter >= 2 bar below). Per
-  // explicit product decision: a fact pulled from the issuer's own official
-  // annual report (a structured XBRL R-file table, not free text) is
-  // reliable on its own, even with no second filing to cross-corroborate it
-  // yet. Verified live this was a real, systemic gap, not just a PAC/OMAB/
-  // ASR-specific one: all three have a real FY'25 figure from their actual
-  // 20-F (filed months ago), rejected only because Check D's section-
-  // subtotal self-check doesn't apply to every statement type (income
-  // statement/balance-sheet concepts have no equivalent "section subtotal"
-  // row the way cash-flow's investing-activities section does) and no
-  // SECOND 20-F has restated FY'25 as a comparative column yet -- the same
-  // shape will recur for every foreign filer's newest fiscal year, every
-  // year, for any concept Check D doesn't cover.
+  // trustSingleSource -- originally set ONLY by the 20-F annual path (a
+  // fact pulled from the issuer's own official annual report, structured
+  // XBRL, is reliable on its own). Now ALSO passed by the 6-K quarterly
+  // path's own call site, per a second explicit product decision: Check A
+  // (same-document cumulative self-check, just above) was tried first as
+  // the safer alternative, but verified live it structurally cannot help
+  // a filer like ASR, which only ever discloses ONE standalone quarter per
+  // year (its H1 release breaks out Q2 alone, no Q1/Q3/Q4 counterpart ever
+  // disclosed) -- Check A's sum-of-consecutive-quarters logic needs at
+  // least 2 real quarters to chain, so a single quarter can never
+  // self-verify no matter how correctly it's extracted. Trusting a single
+  // 6-K extraction is a real step down in safety vs. the 20-F case (free-
+  // text/HTML parsing, not structured XBRL -- this file's own history this
+  // session includes several real extraction bugs that would have
+  // silently published a wrong number under the old >=2 bar's protection),
+  // accepted knowingly to unblock filers like ASR/PAC rather than leave
+  // them waiting up to a year for a second filing to happen to repeat the
+  // same figure.
   if (trustSingleSource) {
-    for (const p of points) if (p.corroborations >= 1) verified.add(p);
+    for (const p of points) if (p.corroborations >= 1 && !p.hasConflict) verified.add(p);
   }
 
   // Check C — cross-filing corroboration: the SAME real value for this
@@ -3313,11 +3390,15 @@ function reconcilePoints(points, annualByEnd, concept, trustSingleSource = false
   // (e.g. as this year's own current-quarter figure, and again a year
   // later as the prior-year comparative column). No arithmetic assumption
   // at all — just literal agreement between independent real documents.
-  // Verified live this is necessary, not just nice-to-have: DEFT and CMBT
-  // (and most of this bucket) only ever disclose ONE standalone quarter per
-  // fiscal year with no same-document cumulative column, so Check A (needs
-  // a cumulative column) and Check B (needs 2+ quarters in the SAME fiscal
-  // year) can never verify them, no matter how correct the extraction is.
+  // Now redundant whenever trustSingleSource is true (every current
+  // caller) since corroborations >= 1 already covers everything this
+  // would also verify -- kept as the fallback bar for any future caller
+  // that passes trustSingleSource = false. Originally verified live this
+  // was necessary, not just nice-to-have: DEFT and CMBT (and most of this
+  // bucket) only ever disclose ONE standalone quarter per fiscal year with
+  // no same-document cumulative column, so Check A (needs a cumulative
+  // column) and Check B (needs 2+ quarters in the SAME fiscal year) could
+  // never verify them under the old, stricter default.
   for (const p of points) if (p.corroborations >= 2) verified.add(p);
 
   // Check A — this point's own disclosed cumulative vs. the sum of
@@ -3329,12 +3410,17 @@ function reconcilePoints(points, annualByEnd, concept, trustSingleSource = false
   // reconciles against Q1+Q2+Q3 summed, not just the immediately-preceding
   // quarter. A filer whose cumulative column is a genuine six-month figure
   // still resolves in one step (chain length 2), unchanged from before.
+  // hasConflict points excluded on both sides -- see Check B's own comment
+  // below for why a disputed point shouldn't be trusted just because some
+  // arithmetic happens to work out, same principle applied here: neither
+  // the point being verified NOR a prior quarter propping up its chain
+  // sum should be an actively-disputed value.
   for (const p of points) {
-    if (p.valueCumulative == null) continue;
+    if (p.valueCumulative == null || p.hasConflict) continue;
     const chain = [p];
     let cursor = p;
     for (;;) {
-      const prior = points.find((q) => !chain.includes(q) && isAdjacentDate(q.end, cursor.start));
+      const prior = points.find((q) => !chain.includes(q) && !q.hasConflict && isAdjacentDate(q.end, cursor.start));
       if (!prior) break;
       chain.push(prior);
       cursor = prior;
@@ -3379,7 +3465,22 @@ function reconcilePoints(points, annualByEnd, concept, trustSingleSource = false
       // Q2/Q3/Q4's much-later starts) fixes this while still requiring
       // every candidate to fall within the fiscal year.
       const startToleranceMs = 5 * 24 * 60 * 60 * 1000;
-      const rawCandidates = (byYear.get(fyEndYear) || []).filter((p) => p.end <= annual.end && new Date(p.start).getTime() >= new Date(annual.start).getTime() - startToleranceMs);
+      // hasConflict excluded here too -- verified live: DEFT's disputed
+      // Q1'25 (two different 6-Ks disclose two different "Total revenues"
+      // figures for the same period, see hasConflict's own comment above)
+      // was slipping through THIS check even with the trustSingleSource/
+      // Check C guards in place, since Check B verifies by whole-fiscal-
+      // year SUM against the real annual XBRL total, with no awareness of
+      // any individual quarter's own provenance. A disputed point summed
+      // in here can make an otherwise-correct year's total look right (or
+      // wrong) for reasons having nothing to do with whether THIS quarter
+      // itself is trustworthy -- excluding it is the same "don't trust an
+      // actively-disputed value just because the arithmetic happens to
+      // work out" principle as trustSingleSource's own guard, applied to
+      // this separate, pre-existing (not new today) verification path.
+      const rawCandidates = (byYear.get(fyEndYear) || [])
+        .filter((p) => !p.hasConflict)
+        .filter((p) => p.end <= annual.end && new Date(p.start).getTime() >= new Date(annual.start).getTime() - startToleranceMs);
       // Decumulate nested/overlapping periods (see decumulateNestedCandidates'
       // own comment) before summing -- a no-op for the common case where
       // every candidate already has a unique start.
