@@ -831,6 +831,21 @@ function parseDateHeaderCell(text) {
   const stripped = text.replace(/^as\s+(of|at)\s+/i, '').trim();
   const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})$/);
   if (compound) return { year: compound[3], monthDay: `${compound[1]} ${compound[2]}` };
+  // ASR-style "2Q 2026"/"2Q 2025" year-row cell -- a bare year prefixed
+  // with its own quarter number, verified live in ASR's H1 2026 interim
+  // 6-K, which pairs a "Six months period ended"/"Three months period
+  // ended" phrase row with a shared "June 30," month-day row and THIS
+  // quarter-labeled year row, instead of a plain "2026"/"2025" the way
+  // every other filer's three-month column labels its year. Without this,
+  // isYearCell/the compound match above both reject it outright, so
+  // dateCells silently undercounts (misses the two real standalone-quarter
+  // columns entirely), which cascades into a wrong phrase-to-column
+  // allocation and a data-row count mismatch -- losing BOTH the real
+  // six-month AND the real three-month data for this table, not just the
+  // quarter. Only the year is extracted (the quarter-number prefix is
+  // redundant with the phrase row's own stated duration, not needed here).
+  const quarterYear = text.trim().match(/^[1-4]Q\s*((?:19|20)\d{2})$/i);
+  if (quarterYear) return { year: quarterYear[1], monthDay: null };
   return null;
 }
 
