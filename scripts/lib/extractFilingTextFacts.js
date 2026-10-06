@@ -3056,6 +3056,51 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
         // sliver of the year (a scale mismatch) and not wildly over it.
         if (ratio >= 0.3 && ratio <= 1.05) score++;
       }
+
+      // A SECOND, cross-year comparison for a lone full-fiscal-year point
+      // with NO sibling quarters at all -- verified live: ASR's own FY'25
+      // revenue comes from a single 6-K earnings-release column (a genuine
+      // "months: 12" duration, not a sum of quarters), so the within-year
+      // check just above never runs for it (candidates.length is 1, always
+      // < 2) and this filing's own real "$ in thousands" scale (confirmed
+      // against its own caption) never gets caught -- silently producing
+      // a FY'25 figure 1000x too small, computing a -99.9% YoY
+      // "collapse" against FY'24's correctly-scaled real XBRL anchor that
+      // never actually happened. A single year-over-year ratio can't use
+      // the same [30%,105%] band (real YoY swings, even extreme ones like
+      // this session's crypto-pivot tickers, can land almost anywhere) --
+      // but a genuine 1000x/1000000x scale miss NEVER lands anywhere near
+      // 1:1 either, so a much wider [5%, 2000%] band still cleanly
+      // separates "real growth/decline" from "wrong scale" without needing
+      // to guess a tighter bound per filer. Flow concepts only -- INSTANT_
+      // CONCEPTS (equity/debt/cash) excluded: a balance-sheet SNAPSHOT can
+      // legitimately swing by more than 20x across a single year (a capital
+      // raise, a write-off) with zero scale bug involved, unlike a flow
+      // concept's cumulative total, and this file's own INSTANT_CONCEPTS
+      // constant already exists exactly to mark that distinction. Verified
+      // live this was a real, not hypothetical, false-positive risk: CMBT's
+      // own equity/debt/cash data is genuinely messy (many small-cap-style
+      // restatements across accessions, several real hasConflict cases) --
+      // without this exclusion, noisy instant-concept "votes" swung
+      // detectScaleMultiplier's single shared bestScale decision for this
+      // filer's ENTIRE extraction pass, corrupting revenue/netIncome/ebit's
+      // otherwise-correct values too and wiping out CMBT's yearly data
+      // entirely.
+      if (INSTANT_CONCEPTS.has(concept)) continue;
+      for (const [year, yearPoints] of byYear) {
+        if (yearPoints.length !== 1) continue;
+        const p = yearPoints[0];
+        const durationDays = (new Date(p.end).getTime() - new Date(p.start).getTime()) / (1000 * 60 * 60 * 24);
+        if (Math.abs(durationDays - 365) > 20) continue; // not actually a full-year point
+        for (const annual of annuals.values()) {
+          if (!annual.value || annual.end.slice(0, 4) === year) continue;
+          const ratio = Math.abs(p.val * scale) / Math.abs(annual.value);
+          if (process.env.DEBUG_FILING_EXTRACT) {
+            console.error('DEBUG detectScaleMultiplier crossYear', concept, year, 'vs', annual.end, 'scale', scale, 'val', p.val, 'annual.value', annual.value, 'ratio', ratio);
+          }
+          if (ratio >= 0.05 && ratio <= 20) score++;
+        }
+      }
     }
     if (score > bestScore) {
       bestScore = score;

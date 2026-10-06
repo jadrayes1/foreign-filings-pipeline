@@ -1394,6 +1394,7 @@ async function processTicker(symbol, cik, isBank) {
       : null;
     if (!allowlist || allowlist.has(symbol.toUpperCase())) {
       const needed20F = [];
+      if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG needed20F-check', symbol, 'revenue.annual=', JSON.stringify(revenue.annual), 'needsAnnual20FBackfill=', needsAnnual20FBackfill(revenue.annual));
       if (needsAnnual20FBackfill(revenue.annual)) needed20F.push('revenue');
       if (needsAnnual20FBackfill(netIncome.annual)) needed20F.push('netIncome');
       if (needsAnnual20FBackfill(ebit.annual)) needed20F.push('ebit', 'pretaxIncome');
@@ -1528,8 +1529,10 @@ async function processTicker(symbol, cik, isBank) {
     const rgTtm = buildRevenueGrowthTTMTrend(revenue.quarterly);
     if (rgTtm.length) ttm.revenueGrowth = rgTtm;
   }
+  if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG final-revenue-annual', symbol, JSON.stringify(revenue.annual));
   if (revenue.annual.length) {
     const rgY = buildAnnualRevenueGrowthTrend(revenue.annual);
+    if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG buildAnnualRevenueGrowthTrend result', symbol, JSON.stringify(rgY));
     if (rgY.length) yearly.revenueGrowth = rgY;
   }
 
@@ -1711,11 +1714,33 @@ async function main() {
       }
       if (globalStop) return;
 
+      // Applied unconditionally now (previously gated behind
+      // `Object.keys(merged).length`, skipping the update -- and with it,
+      // every per-(cadence,metric) staleness re-check -- whenever NOTHING
+      // for this ticker came back fresh this run). pickCadenceTrendsToPublish
+      // already decides per-(cadence,metric) whether to retire data past
+      // isRecentEnough's 18-month floor, but that decision only ever took
+      // effect as a side effect of trends[symbol] being reassigned at all --
+      // which depended on some UNRELATED sibling cadence/metric refreshing
+      // successfully this run. Verified live: CMBT's yearly data (21+
+      // months stale) rode along untouched for that whole time because its
+      // quarterly extraction was ALSO broken the entire period, so `merged`
+      // stayed empty and the reassignment (and the retirement bundled
+      // inside it) never fired -- until quarterly extraction got fixed
+      // separately, at which point yearly's already-correct "too stale"
+      // exclusion finally applied, all at once, looking like a sudden loss
+      // triggered by an unrelated change. Applying this every run, for
+      // every ticker, makes retirement depend only on that (cadence,metric)
+      // slot's OWN age -- exactly what the original PDD fix's own stated
+      // goal was ("once fresh extraction stops finding anything newer...
+      // no mechanism to ever flag it as stale") -- rather than on some
+      // other part of the same ticker happening to refresh. A ticker with
+      // nothing fresh and nothing previously published still safely
+      // collapses to `trends[symbol] = {}`, identical to having no entry
+      // at all from every downstream consumer's point of view.
       const merged = pickCadenceTrendsToPublish(trends[symbol], fresh || {});
-      if (Object.keys(merged).length) {
-        trends[symbol] = merged;
-        resolved++;
-      }
+      trends[symbol] = merged;
+      if (Object.keys(merged).length) resolved++;
 
       processed++;
       if (processed % 50 === 0) {
