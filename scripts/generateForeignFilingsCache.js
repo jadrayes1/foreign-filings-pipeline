@@ -732,6 +732,11 @@ function buildAnnualRatioTrend(numeratorAnnual, denominatorAnnual, combine) {
 // ---------------------------------------------------------------------------
 
 function investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank) {
+  if (process.env.DEBUG_CUMULATIVE_IDX) {
+    console.error('DEBUG investedCapitalByEnd equityInstant', JSON.stringify(equityInstant));
+    console.error('DEBUG investedCapitalByEnd cashInstant', JSON.stringify(cashInstant));
+    console.error('DEBUG investedCapitalByEnd debtInstant', JSON.stringify(debtInstant));
+  }
   const cashByEnd = new Map(cashInstant.map((f) => [f.end, f.value]));
   const debtByEnd = new Map(debtInstant.map((f) => [f.end, f.value]));
   const map = new Map();

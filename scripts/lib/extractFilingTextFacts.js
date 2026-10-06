@@ -1705,7 +1705,23 @@ const SECTION_SUBTOTAL_PATTERN = /^net (cash|increase|decrease)\b.*(operating|in
 // IMPP's caption has no unit qualifier at all (raw dollars, needs no
 // scaling) -- both handled by the same simple text check.
 function detectTableScale($, table) {
-  const headerText = $(table).find('tr').first().text();
+  // Checks the first THREE rows, not just the first -- verified live:
+  // ITRN's own balance sheet puts its "(In thousands)" caption in its
+  // SECOND row (row 1 is just the statement title, row 2 the units
+  // caption, row 3+ the real column headers/dates), a common enough
+  // layout that checking only row 1 silently missed the scale entirely,
+  // leaving a real $224,486,000 equity figure as a bare, 1000x-too-small
+  // "224,486" -- which then corrupted ROIC (and anything else dividing by
+  // it) into an absurd value. Three rows is generous enough to catch a
+  // title+caption pair or even title+blank+caption while still being
+  // comfortably before any real header row's own test for the column-
+  // phrase shapes.
+  const headerText = $(table)
+    .find('tr')
+    .slice(0, 3)
+    .map((_, tr) => $(tr).text())
+    .get()
+    .join(' ');
   if (/in thousands/i.test(headerText)) return 1000;
   if (/in millions/i.test(headerText)) return 1000000;
   return 1;
@@ -2723,6 +2739,25 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         const impliesScalingNeeded = maxRaw > 0 && maxRaw < MIN_PLAUSIBLE_RAW_SHARES && maxRaw * scale >= MIN_PLAUSIBLE_RAW_SHARES;
         if (!impliesScalingNeeded) continue;
       }
+      // INSTANT_CONCEPTS (equity/debt/cash) excluded here too -- excluding
+      // them from detectScaleMultiplier's own scoring (see that function's
+      // comment) only stops their messy same-year-snapshot data from
+      // influencing WHICH scale gets picked; it doesn't stop a scale this
+      // step picked for OTHER (legitimate flow-concept) reasons from then
+      // being applied to them anyway. Their own scale is already resolved
+      // independently and correctly upstream, per-table, by
+      // extractFromInstantTable's own detectTableScale (see that
+      // function's own comment, written for the original ASR equity-scale
+      // bug) -- applying a SECOND, unrelated scale on top of an already-
+      // correct value is never right, no matter what bestScale resolves to
+      // for this filing's flow concepts. Verified live: ITRN's real
+      // extractFromInstantRFile output ($224,486,000 equity) was already
+      // correct, but this step's own blanket scale application (triggered
+      // by some unrelated flow-concept candidate elsewhere in the same
+      // batch) multiplied it by another 1000x anyway, corrupting ROIC's
+      // invested-capital denominator into producing ~0.03% instead of the
+      // real ~28%.
+      if (INSTANT_CONCEPTS.has(concept)) continue;
       for (const p of points) {
         p.val *= scale;
         if (p.valueCumulative != null) p.valueCumulative *= scale;
@@ -3012,6 +3047,25 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
   for (const scale of SCALE_CANDIDATES) {
     let score = 0;
     for (const [concept, points] of pointsByConcept) {
+      // INSTANT_CONCEPTS (equity/debt/cash) excluded from this whole
+      // per-concept block, not just the cross-year addition further below
+      // -- summing multiple same-year point-in-time SNAPSHOTS and
+      // comparing that sum to an annual snapshot is meaningless the way
+      // summing quarters of a FLOW concept approximates an annual total
+      // (two balance-sheet snapshots added together isn't "the annual
+      // balance" at any scale). Verified live: ITRN's own equity snapshots
+      // (Dec'25 ~$224M, Jun'26 ~$225M) summed to roughly double the real
+      // annual anchor, outside the plausible [30%,105%] band at scale=1 --
+      // but this loop's shared `score` is accumulated ACROSS every concept
+      // together, so this spurious equity "vote" at some other candidate
+      // scale could tip the GLOBAL bestScale decision for the whole
+      // filing, corrupting equity/cash/debt's own otherwise-correct values
+      // via the later "apply bestScale to every point" step (extra x1000
+      // confirmed live: ITRN's correctly-extracted $224,486,000 equity
+      // became $224,486,000,000 by the time it reached ROIC's invested-
+      // capital calculation, producing an implausible ~0.03% instead of
+      // the real ~28%).
+      if (INSTANT_CONCEPTS.has(concept)) continue;
       const annuals = annualByEnd?.[concept];
       if (!annuals || !annuals.size) continue;
 
