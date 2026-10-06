@@ -120,6 +120,9 @@ jobs:
       - name: Generate foreign filings cache
         env:
           ENABLE_FILING_TEXT_FALLBACK: '1'
+          # See shard 1's own comment on this flag -- this shard never had
+          # the input wired at all, so it was never enabled here either.
+          ENABLE_20F_ANNUAL_FALLBACK: '1'
           SHARD_INDEX: '3'
           SHARD_COUNT: '3'
           TARGET_SYMBOL: ${{ inputs.symbol }}

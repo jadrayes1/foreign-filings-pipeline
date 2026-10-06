@@ -1376,9 +1376,18 @@ async function processTicker(symbol, cik, isBank) {
   // fixed doesn't pay for a redundant, heavier 20-F scan (3 full documents'
   // FilingSummary.xml + several R-files each, vs. the 6-K path's lighter
   // per-filing cost). Own flag/allowlist, separate from
-  // ENABLE_FILING_TEXT_FALLBACK -- same rollout discipline as
-  // ENABLE_BUSINESSQUANT_FALLBACK below, staged via workflow_dispatch
-  // against a small ticker set first given the added per-ticker cost.
+  // ENABLE_FILING_TEXT_FALLBACK. Was staged via workflow_dispatch against a
+  // small ticker set first, same rollout discipline as
+  // ENABLE_BUSINESSQUANT_FALLBACK below -- now promoted to on-by-default in
+  // all 3 scheduled shard workflows after this session's extensive
+  // verification (PAC/ASR/OMAB/BTE, zero regression across the established
+  // DHT/STNG/IAG/CANG/EGO/GFR/DEFT/CMBT population). Confirmed live this
+  // gap was real, not hypothetical, while it was still manual-only: a
+  // scheduled run (which never set this flag) reverted ASR's own freshly
+  // force-published FY'25 data back to FY'24-max within hours, since its
+  // own merge-protection correctly preserves existing data when a fresh
+  // run finds nothing -- but "fresh" never even tried the path that found
+  // it in the first place when this flag was off.
   if (process.env.ENABLE_20F_ANNUAL_FALLBACK) {
     const allowlist = process.env.FILING_TEXT_FALLBACK_TICKERS
       ? new Set(process.env.FILING_TEXT_FALLBACK_TICKERS.split(',').map((s) => s.trim().toUpperCase()))

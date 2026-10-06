@@ -87,7 +87,7 @@ on:
         required: false
         type: string
       enable20FAnnualFallback:
-        description: 'Optional: set to 1 to try the 20-F R-file annual extractor (ENABLE_20F_ANNUAL_FALLBACK) for this run -- built for DHT but never wired into the scheduled runs; staged manual testing only until verified, see that flag''s own comment in generateForeignFilingsCache.js'
+        description: 'Optional: the 20-F R-file annual extractor (ENABLE_20F_ANNUAL_FALLBACK) is now on by default for every run, scheduled or manual -- only set this to explicitly override that (e.g. 0 to disable for one debug run), see that flag''s own comment in generateForeignFilingsCache.js'
         required: false
         type: string
 
@@ -132,7 +132,23 @@ jobs:
           SHARD_COUNT: '3'
           TARGET_SYMBOL: ${{ inputs.symbol }}
           DEBUG_FILING_EXTRACT: ${{ inputs.debugFilingExtract }}
-          ENABLE_20F_ANNUAL_FALLBACK: ${{ inputs.enable20FAnnualFallback }}
+          # Defaults to on (previously only set by a manual dispatch's own
+          # input, never by the daily schedule trigger -- scheduled runs
+          # always saw inputs.enable20FAnnualFallback as empty/falsy).
+          # Promoted the same way ENABLE_FILING_TEXT_FALLBACK itself was
+          # promoted out of staged manual testing above, after this
+          # session's extensive verification (PAC/ASR/OMAB/BTE, zero
+          # regression across the established DHT/STNG/IAG/CANG/EGO/GFR/
+          # DEFT/CMBT population) -- confirmed live this gap was real, not
+          # hypothetical: a scheduled run with the flag off reverted ASR's
+          # own manually-republished FY'25 data back to FY'24-max within
+          # hours, since its own merge-protection correctly keeps "fresh
+          # found nothing" from removing existing data, but "fresh" here
+          # never even tried the 20-F path that found it in the first
+          # place. `|| '1'` still lets an explicit manual override through
+          # (e.g. a debug dispatch that explicitly sets it to something
+          # else), only the empty/scheduled case defaults to on.
+          ENABLE_20F_ANNUAL_FALLBACK: ${{ inputs.enable20FAnnualFallback || '1' }}
           ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
           BUSINESSQUANT_API_KEY: ${{ secrets.BUSINESSQUANT_API_KEY }}
           FILING_TEXT_FALLBACK_TICKERS: ${{ inputs.enableBusinessQuant && inputs.symbol || '' }}
