@@ -1687,7 +1687,13 @@ function resolveConceptCandidates(list, concept, valueKey) {
   // items roll up into one "Total" row). When exactly one candidate is
   // unambiguously a total line, prefer it over the sub-items rather than
   // dropping the concept entirely.
-  const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
+  // For netIncome, a "Total comprehensive income..." row is never the
+  // total we want: it adds OCI (FX translation etc.) on top of net income.
+  // Verified live: ASR's Q2'26 statement has both "Net income for the
+  // period" (2,384,562) and "Total comprehensive income for the period"
+  // (-234,891); the latter won this tiebreak as the only "Total" row,
+  // publishing a -2.5% quarterly margin for a quarter that was really +25%.
+  const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()) && !(concept === 'netIncome' && /comprehensive/i.test(d.label)));
   if (totalMatches.length === 1) return { winner: totalMatches[0] };
   // Two (or more) "Total..."-prefixed candidates, not just one -- verified
   // live: CTRM (Castor Maritime) discloses a real segment subtotal,
