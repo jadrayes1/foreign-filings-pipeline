@@ -1629,18 +1629,19 @@ function isSemiAnnualFlow(flow) {
   return recent(flow.h1).length > 0 && recent(flow.quarterly).length === 0;
 }
 
-// At least two recent balance-sheet dates, and none closer than ~5 months
-// apart -- quarterly reporters have ~90-day gaps between snapshots.
+// Recent balance-sheet dates spaced ~6 months apart: no gap under ~5
+// months (quarterly reporters are ~90 days apart) and at least one gap
+// under ~7 months -- verified live: EHLD's snapshots are all Dec 31, a
+// year apart, which the "no short gaps" check alone wrongly called
+// semi-annual.
 function isSemiAnnualInstant(points) {
   const cutoff = Date.now() - SEMI_ANNUAL_LOOKBACK_DAYS * 86400000;
   const ends = [...new Set((points || []).map((p) => p.end))]
     .filter((e) => new Date(e).getTime() >= cutoff)
     .sort();
   if (ends.length < 2) return false;
-  for (let i = 1; i < ends.length; i++) {
-    if (daysBetween(ends[i - 1], ends[i]) < 150) return false;
-  }
-  return true;
+  const gaps = ends.slice(1).map((e, i) => daysBetween(ends[i], e));
+  return gaps.every((g) => g >= 150) && gaps.some((g) => g <= 220);
 }
 
 async function main() {
