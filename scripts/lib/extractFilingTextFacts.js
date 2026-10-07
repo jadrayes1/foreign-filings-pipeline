@@ -465,7 +465,14 @@ const LABEL_ALIASES = {
     // candidates in the SAME table as the real "Net income" row and bail
     // on the ambiguity -- silently losing a real, otherwise-cleanly-
     // extracted value, not just adding a wrong one.
-    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b|non-gaap|\bbasic\b|\bdiluted\b|net income tax/i,
+    // "\badjusted\b" added -- verified live: CTRM (Castor Maritime) labels
+    // its real non-GAAP figure "Adjusted net income (1)" -- the exact same
+    // adjusted-vs-GAAP ambiguity the "non-gaap" exclude above already
+    // exists for (VIPS), just worded differently (CTRM's label never
+    // contains the literal string "non-gaap" at all). Two real, disagreeing
+    // candidates ("Net income/(loss)" and "Adjusted net income (1)") in
+    // the same table is unresolvable, silently dropping the real value.
+    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b|non-gaap|\badjusted\b|\bbasic\b|\bdiluted\b|net income tax/i,
   },
   // ROIC's numerator (mirrors EBIT_CONCEPTS in generateForeignFilingsCache.js
   // -- ProfitLossFromOperatingActivities/ProfitLossBeforeTax). Verified
@@ -1682,6 +1689,21 @@ function resolveConceptCandidates(list, concept, valueKey) {
   // dropping the concept entirely.
   const totalMatches = distinct.filter((d) => /^total\b/i.test(d.label.trim()));
   if (totalMatches.length === 1) return { winner: totalMatches[0] };
+  // Two (or more) "Total..."-prefixed candidates, not just one -- verified
+  // live: CTRM (Castor Maritime) discloses a real segment subtotal,
+  // "Total vessel revenues", ABOVE the real statement's own true grand
+  // total, "Total revenues" (vessel + "Revenue from services" summed) --
+  // both match the loose /^total\b/i check above, defeating the single-
+  // match tiebreak just above even though one of them is unambiguously
+  // the real grand total by its own EXACT wording (no segment qualifier
+  // inserted between "Total" and "revenue(s)"). Scoped to revenue only --
+  // this exact "Total X revenues" + "Total revenues" co-occurrence is a
+  // revenue-statement-specific shape, not assumed for other concepts'
+  // own "Total..." conventions.
+  if (concept === 'revenue' && totalMatches.length > 1) {
+    const grandTotal = totalMatches.filter((d) => /^total\s+revenues?$/i.test(d.label.trim()));
+    if (grandTotal.length === 1) return { winner: grandTotal[0] };
+  }
 
   // Still tied — for netIncome specifically, DEFT also discloses a
   // separate "Net income for the period after taxes" alongside "Net
@@ -1711,6 +1733,18 @@ function resolveConceptCandidates(list, concept, valueKey) {
     // is just a second, cheap guard against the same thing.
     const attributableToParent = distinct.filter((d) => /attributable to (?!(non|minority))/i.test(d.label));
     if (attributableToParent.length === 1) return { winner: attributableToParent[0] };
+    // Still tied among 2+ "attributable to" candidates -- verified live:
+    // CTRM (Castor Maritime) discloses THREE levels in the same statement
+    // ("Net income/(loss)", "...attributable to Castor Maritime Inc.", and
+    // the most refined "...attributable to common shareholders of Castor
+    // Maritime Inc."), not just the two the single-match check above
+    // assumes. The "common shareholders" figure is the one every EPS/
+    // profitMargin-style ratio conventionally means (it's the parent-
+    // attributable figure net of whatever separates it from the merely
+    // parent-attributable one, e.g. preferred distributions) -- prefer it
+    // when exactly one candidate names it.
+    const attributableToCommon = attributableToParent.filter((d) => /common (shareholders|stockholders)/i.test(d.label));
+    if (attributableToCommon.length === 1) return { winner: attributableToCommon[0] };
   }
   // revenue specifically: a filer can break revenue into several
   // sub-lines that don't roll up into a "Total ..."-prefixed row -- verified
