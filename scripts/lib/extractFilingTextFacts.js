@@ -652,22 +652,24 @@ const LABEL_ALIASES = {
     // operating-activities adjustment, or "Gain on disposal of property,
     // plant and equipment") that are NOT capex; anchoring to the full label
     // matches only when the row's entire text IS the asset name itself.
-    // "investments? in.*concession" added -- verified live: ASR (Grupo
-    // Aeroportuario del Sureste, an airport CONCESSION operator) labels its
-    // real investing-section capex line "Investments in machinery,
-    // furniture, equipment and concession improvements" -- a SEVENTH
-    // distinct real-world phrasing, matching neither "vessels" nor
-    // "property" (an airport concession holder improves the CONCESSION
-    // right itself, not owned real estate, so "property" never appears in
-    // its own capex line at all). ".*" bounded by requiring "investments?
-    // in" at the start and "concession" later in the SAME label -- the
-    // multi-noun list in between ("machinery, furniture, equipment and")
-    // varies by filer, but "concession improvements" is the fixed anchor
-    // every Mexican airport-concession operator (ASR/PAC/OMAB, all under
-    // the same regulatory concession structure) plausibly shares, since
-    // all three file under the same IFRS convention for an identical
-    // business model.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|^(mineral )?propert(y|ies),? plant and equipment$/i,
+    // "concession" alternatives added -- verified live: ASR (Grupo
+    // Aeroportuario del Sureste, an airport CONCESSION operator) uses TWO
+    // genuinely different real phrasings for the SAME capex concept across
+    // its OWN filings -- "Investments in machinery, furniture, equipment
+    // and concession improvements" (6-K earnings release) and
+    // "Improvements to assets under concession and acquisition of
+    // furniture and equipment" (20-F annual R-file) -- neither matching
+    // "vessels" nor "property" (an airport concession holder improves the
+    // CONCESSION right itself, not owned real estate, so "property" never
+    // appears in its own capex line at all). Not anchored to a specific
+    // leading verb ("investments in"/"improvements to") since that's
+    // exactly what varies between the two -- just requires "concession"
+    // to co-occur with one of the asset words every real phrasing shares.
+    // "concession" is the fixed anchor every Mexican airport-concession
+    // operator (ASR/PAC/OMAB, all under the same regulatory concession
+    // structure) plausibly shares, since all three file under the same
+    // IFRS convention for an identical business model.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|concession.*(improvements?|furniture|equipment)|improvements?.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|^(mineral )?propert(y|ies),? plant and equipment$/i,
     exclude: /proceeds|disposal|\bsale of\b|depreciation|amortization|gain on|loss on/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -1971,9 +1973,21 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap) {
         const data = (sectionDataByColumn[ci][currentSection] = sectionDataByColumn[ci][currentSection] || { sum: 0, subtotal: null });
         data.subtotal = row.values[annualIdxs[ci]];
       }
-      continue; // a subtotal row is never itself a concept candidate
-    }
-    if (currentSection) {
+      // Falls through to the concept-matching loop below (no `continue`) --
+      // verified live: ASR's real operating-activities subtotal row IS
+      // itself the real ocf value ("Net cash flows generated from
+      // operating activities"), standard cash-flow-statement presentation
+      // for any filer whose OCF concept isn't section-restricted (unlike
+      // capex, which is usually one or a few specific investing-activity
+      // line ITEMS, never the investing-activities subtotal as a whole --
+      // this was previously unconditionally excluding every subtotal row
+      // from candidate-matching, silently losing ocf/fcfMargin for any
+      // filer whose real 20-F discloses no separate, differently-worded
+      // line beyond this exact subtotal). Still excluded from the
+      // section-sum accumulation just below -- that sum is specifically
+      // for reconciling the itemized ADJUSTMENT lines against this
+      // subtotal (Check D), not for folding the subtotal into its own sum.
+    } else if (currentSection) {
       for (let ci = 0; ci < annualIdxs.length; ci++) {
         const data = (sectionDataByColumn[ci][currentSection] = sectionDataByColumn[ci][currentSection] || { sum: 0, subtotal: null });
         data.sum += row.values[annualIdxs[ci]];
