@@ -2703,9 +2703,21 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // anchor (usually revenue) correctly carries the other concepts along
   // with it, rather than leaving them uncorrected for lack of their own
   // evidence.
-  const scale = detectScaleMultiplier(pointsByConcept, annualByEnd);
-  if (scale !== 1) {
+  //
+  // That assumption doesn't always hold, though -- see detectScaleMultiplier's
+  // own comment for the real ASR counter-example (income statement in raw
+  // pesos, cash-flow statement "$ in Thousands", same filing). `global` is
+  // this function's ORIGINAL single shared scale, still applied to any
+  // concept with no strong disagreeing evidence of its own; `perConcept`
+  // (from a concept whose OWN evidence actually disagrees) overrides it
+  // for just that concept, resolved per concept below via `scaleFor`.
+  const { global: globalScale, perConcept: conceptScaleOverrides } = detectScaleMultiplier(pointsByConcept, annualByEnd);
+  if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG scale-resolution', 'global', globalScale, 'perConcept', JSON.stringify([...conceptScaleOverrides]));
+  const scaleFor = (concept) => conceptScaleOverrides.get(concept) ?? globalScale;
+  if (globalScale !== 1 || conceptScaleOverrides.size) {
     for (const [concept, points] of pointsByConcept) {
+      const scale = scaleFor(concept);
+      if (scale === 1) continue;
       // A share COUNT is USUALLY never abbreviated the way a dollar figure
       // is -- verified live: STNG's earnings-release table states OCF/
       // capex/net income "in thousands" but its weighted-average-share-
@@ -3036,12 +3048,37 @@ const SCALE_CANDIDATES = [1, 1000, 1000000, 0.001, 0.000001];
 
 // pointsByConcept: Map<concept, points[]>. annualByEnd: { [concept]:
 // Map<end, {end, value}> }. Scores each candidate scale against EVERY
-// concept's own evidence and sums the scores together — a concept with no
-// usable recent annual anchor of its own (score 0 for every candidate)
-// simply doesn't vote, rather than dragging the shared result back to "no
-// correction"; see the call site for why sharing one scale across concepts
-// from the same filing is the right model in the first place.
+// concept's own evidence. Returns { global, perConcept }: `global` sums
+// every concept's score together (the original model — correct for the
+// common case where one unit convention really does run through the
+// whole release, and the only way a concept with no recent annual anchor
+// of its own ever gets a sensible scale at all); `perConcept` is a
+// Map<concept, scale> holding ONLY the concepts whose OWN evidence (score
+// >= 1 at some candidate, independent of every other concept) actually
+// disagrees with the global pick — the call site uses this to let that
+// one concept's own, stronger signal win instead of inheriting a scale
+// that fits everything else in the filing but not it.
+//
+// Verified live this split is necessary, not just theoretical: ASR's own
+// July-2026 6-K earnings release states its income statement (revenue/
+// EBIT/net income) in raw pesos but its cash-flow statement specifically
+// "$ in Thousands" — a real, same-filing, same-filer mixed-scale
+// situation the original single-shared-scale design (see this file's own
+// prior comment: "a real filing never mixes 'revenue in millions' with
+// 'OCF in thousands' in the same release") assumed could never happen.
+// Revenue/EBIT's own strong, consistent signal correctly won the GLOBAL
+// vote at scale=1, which then got applied to OCF too, leaving its real
+// FY'25 value ~1000x too small (12,348,613 instead of
+// 12,348,613,000) — silently producing a near-zero fcfMargin input and,
+// since fcfMargin needs BOTH ocf and capex, usually no fcfMargin trend
+// published at all.
 function detectScaleMultiplier(pointsByConcept, annualByEnd) {
+  const scoreByConceptAndScale = new Map(); // concept -> Map<scale, score>
+  const recordConceptScore = (concept, scale) => {
+    if (!scoreByConceptAndScale.has(concept)) scoreByConceptAndScale.set(concept, new Map());
+    const byScale = scoreByConceptAndScale.get(concept);
+    byScale.set(scale, (byScale.get(scale) || 0) + 1);
+  };
   let bestScale = 1;
   let bestScore = -1;
   for (const scale of SCALE_CANDIDATES) {
@@ -3108,7 +3145,10 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
         // [30%, 105%] of that year's total (generous bounds for
         // seasonality and the possibility all 4 are present) — not a
         // sliver of the year (a scale mismatch) and not wildly over it.
-        if (ratio >= 0.3 && ratio <= 1.05) score++;
+        if (ratio >= 0.3 && ratio <= 1.05) {
+          score++;
+          recordConceptScore(concept, scale);
+        }
       }
 
       // A SECOND, cross-year comparison for a lone full-fiscal-year point
@@ -3152,7 +3192,10 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
           if (process.env.DEBUG_FILING_EXTRACT) {
             console.error('DEBUG detectScaleMultiplier crossYear', concept, year, 'vs', annual.end, 'scale', scale, 'val', p.val, 'annual.value', annual.value, 'ratio', ratio);
           }
-          if (ratio >= 0.05 && ratio <= 20) score++;
+          if (ratio >= 0.05 && ratio <= 20) {
+            score++;
+            recordConceptScore(concept, scale);
+          }
         }
       }
     }
@@ -3161,7 +3204,31 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
       bestScale = scale;
     }
   }
-  return bestScore > 0 ? bestScale : 1;
+  const global = bestScore > 0 ? bestScale : 1;
+
+  // Per-concept override: only for a concept whose OWN best-scoring scale
+  // (>= 1 real match, same plausibility bands as above — never a guess)
+  // actually disagrees with the global pick. A concept with no evidence of
+  // its own, or whose own evidence already agrees with global, is left out
+  // entirely and falls through to `global` at the call site — same
+  // "doesn't vote on its own, inherits the filing's convention" behavior
+  // the original design already relied on for a sparse concept.
+  const perConcept = new Map();
+  for (const [concept, byScale] of scoreByConceptAndScale) {
+    let conceptBestScale = null;
+    let conceptBestScore = 0;
+    for (const [scale, score] of byScale) {
+      if (score > conceptBestScore) {
+        conceptBestScore = score;
+        conceptBestScale = scale;
+      }
+    }
+    if (conceptBestScale != null && conceptBestScale !== global) {
+      perConcept.set(concept, conceptBestScale);
+    }
+  }
+
+  return { global, perConcept };
 }
 
 const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
