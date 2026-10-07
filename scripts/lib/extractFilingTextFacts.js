@@ -91,6 +91,128 @@ const MIN_SUBSTANTIVE_FILING_BYTES = 160000;
 const MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES = {
   CAAS: 100000, // comfortably above its 55,388-byte routine ceiling, below its 146,056-byte real floor
 };
+
+// Per-filer native reporting currency -- every OTHER filer this pipeline
+// handles either reports natively in USD or discloses a parallel USD
+// convenience-translation column the currency-triple/group-label logic
+// above already picks out (CURRENCY_CODE_CELL/UNIT_CURRENCY_LABEL_CELL).
+// Verified live: TSM (Taiwan Semiconductor)'s real quarterly "Consolidated
+// Financial Statements" exhibit (e.g. tsmc2025q1consolidatdfinan.htm)
+// states every table "(In Thousands of New Taiwan Dollars...)" with NO
+// USD column anywhere -- USD only ever appears in unstructured prose
+// elsewhere ("In US dollars, revenue was $40.20 billion"). Hand-verified
+// only, same philosophy as MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES/
+// CIK_CONTINUITY_ALIASES above -- never an automatic per-filer currency
+// detector (a wrong guess here would silently corrupt every value it
+// touches, worse than leaving the gap alone). Add an entry only after
+// confirming the filer's own structured tables truly carry no USD column
+// at all (reconciliation would otherwise catch a scale error eventually,
+// but a currency error can clear reconciliation entirely e.g. two TWD
+// figures agreeing with each other). See convertNativeCurrencyToUsd's own
+// comment for the conversion methodology and its own verification.
+const NATIVE_CURRENCY_OVERRIDES = {
+  TSM: 'TWD',
+};
+
+// --- Native-currency-to-USD conversion ---------------------------------
+// For filers in NATIVE_CURRENCY_OVERRIDES above, whose structured tables
+// provide no USD column at all (unlike the currency-triple/convenience-
+// translation shapes the rest of this file already handles). Uses the
+// Federal Reserve's own published daily exchange rate (FRED series, free,
+// no API key: https://fred.stlouisfed.org/graph/fredgraph.csv?id=<series>)
+// -- verified live for TWD: averaging DEXTAUS (New Taiwan Dollars per US
+// dollar) across 2026 Q2 (Apr 1 - Jun 30) gives $40.198B against TSMC's own
+// disclosed "$40.20 billion" Q2'26 USD revenue, on a $40.2B base -- i.e.
+// the exact methodology TSMC itself uses for its own USD disclosure, not
+// an independently-chosen approximation.
+//
+// A DURATION (flow) concept -- revenue/netIncome/ebit/pretaxIncome/ocf/
+// capex, every one of this file's income-statement and cash-flow concepts
+// -- is converted using the AVERAGE daily rate across its own [start, end]
+// window, the standard convenience-translation convention for a flow
+// figure (confirmed by the TSM verification above). An INSTANT (balance-
+// sheet) concept -- equity/debt/cash -- instead uses the single rate as of
+// (or nearest before) its own end date, the standard convention for a
+// point-in-time balance, never an average over a period it doesn't span.
+const FX_SERIES_BY_CURRENCY = {
+  // Do not add a currency here without the same kind of independent
+  // verification against a real, filer-disclosed USD figure (see comment
+  // above) -- an unverified series id or rate direction would silently
+  // corrupt every value it touches, which is worse than leaving the gap.
+  TWD: 'DEXTAUS',
+};
+
+const fxRateSeriesCache = new Map(); // currency code -> sorted [{date, rate}] | null, fetched at most once per process
+
+async function fetchFxRateSeries(currency) {
+  if (fxRateSeriesCache.has(currency)) return fxRateSeriesCache.get(currency);
+  const seriesId = FX_SERIES_BY_CURRENCY[currency];
+  if (!seriesId) {
+    fxRateSeriesCache.set(currency, null);
+    return null;
+  }
+  let series = null;
+  try {
+    const res = await fetchWithTimeout(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${seriesId}`, {});
+    if (res.ok) {
+      const csv = await res.text();
+      series = csv
+        .trim()
+        .split('\n')
+        .slice(1) // header row
+        .map((line) => {
+          const [date, rawVal] = line.split(',');
+          const rate = Number(rawVal);
+          return date && Number.isFinite(rate) ? { date, rate } : null;
+        })
+        .filter(Boolean);
+    }
+  } catch {
+    series = null;
+    // Non-fatal -- same graceful-degradation philosophy as every other
+    // network fetch in this file. A failed FX fetch just means this
+    // filer's points can't be converted (and so aren't recorded) this run,
+    // not a thrown error that would take down every other concept/filing.
+  }
+  fxRateSeriesCache.set(currency, series);
+  return series;
+}
+
+// Mean of every daily rate within [startIso, endIso] inclusive -- the
+// convenience-translation convention for a flow figure, see this section's
+// own header comment for the live TSM verification.
+function averageFxRate(series, startIso, endIso) {
+  const inRange = series.filter((p) => p.date >= startIso && p.date <= endIso);
+  if (!inRange.length) return null;
+  return inRange.reduce((sum, p) => sum + p.rate, 0) / inRange.length;
+}
+
+// The most recent real rate ON OR BEFORE endIso -- the convention for a
+// point-in-time balance. Falls back to the earliest available rate only
+// when every real rate is AFTER endIso (a period older than this file's
+// own fetched window), rather than returning null for a plausible date
+// just outside the exact window.
+function nearestFxRateOnOrBefore(series, endIso) {
+  let best = null;
+  for (const p of series) {
+    if (p.date > endIso) continue;
+    if (!best || p.date > best.date) best = p;
+  }
+  return best ? best.rate : series.length ? series[0].rate : null;
+}
+
+// `period` is {start, end} (ISO strings) for a duration concept, or just
+// {end} for an instant one (start omitted/null). Returns null (never a
+// guessed value) when no currency override applies, the FX fetch failed,
+// or no rate exists anywhere near the requested date -- the caller treats
+// null exactly like any other unextractable value, never publishing a
+// fabricated figure.
+async function convertNativeCurrencyToUsd(value, currency, period) {
+  const series = await fetchFxRateSeries(currency);
+  if (!series || !series.length) return null;
+  const rate = period.start ? averageFxRate(series, period.start, period.end) : nearestFxRateOnOrBefore(series, period.end);
+  return rate ? value / rate : null;
+}
 const FILING_LOOKBACK_ENTRIES = 400; // how far into submissions.json's 'recent' list to look for size-qualifying candidates
 const MIN_EXHIBIT_BYTES = 20000; // cover-page heuristic — verified live: STNG's 6-K cover page was 11,450 bytes, its real earnings exhibit 733,171 bytes
 const RECONCILE_TOLERANCE = 0.02; // 2%
@@ -331,7 +453,19 @@ const LABEL_ALIASES = {
     // row and from each other, so without this they multiply the
     // "attributable to (parent)" tiebreak's candidate count well past 1,
     // defeating that tiebreak even after the non-GAAP exclude above.
-    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b|non-gaap|\bbasic\b|\bdiluted\b/i,
+    // "net income tax" added -- verified live: PAC (Grupo Aeroportuario
+    // del Pacifico)'s statement of changes in equity has an OCI
+    // remeasurement line, "Remeasurements of employee benefit – net income
+    // tax" -- means "net OF income tax", completely unrelated to the real
+    // net-income metric, but matches the base include pattern's "net
+    // income\b" alternative as a plain substring (the \b after "income"
+    // only requires a word boundary, which the following space satisfies).
+    // This single false candidate, with its own small, different value,
+    // made resolveConceptCandidates see two disagreeing "netIncome"
+    // candidates in the SAME table as the real "Net income" row and bail
+    // on the ambiguity -- silently losing a real, otherwise-cleanly-
+    // extracted value, not just adding a wrong one.
+    exclude: /shares?\b|attributable to (non|minority)|from (continuing|discontinued)|margin|growth|\bbefore\b|non-gaap|\bbasic\b|\bdiluted\b|net income tax/i,
   },
   // ROIC's numerator (mirrors EBIT_CONCEPTS in generateForeignFilingsCache.js
   // -- ProfitLossFromOperatingActivities/ProfitLossBeforeTax). Verified
@@ -364,7 +498,17 @@ const LABEL_ALIASES = {
     // previously-unambiguous match into a real conflict that suppressed
     // ebit entirely for this filer. A real operating-income SUBTOTAL is
     // never itself prefixed "Other" in standard accounting presentation.
-    exclude: /per share|margin|growth|^other\b/i,
+    // "non-?operating" added -- verified live: TSM's real income statement
+    // has a "Total non-operating income and expenses" subtotal (the
+    // interest/FX/equity-method-investment section below the real operating-
+    // income line), which the include pattern's own "operating income"
+    // alternative matches as a plain substring ("non-operating income"
+    // contains it) with no word-boundary protecting the "non-" prefix.
+    // This single wrong match (value ~$24M) beat the real "INCOME FROM
+    // OPERATIONS" subtotal (value ~$407M) in the ambiguity tiebreak below,
+    // silently producing an EBIT figure ~17x too small. A non-operating
+    // section is definitionally the opposite of what this concept wants.
+    exclude: /per share|margin|growth|^other\b|non-?operating/i,
   },
   // Fallback for a filer with no operating-income subtotal at all --
   // verified live: Ardmore Shipping (ASC) nets interest/gains-on-sale in
@@ -508,7 +652,22 @@ const LABEL_ALIASES = {
     // operating-activities adjustment, or "Gain on disposal of property,
     // plant and equipment") that are NOT capex; anchoring to the full label
     // matches only when the row's entire text IS the asset name itself.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|^(mineral )?propert(y|ies),? plant and equipment$/i,
+    // "investments? in.*concession" added -- verified live: ASR (Grupo
+    // Aeroportuario del Sureste, an airport CONCESSION operator) labels its
+    // real investing-section capex line "Investments in machinery,
+    // furniture, equipment and concession improvements" -- a SEVENTH
+    // distinct real-world phrasing, matching neither "vessels" nor
+    // "property" (an airport concession holder improves the CONCESSION
+    // right itself, not owned real estate, so "property" never appears in
+    // its own capex line at all). ".*" bounded by requiring "investments?
+    // in" at the start and "concession" later in the SAME label -- the
+    // multi-noun list in between ("machinery, furniture, equipment and")
+    // varies by filer, but "concession improvements" is the fixed anchor
+    // every Mexican airport-concession operator (ASR/PAC/OMAB, all under
+    // the same regulatory concession structure) plausibly shares, since
+    // all three file under the same IFRS convention for an identical
+    // business model.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|^(mineral )?propert(y|ies),? plant and equipment$/i,
     exclude: /proceeds|disposal|\bsale of\b|depreciation|amortization|gain on|loss on/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -532,7 +691,16 @@ const LABEL_ALIASES = {
     // a real but different, non-total figure). Anchoring to the full label
     // is required here -- a generic unanchored "\bequity\b" would also
     // match that non-total line and several others in the same section.
-    include: /total (shareholders|stockholders)('|s)? equity|total equity|^equity$/i,
+    // "(shareholder|stockholder)s?('s|s'|s)?" -- verified live: PAC (Grupo
+    // Aeroportuario del Pacifico) labels its real grand-total equity row
+    // "Total stockholder's equity" -- SINGULAR "stockholder" with a
+    // possessive "'s", not the plural "stockholders(')" every other
+    // alternative here already covered. The old fixed "stockholders"
+    // substring (plural, no apostrophe) never matched "stockholder's" at
+    // all (missing the second "s" before the apostrophe), silently
+    // dropping PAC's equity row from EVERY cadence -- same failure shape
+    // whether the row is otherwise perfectly clean or not.
+    include: /total (shareholder|stockholder)s?('s|s'|s)?\s+equity|total equity|^equity$/i,
     exclude: /per share/i,
   },
   debt: {
@@ -784,7 +952,18 @@ function nonEmptyCells($, row) {
 // "Ended". This ticker in particular has surfaced several distinct real
 // header phrasings already (see "Quarters Ended" above) -- another
 // legitimate variant, not a one-off typo.
-const PERIOD_PHRASE_INDICATOR = /months?( periods?)? ended|quarters?( periods?)? ended|years?( periods?)? ended/i;
+// \s+ (not a literal space) before "period(s)"/"ended" -- verified live:
+// ASR's real cash-flow caption line-wraps as "Six-month\nperiods ended June
+// 30, 2026 and 2025" (a genuine newline where a literal space sat in every
+// other filer's single-line version of this phrase) -- silently failed to
+// match at all, leaving findExternalPeriodPhrases with nothing and the
+// cash-flow table's own bare "2026 | 2025" year columns with no duration
+// to pair against (this table has no in-row period phrase of its own,
+// unlike ASR's income statement a few pages earlier, which does and so
+// was unaffected). Same newline-vs-space artifact already fixed for
+// STATEMENT_HEADINGS' own internal spaces (see HXHX's comment there) --
+// just never extended to this indicator.
+const PERIOD_PHRASE_INDICATOR = /months?\s+(periods?\s+)?ended|quarters?\s+(periods?\s+)?ended|years?\s+(periods?\s+)?ended/i;
 
 function parsePeriodPhrase(text) {
   // "months?" (not just plural "months") on every count -- verified live:
@@ -1266,6 +1445,31 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
             valueIndices: finalKeepIndices,
           };
         }
+      }
+
+      // A TWELFTH header shape, verified live: TSM (Taiwan Semiconductor)'s
+      // real "Consolidated Statements of Comprehensive Income" interleaves
+      // a "% of revenue" column between periods -- a sub-header row reading
+      // "Amount" | "%" | "Amount" | "%" sitting directly under the bare-year
+      // row, doubling the raw cell count per date column without any
+      // currency marker at all (so neither currency check above fires).
+      // Every data row then carries a matching value+percent pair per
+      // period (e.g. "$839,253,664" | "100" for 2025's Net Revenue -- "100"
+      // meaning "100% of revenue", not a second currency or a real figure).
+      // Reuses the exact same rawColumnCount/valueIndices mechanism as the
+      // currency-triple expansion above, just keeping each pair's "Amount"
+      // slot and dropping its "%" one.
+      if (
+        nextRowCells.length === columns.length * 2 &&
+        nextRowCells.every((c, idx) => (idx % 2 === 0 ? /^Amounts?$/i.test(c.text) : /^%$/.test(c.text)))
+      ) {
+        const keepIndices = columns.map((_, colIdx) => colIdx * 2);
+        return {
+          columns,
+          dataStartRowIdx: i + 2,
+          rawColumnCount: nextRowCells.length,
+          valueIndices: keepIndices,
+        };
       }
 
       return { columns, dataStartRowIdx: i + 1 };
@@ -1833,14 +2037,69 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap) {
 // <Day>, <Year>" shape parseDateHeaderCell already recognizes (reused
 // as-is, unchanged) — just with no preceding period-length phrase to
 // combine with, since each date IS its own complete instant column.
-function parseInstantTableColumns($, table, externalColumnDates = null) {
+// Detects a trailing "Change" + "%" pair of EXTRA header cells beyond the
+// real date columns -- verified live: PAC (Grupo Aeroportuario del
+// Pacifico)'s real balance sheet headers each row "2025 | 2026 | Change |
+// %", where every data row then carries a matching extra ABSOLUTE
+// difference value immediately before its own "%" cell (e.g. "16,227,819
+// | 23,185,136 | 6,957,317 | 42.9 | %" for Cash and cash equivalents) --
+// unlike the duration-side CPA precedent (a bare percent only, no
+// absolute-difference number), parseDataRow's existing single-value %-pop
+// isn't enough here: it correctly drops the percent but leaves the
+// absolute-difference value behind, overcounting every row by exactly 1
+// and silently rejecting 100% of this table's rows as malformed (values.
+// length never equals columnCount). Mirrors the duration-side currency-
+// triple's own rawColumnCount/valueIndices mechanism -- kept to this one
+// specific, verified 2-extra-cell shape rather than a speculative general
+// rule, since an unindicated real reason columnCount might differ (e.g. a
+// genuine third real date column) must never be silently discarded.
+function detectTrailingChangeColumns(headerCells, realColumnCount) {
+  if (headerCells.length !== realColumnCount + 2) return null;
+  const [change, pct] = headerCells.slice(realColumnCount);
+  if (!/^change$/i.test(change.text) || !/^%$/.test(pct.text)) return null;
+  // The expected POST-popping value count, not the header's own raw cell
+  // count -- parseDataRow's existing single-value "%"-marker pop already
+  // consumes the computed percent NUMBER and its own "%" sign by itself
+  // (same mechanism the duration-side CPA precedent relies on), so the
+  // header's 2 extra cells ("Change" + "%") collapse to just ONE lingering
+  // numeric value per row (the absolute difference itself, which nothing
+  // else marks for removal) -- verified live: PAC's "Cash and cash
+  // equivalents" row is "16,227,819 | 23,185,136 | 6,957,317 | 42.9 | %"
+  // (5 raw cells), which parseDataRow's own popping already reduces to 3
+  // values before this function's columnCount check ever sees it, not 4.
+  return { rawColumnCount: realColumnCount + 1, valueIndices: Array.from({ length: realColumnCount }, (_, idx) => idx) };
+}
+
+function parseInstantTableColumns($, table, externalColumnDates = null, externalBareMonthDay = null) {
   const rows = $(table).find('tr').toArray();
   for (let i = 0; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     const dateCells = cells.map((c) => parseDateHeaderCell(c.text)).filter((d) => d && d.monthDay);
     if (dateCells.length >= 2) {
       const columns = dateCells.map((d) => ({ endMonthDay: d.monthDay, year: d.year }));
-      return { columns, dataStartRowIdx: i + 1 };
+      const trailing = detectTrailingChangeColumns(cells, columns.length);
+      return trailing ? { columns, dataStartRowIdx: i + 1, ...trailing } : { columns, dataStartRowIdx: i + 1 };
+    }
+  }
+  // A bare-year-only header row ("2025 | 2026 | Change | %", no month/day
+  // of its own -- isYearCell's branch of parseDateHeaderCell always
+  // returns monthDay:null, so the loop above can never resolve it),
+  // combined with a caption that states the shared month/day WITHOUT a
+  // year of its own ("as of March 31 (in thousands of pesos)" -- both
+  // comparison years share the same fiscal quarter-end, so PAC's filer
+  // states the day just once). Neither source alone carries a complete
+  // date; externalColumnDates (below) requires a FULL date with year and
+  // finds nothing in a caption like this either. Tried only after both
+  // stronger sources above have already failed.
+  if (externalBareMonthDay) {
+    for (let i = 0; i < rows.length; i++) {
+      const cells = nonEmptyCells($, rows[i]);
+      const yearCells = cells.filter((c) => isYearCell(c.text));
+      if (yearCells.length >= 2) {
+        const columns = yearCells.map((c) => ({ endMonthDay: externalBareMonthDay, year: extractYear(c.text) }));
+        const trailing = detectTrailingChangeColumns(cells, columns.length);
+        return trailing ? { columns, dataStartRowIdx: i + 1, ...trailing } : { columns, dataStartRowIdx: i + 1 };
+      }
     }
   }
   // Fallback shape, verified live: SGHC's real balance-sheet caption states
@@ -1900,16 +2159,41 @@ function findExternalInstantColumnDates($, allEls, startIdx, endIdx) {
   return dates;
 }
 
+// A bare "<Month> <Day>" with NO year -- unlike findDatesInText above
+// (which requires one). Verified live: PAC's real balance-sheet caption
+// reads "Consolidated statement of financial position as of March 31 (in
+// thousands of pesos)" -- no year anywhere in the caption at all, since
+// both comparison years (2025/2026) share the same fiscal quarter-end
+// month/day and the filer only states it once. Tried only as a last
+// resort (see parseInstantTableColumns' own comment) -- a caption that
+// DOES carry a real year is already handled by findExternalInstantColumnDates
+// above, called first by this function's caller.
+function findExternalBareMonthDay($, allEls, startIdx, endIdx) {
+  for (let i = startIdx; i < endIdx; i++) {
+    const $el = $(allEls[i]);
+    const text = $el.text();
+    if (!isHeadingLeaf($, $el) || text.length > MAX_HEADING_TEXT_LENGTH) continue;
+    const m = text.match(/as\s+(?:of|at)\s+([A-Za-z]+\.?\s+\d{1,2})/i);
+    if (m) return m[1].replace(/\.$/, '');
+  }
+  return null;
+}
+
 // Parses every date column in an already-located balance-sheet <table> —
 // unlike extractFromTable (which targets ONE specific quarter), every
 // column here is independently useful (a filing's own current-period AND
 // prior-year-comparative snapshots are both real, previously-undisclosed-
 // elsewhere data points), so this returns one result per column rather than
 // a single target period.
-function extractFromInstantTable($, table, aliasMap, externalColumnDates = null) {
-  const parsed = parseInstantTableColumns($, table, externalColumnDates);
+function extractFromInstantTable($, table, aliasMap, externalColumnDates = null, externalBareMonthDay = null) {
+  const parsed = parseInstantTableColumns($, table, externalColumnDates, externalBareMonthDay);
   if (!parsed) return [];
-  const { columns, dataStartRowIdx } = parsed;
+  const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
+  // See extractFromTable's identical rawColumnCount/valueIndices handling
+  // -- only ever set by parseInstantTableColumns' own trailing-Change/%
+  // detection (see detectTrailingChangeColumns), absent for every other
+  // header shape, where this is exactly the pre-existing behavior.
+  const parsedRowColumnCount = rawColumnCount ?? columns.length;
   // See extractAllAnnualColumnsFromTable's identical call -- this table's
   // own header ("$ in Thousands"/"in Millions") applies here too, and
   // without it a balance-sheet concept comes out 1000x too SMALL relative
@@ -1929,8 +2213,9 @@ function extractFromInstantTable($, table, aliasMap, externalColumnDates = null)
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
-    const row = parseDataRow(cells, columns.length);
+    const row = parseDataRow(cells, parsedRowColumnCount);
     if (!row) continue;
+    if (valueIndices) row.values = valueIndices.map((idx) => row.values[idx]);
     if (scale !== 1) row.values = row.values.map((v) => v * scale);
     for (const concept of Object.keys(aliasMap)) {
       if (!matchesConcept(row.label, concept)) continue;
@@ -2215,7 +2500,15 @@ function extractInstantStatement($, headingRegex, aliasMap) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
       const tableIdx = allEls.indexOf(table);
       const externalColumnDates = tableIdx > headingIdx ? findExternalInstantColumnDates($, allEls, headingIdx + 1, tableIdx) : [];
-      const result = extractFromInstantTable($, table, aliasMap, externalColumnDates);
+      // Scanned from headingIdx itself (inclusive), not headingIdx + 1 --
+      // verified live: PAC's real caption ("...as of March 31 (in
+      // thousands of pesos):") sits in the SAME leaf as the heading text
+      // itself ("Exhibit B: Consolidated statement of financial position
+      // as of March 31..."), not a separate sibling after it. Only tried
+      // when the stronger, full-date source above found nothing, so this
+      // can't override a real multi-year caption elsewhere.
+      const externalBareMonthDay = externalColumnDates.length < 2 && tableIdx >= headingIdx ? findExternalBareMonthDay($, allEls, headingIdx, tableIdx) : null;
+      const result = extractFromInstantTable($, table, aliasMap, externalColumnDates, externalBareMonthDay);
       const factCount = result.reduce((sum, r) => sum + Object.keys(r.facts).length, 0);
       if (result.length && factCount > bestFactCount) {
         best = result;
@@ -2352,6 +2645,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   if (!submissions?.filings?.recent) return {};
 
   const minSubstantiveBytes = MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES[symbol] ?? MIN_SUBSTANTIVE_FILING_BYTES;
+  const nativeCurrency = NATIVE_CURRENCY_OVERRIDES[symbol] || null;
   const r = submissions.filings.recent;
   const filings = [];
   for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN; i++) {
@@ -2388,7 +2682,14 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // from `r.form[i] === '6-K'` exactly (never '6-K/A'), so any two entries
   // here are genuinely independent original filings, not a filing and its
   // own amendment.
-  function recordExtracted(extracted, filing) {
+  // nativeCurrency is set once per call to extractQuarterlyFactsFromFilings
+  // (null for the ~1000+ filers this file already handles without it) --
+  // see NATIVE_CURRENCY_OVERRIDES' own comment. Every value this function
+  // records has already been through convertNativeCurrencyToUsd by the
+  // time it reaches `collected`, so nothing downstream of this function
+  // (reconciliation, decumulation, dedupeAndClassify) needs to know or
+  // care that a conversion ever happened.
+  async function recordExtracted(extracted, filing) {
     if (!extracted) return;
     const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
     if (!endIso) return;
@@ -2401,9 +2702,16 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     // H1 fact already would be.
     const startIso = subtractMonths(endIso, extracted.period.months);
     for (const [concept, fact] of Object.entries(extracted.facts)) {
+      let val = fact.value3mo;
+      let valueCumulative = fact.valueCumulative;
+      if (nativeCurrency) {
+        val = val != null ? await convertNativeCurrencyToUsd(val, nativeCurrency, { start: startIso, end: endIso }) : null;
+        valueCumulative = valueCumulative != null ? await convertNativeCurrencyToUsd(valueCumulative, nativeCurrency, { start: startIso, end: endIso }) : null;
+        if (val == null) continue; // FX fetch/lookup failed -- never record a half-converted or fabricated figure
+      }
       const list = collected[concept].get(endIso) || [];
       if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
-        list.push({ start: startIso, end: endIso, val: fact.value3mo, valueCumulative: fact.valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
+        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
       }
       collected[concept].set(endIso, list);
     }
@@ -2413,14 +2721,19 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // balance-sheet snapshot has no duration), and extractFromInstantTable
   // already returns one entry PER DATE COLUMN, so this is called once per
   // column rather than once per statement.
-  function recordExtractedInstant(extractedList, filing) {
+  async function recordExtractedInstant(extractedList, filing) {
     for (const extracted of extractedList) {
       const endIso = monthDayYearToIso(extracted.period.endMonthDay, extracted.period.year);
       if (!endIso) continue;
       for (const [concept, fact] of Object.entries(extracted.facts)) {
+        let val = fact.value;
+        if (nativeCurrency) {
+          val = val != null ? await convertNativeCurrencyToUsd(val, nativeCurrency, { end: endIso }) : null;
+          if (val == null) continue;
+        }
         const list = collected[concept].get(endIso) || [];
         if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
-          list.push({ end: endIso, val: fact.value, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
+          list.push({ end: endIso, val, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
         }
         collected[concept].set(endIso, list);
       }
@@ -2485,7 +2798,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
               continue;
             }
             if (debug) console.error('DEBUG extractFromInstantRFile result', rUrl, JSON.stringify(extractedList));
-            recordExtractedInstant(extractedList, filing);
+            await recordExtractedInstant(extractedList, filing);
             continue;
           }
           for (const year of candidateYears) {
@@ -2497,7 +2810,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
               continue;
             }
             if (debug) console.error('DEBUG extractFromRFile result', rUrl, year, JSON.stringify(extracted));
-            recordExtracted(extracted, filing);
+            await recordExtracted(extracted, filing);
           }
         }
       }
@@ -2563,7 +2876,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
             continue;
           }
           if (debug) console.error('DEBUG extractStatement result', url, year, JSON.stringify(extracted));
-          recordExtracted(extracted, filing);
+          await recordExtracted(extracted, filing);
         }
       }
 
@@ -2584,7 +2897,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
             continue;
           }
           if (debug) console.error('DEBUG extractMdaCashFlowSummary result', url, year, JSON.stringify(extracted));
-          recordExtracted(extracted, filing);
+          await recordExtracted(extracted, filing);
         }
       }
 
@@ -2598,7 +2911,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           extractedList = [];
         }
         if (debug) console.error('DEBUG extractInstantStatement result', url, JSON.stringify(extractedList));
-        recordExtractedInstant(extractedList, filing);
+        await recordExtractedInstant(extractedList, filing);
       }
     }
   }
