@@ -441,7 +441,10 @@ function dedupeAndClassify(rawFacts) {
 
   quarterly.sort((a, b) => new Date(a.end) - new Date(b.end));
   annual.sort((a, b) => new Date(a.end) - new Date(b.end));
-  return { quarterly, annual };
+  // h1 returned too so the caller can tell "this filer only ever discloses
+  // this concept half-yearly" (h1 present, no quarter derivable) apart from
+  // "no data at all" -- see semiAnnualCashFlow below.
+  return { quarterly, annual, h1 };
 }
 
 // Balance-sheet concepts (Equity, Cash, Borrowings) are INSTANT facts — a
@@ -999,6 +1002,12 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   // metric rather than recomputing it per pipeline.
   if (!out.quarterly && !out.ttm && out.yearly) {
     out.annualOnlyFiler = true;
+  }
+  // Fresh run's verdict wins when it produced anything; otherwise keep the
+  // previous one rather than silently dropping a still-true disclosure fact.
+  for (const flag of ['semiAnnualCashFlow', 'semiAnnualBalanceSheet']) {
+    const hasFresh = freshEntry && Object.keys(freshEntry).length;
+    if (hasFresh ? freshEntry[flag] : existingEntry?.[flag]) out[flag] = true;
   }
   return out;
 }
@@ -1600,7 +1609,38 @@ async function processTicker(symbol, cik, isBank) {
   if (Object.keys(quarterly).length) result.quarterly = quarterly;
   if (Object.keys(yearly).length) result.yearly = yearly;
   if (Object.keys(ttm).length) result.ttm = ttm;
+  // Lets the app explain an empty Quarterly/TTM fcfMargin/roic as a real
+  // disclosure limit rather than a data gap -- verified live: ASR files
+  // full statements only for H1 (6-K) and the full year (20-F); its Q1/Q3
+  // releases carry income-statement highlights only, so OCF/capex exist
+  // solely as 6-month figures and the balance sheet solely at Jun 30 /
+  // Dec 31. Neither will ever yield a standalone quarter.
+  if (isSemiAnnualFlow(ocf)) result.semiAnnualCashFlow = true;
+  if (isSemiAnnualInstant(equityInstant)) result.semiAnnualBalanceSheet = true;
   return Object.keys(result).length ? result : null;
+}
+
+const SEMI_ANNUAL_LOOKBACK_DAYS = 730;
+
+// Recent half-year figures exist, but no recent standalone quarter does.
+function isSemiAnnualFlow(flow) {
+  const cutoff = Date.now() - SEMI_ANNUAL_LOOKBACK_DAYS * 86400000;
+  const recent = (points) => (points || []).filter((p) => new Date(p.end).getTime() >= cutoff);
+  return recent(flow.h1).length > 0 && recent(flow.quarterly).length === 0;
+}
+
+// At least two recent balance-sheet dates, and none closer than ~5 months
+// apart -- quarterly reporters have ~90-day gaps between snapshots.
+function isSemiAnnualInstant(points) {
+  const cutoff = Date.now() - SEMI_ANNUAL_LOOKBACK_DAYS * 86400000;
+  const ends = [...new Set((points || []).map((p) => p.end))]
+    .filter((e) => new Date(e).getTime() >= cutoff)
+    .sort();
+  if (ends.length < 2) return false;
+  for (let i = 1; i < ends.length; i++) {
+    if (daysBetween(ends[i - 1], ends[i]) < 150) return false;
+  }
+  return true;
 }
 
 async function main() {
