@@ -1003,9 +1003,16 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   return out;
 }
 
+// Cache-busting query param (not a change to fetchJson itself, which is
+// also shared with SEC API calls that don't need it) -- verified live
+// elsewhere this session: GitHub's raw-gist CDN served a genuinely stale
+// file minutes after a real, confirmed-via-git-clone push, the same CDN-
+// staleness trap this project's own standing instruction already works
+// around manually for human-run `gh gist` reads. A per-request-unique URL
+// can never be served from a stale cache entry.
 async function fetchPreviouslyPublished() {
   try {
-    const data = await fetchJson(GIST_FOREIGN_FILINGS_URL);
+    const data = await fetchJson(`${GIST_FOREIGN_FILINGS_URL}?_cb=${Date.now()}`);
     return data?.trends && typeof data.trends === 'object' ? data.trends : {};
   } catch {
     return {};
@@ -1598,9 +1605,10 @@ async function processTicker(symbol, cik, isBank) {
 
 async function main() {
   console.log('Fetching known foreign-filer list, sector-metrics feed, and SEC ticker->CIK map...');
+  const mainCacheBust = `_cb=${Date.now()}`;
   const [foreignFilerList, metricsDataset, tickerToCik, previouslyPublished] = await Promise.all([
-    fetchJson(GIST_FOREIGN_FILER_LIST_URL).catch(() => null),
-    fetchJson(GIST_METRICS_URL),
+    fetchJson(`${GIST_FOREIGN_FILER_LIST_URL}?${mainCacheBust}`).catch(() => null),
+    fetchJson(`${GIST_METRICS_URL}?${mainCacheBust}`),
     fetchTickerToCikMap(),
     fetchPreviouslyPublished(),
   ]);
