@@ -568,7 +568,20 @@ const LABEL_ALIASES = {
     // handled for pretaxIncome's own "(loss)" parenthetical just above,
     // never applied here too.
     include: /cash (flows? )?(\([^)]*\)\s*)?(from|provided by|generated (from|by)|used in|inflow|outflow).*operating|operating cash flow/i,
-    exclude: /investing|financing|discontinued/i,
+    // "before" added -- verified live: RCI (Rogers Communications)'s real
+    // cash-flow statement has TWO distinct lines both matching the include
+    // pattern above as a plain substring -- the real, final OCF subtotal
+    // ("Cash provided by operating activities", the one actually wanted)
+    // AND an earlier, PARTIAL intermediate subtotal ("Cash provided by
+    // operating activities before changes in net operating assets and
+    // liabilities, income taxes paid, and interest paid") that exists
+    // purely to show the effect of working-capital/tax/interest below it.
+    // Two real candidates with two different values in the same table is
+    // an unresolvable ambiguity to resolveConceptCandidates, which
+    // silently dropped ocf (and fcfMargin with it) entirely rather than
+    // picking either one -- not a false-POSITIVE-shaped bug like most
+    // other excludes here, but the same failure mode in practice.
+    exclude: /investing|financing|discontinued|\bbefore\b/i,
   },
   capex: {
     // "acquisition(s) of vessels"/"drydock" added -- verified live: STNG
