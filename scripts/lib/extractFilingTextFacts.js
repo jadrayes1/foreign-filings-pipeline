@@ -2333,8 +2333,26 @@ function extractFromInstantTable($, table, aliasMap, externalColumnDates = null,
 // enclosing <tr> (if any) to have exactly one non-empty cell -- the heading
 // itself -- to tell the two apart. A heading with no enclosing <tr> at all
 // (the common case -- a standalone <p>/<div>) is unaffected.
+// An EMPTY <a> child is also tolerated -- verified live: Telecom Argentina
+// (TEO) wraps its real heading as "<u><a name="un_005"></a>CONSOLIDATED
+// INCOME STATEMENTS</u>", an empty anchor acting as the bookmark target its
+// table-of-contents links to. The anchor holds no text, so the <u> still
+// reads as a single heading string via .text(), but the strict all-<br>
+// check rejected it -- and with the real heading unmatched, the only
+// remaining matches were TEO's table-of-contents entries, whose "next table
+// scanning forward" is not the statement at all. That silently cost TEO
+// every income-statement quarter from the filings using this shape.
+//
+// Deliberately narrow to empty ANCHORS rather than "any child contributing
+// no text": the looser version regressed NYAX live (lost four revenue/ocf/
+// capex quarters). Tolerating any empty child lets extra container elements
+// up the tree qualify as headings too, and since extractStatement takes the
+// first non-null result per CONCEPT, a newly-matched spurious heading whose
+// forward table yields *something* can beat the real statement table. An
+// empty <a> is unambiguously a bookmark target, so it admits the real
+// heading without widening the candidate set anywhere else.
 function isHeadingLeaf($, $el) {
-  if (!$el.children().toArray().every((c) => c.tagName === 'br')) return false;
+  if (!$el.children().toArray().every((c) => c.tagName === 'br' || (c.tagName === 'a' && !$(c).text().trim()))) return false;
   const tr = $el.closest('tr');
   if (!tr.length) return true;
   return nonEmptyCells($, tr[0]).length === 1;
