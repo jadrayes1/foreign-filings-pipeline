@@ -652,12 +652,34 @@ function buildRevenueGrowthTrend(revenueQuarterly) {
 
 // TTM-cadence revenue growth — YoY on a trailing-4-quarter-SUMMED revenue
 // figure rather than a single standalone quarter, mirroring the main app's
-// buildRevenueGrowthTTMFromFilings (src/utils/metrics.js). Only non-partial
-// (a full 4 consecutive quarters) windows are used — a partial TTM sum isn't
-// meaningfully comparable YoY against another partial sum.
+// buildRevenueGrowthTTMFromFilings (src/utils/metrics.js).
+//
+// Partial windows are KEPT, but a window is only ever compared against a
+// prior-year window of the SAME quarter count. Dropping every partial
+// window (the original behavior) silently deleted this metric outright for
+// sparsely-covered filers -- verified live: ASR (Grupo Aeroportuario del
+// Sureste) only ever yields standalone Q2 quarters, so every window was
+// partial and TTM revenueGrowth vanished entirely, even though its TTM
+// profitMargin and roic were both published from those very same single
+// quarters. buildRatioTrend (which powers those two) has always kept
+// partial windows and flagged them `partial`/`quartersUsed`, so requiring
+// 4 full quarters here made revenueGrowth the lone metric that disappeared
+// instead of rendering as a flagged partial point.
+//
+// The equal-quartersUsed requirement is what makes this sound: a 1-quarter
+// sum compared against a 4-quarter sum would be meaningless, while
+// 1-quarter vs the same quarter a year earlier is a real YoY comparison
+// (for ASR it equals the Quarterly-cadence figure, which already rendered).
+// The app only uses `partial` for bar styling, never to filter points, so a
+// flagged point is drawn as partial rather than hidden.
 function buildRevenueGrowthTTMTrend(revenueQuarterly) {
-  const windows = buildTrailingWindows(revenueQuarterly, 4).filter((w) => !w.partial);
-  const ttmPoints = windows.map((w) => ({ end: w.anchor.end, value: w.quarters.reduce((sum, q) => sum + q.value, 0) }));
+  const windows = buildTrailingWindows(revenueQuarterly, 4);
+  const ttmPoints = windows.map((w) => ({
+    end: w.anchor.end,
+    value: w.quarters.reduce((sum, q) => sum + q.value, 0),
+    partial: w.partial,
+    quartersUsed: w.quarters.length,
+  }));
 
   const points = [];
   for (const curr of ttmPoints) {
@@ -666,6 +688,7 @@ function buildRevenueGrowthTTMTrend(revenueQuarterly) {
     let best = null;
     let bestDiff = Infinity;
     for (const cand of ttmPoints) {
+      if (cand.quartersUsed !== curr.quartersUsed) continue;
       const diff = Math.abs(new Date(cand.end) - targetPriorEnd);
       if (diff < bestDiff) {
         bestDiff = diff;
@@ -674,7 +697,7 @@ function buildRevenueGrowthTTMTrend(revenueQuarterly) {
     }
     const withinTolerance = bestDiff <= 30 * 24 * 60 * 60 * 1000;
     const value = clampImplausible(withinTolerance && best && best.value ? (curr.value - best.value) / best.value : null);
-    if (value != null) points.push({ label: quarterLabelFromDate(curr.end), value });
+    if (value != null) points.push({ label: quarterLabelFromDate(curr.end), value, partial: curr.partial, quartersUsed: curr.quartersUsed });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
 }
