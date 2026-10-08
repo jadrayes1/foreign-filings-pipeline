@@ -689,7 +689,7 @@ const LABEL_ALIASES = {
     // operator (ASR/PAC/OMAB, all under the same regulatory concession
     // structure) plausibly shares, since all three file under the same
     // IFRS convention for an identical business model.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|concession.*(improvements?|furniture|equipment)|improvements?.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|^(mineral )?propert(y|ies),? plant and equipment$/i,
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|concession.*(improvements?|furniture|equipment)|improvements?.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|(cash )?paid for( \w+)? vessels?|payments? for( \w+)? vessels?|vessels? improvements?|^(mineral )?propert(y|ies),? plant and equipment$/i,
     exclude: /proceeds|disposal|\bsale of\b|depreciation|amortization|gain on|loss on/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
