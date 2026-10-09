@@ -1023,6 +1023,26 @@ function parsePeriodPhrase(text) {
 // inline elements with no text node between them in the source HTML).
 // Returns null for neither shape, so a genuinely unrelated cell (e.g. a
 // stray "Notes" or "(In millions...)" label) is correctly ignored.
+// SEC's financial-report renderer appends the column's UNIT to the date
+// cell itself whenever a table carries more than one unit -- verified live:
+// TSM's R-file income statement heads its columns "Dec. 31, 2025 TWD ($)
+// $ / shares" and "Dec. 31, 2025 USD ($) $ / shares". A single-unit filer's
+// cell is a bare "Dec. 31, 2025", which is why only multi-unit filers hit
+// this. Returns {ok} false unless the tail is NOTHING BUT unit noise, so
+// this stays as strict as the original anchored match for anything else
+// (e.g. "Dec. 31, 2025 and 2024" still correctly fails) -- and reports the
+// currency code when exactly one is present, so the caller can tell a
+// native column from a convenience translation.
+function parseDateCellUnitTail(tail) {
+  if (!tail || !tail.trim()) return { ok: true, currency: null };
+  let rest = tail.replace(/\bper\s+shares?\b/gi, ' ').replace(/\bshares?\b/gi, ' ');
+  const codes = rest.match(/\b[A-Z]{3}\b/g) || [];
+  rest = rest.replace(/\b[A-Z]{3}\b/g, ' ');
+  if (/[A-Za-z0-9]/.test(rest)) return { ok: false, currency: null };
+  if (codes.length > 1) return { ok: false, currency: null };
+  return { ok: true, currency: codes[0] || null };
+}
+
 function parseDateHeaderCell(text) {
   if (isYearCell(text)) return { year: extractYear(text), monthDay: null };
   // CANG's balance sheet (and presumably other filers') labels each date
@@ -1030,8 +1050,11 @@ function parseDateHeaderCell(text) {
   // prefix before the anchored date match rather than loosening the date
   // match itself, so this can't accidentally start matching non-date cells.
   const stripped = text.replace(/^as\s+(of|at)\s+/i, '').trim();
-  const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})$/);
-  if (compound) return { year: compound[3], monthDay: `${compound[1]} ${compound[2]}` };
+  const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})\b([\s\S]*)$/);
+  if (compound) {
+    const tail = parseDateCellUnitTail(compound[4]);
+    if (tail.ok) return { year: compound[3], monthDay: `${compound[1]} ${compound[2]}`, currency: tail.currency };
+  }
   // ASR-style "2Q 2026"/"2Q 2025" year-row cell -- a bare year prefixed
   // with its own quarter number, verified live in ASR's H1 2026 interim
   // 6-K, which pairs a "Six months period ended"/"Three months period
@@ -1136,7 +1159,7 @@ function allocateItemsToPhrases(itemCount, periodPhrases) {
   return periodPhrases.flatMap((phrase, idx) => Array(counts[idx]).fill(phrase));
 }
 
-function parseTableColumns($, table, externalPeriodPhrases = []) {
+function parseTableColumns($, table, externalPeriodPhrases = [], preferredCurrency = null) {
   const rows = $(table).find('tr').toArray();
   // A NINTH header shape, verified live: CPA's real cash-flow statement
   // states its period entirely OUTSIDE the <table> -- "Consolidated
@@ -1390,7 +1413,7 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
         // XBRL date and fails Check A/B/C reconciliation harmlessly, same
         // as any other unverified candidate in this file.
         const endMonthDay = date.monthDay || pendingMonthDay || phrase.endMonthDay || CALENDAR_QUARTER_END_BY_MONTHS[phrase.months];
-        return endMonthDay ? { months: phrase.months, endMonthDay, year: date.year } : null;
+        return endMonthDay ? { months: phrase.months, endMonthDay, year: date.year, currency: date.currency || null } : null;
       });
       if (columns.some((c) => !c)) continue; // neither row carries a date for some column — bail on this row, try the next
 
@@ -1492,6 +1515,60 @@ function parseTableColumns($, table, externalPeriodPhrases = []) {
           rawColumnCount: nextRowCells.length,
           valueIndices: keepIndices,
         };
+      }
+
+      // A THIRTEENTH header shape, verified live: TSM's R-file states each
+      // column's unit INSIDE the date cell ("Dec. 31, 2025 TWD ($)" beside
+      // "Dec. 31, 2025 USD ($)") instead of in a separate currency row, so
+      // neither currency check above fires. Left alone, ONE period appears
+      // as TWO columns whose values differ by the exchange rate, and the
+      // extractor can take whichever it reaches first -- confirmed live as
+      // the cause of TSM's FY2017 annual revenue being 32,977,300,000
+      // (really $32.98B USD) sitting in a series of TWD figures ~30x
+      // larger. Drop the convenience translation and keep the native
+      // column, so the series stays in ONE currency for the FX conversion
+      // downstream to handle uniformly. Reuses the same rawColumnCount/
+      // valueIndices mechanism as the currency-triple expansion above.
+      const embeddedCurrencies = columns.map((c) => c.currency).filter(Boolean);
+      if (embeddedCurrencies.length && new Set(embeddedCurrencies.map((c) => c.toUpperCase())).size > 1) {
+        // Which currency to KEEP depends on what the ticker's XBRL series is
+        // denominated in, which the caller passes down (see
+        // detectPreferredUnit in generateForeignFilingsCache.js) -- picking
+        // by a fixed rule here is what makes the two sources disagree. TSM's
+        // XBRL is tagged in USD, so its USD column is the one that merges
+        // cleanly; a filer whose XBRL carries only its native currency
+        // (verified live previously for IRSA/ARS) needs the opposite, and
+        // falls through to dropping the USD convenience translation.
+        const wanted = preferredCurrency ? preferredCurrency.toUpperCase() : null;
+        const matchesWanted = wanted && columns.some((c) => c.currency && c.currency.toUpperCase() === wanted);
+        // When the caller named a currency and NO column is in it, this
+        // table cannot be used at all. Taking the native column instead
+        // would hand back a figure in the wrong currency, and the 20-F
+        // annual path has no conversion step (convertNativeCurrencyToUsd
+        // runs only in the 6-K path) -- verified live as the real cause of
+        // TSM's yearly series being ~31x wrong for the years whose OLDER
+        // 20-F R-files carry a TWD column only: those got through
+        // unconverted and competed with the USD facts from XBRL for the
+        // same period. Bailing here just means the period stays sourced
+        // from wherever it already came from.
+        if (wanted && !matchesWanted) continue;
+        const keepIndices = columns
+          .map((c, idx) => {
+            if (matchesWanted) return !c.currency || c.currency.toUpperCase() === wanted ? idx : -1;
+            return c.currency && CONVENIENCE_TRANSLATION_CURRENCY.test(c.currency) ? -1 : idx;
+          })
+          .filter((idx) => idx !== -1);
+        if (process.env.DEBUG_PARSE_TABLE_COLUMNS) {
+          console.error('DEBUG embedded-currency-columns', JSON.stringify({ keepIndices, columns }));
+        }
+        if (keepIndices.length && keepIndices.length < columns.length) {
+          return {
+            columns: keepIndices.map((idx) => columns[idx]),
+            dataStartRowIdx: i + 1,
+            rawColumnCount: columns.length,
+            valueIndices: keepIndices,
+          };
+        }
       }
 
       return { columns, dataStartRowIdx: i + 1 };
@@ -1986,8 +2063,8 @@ function detectTableScale($, table) {
   return 1;
 }
 
-function extractAllAnnualColumnsFromTable($, table, aliasMap) {
-  const parsed = parseTableColumns($, table);
+function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency = null) {
+  const parsed = parseTableColumns($, table, [], preferredCurrency);
   if (!parsed) return [];
   const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
   // See extractFromTable's identical handling — only set by
@@ -2137,13 +2214,38 @@ function detectTrailingChangeColumns(headerCells, realColumnCount) {
   return { rawColumnCount: realColumnCount + 1, valueIndices: Array.from({ length: realColumnCount }, (_, idx) => idx) };
 }
 
-function parseInstantTableColumns($, table, externalColumnDates = null, externalBareMonthDay = null) {
+function parseInstantTableColumns($, table, externalColumnDates = null, externalBareMonthDay = null, preferredCurrency = null) {
   const rows = $(table).find('tr').toArray();
   for (let i = 0; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     const dateCells = cells.map((c) => parseDateHeaderCell(c.text)).filter((d) => d && d.monthDay);
     if (dateCells.length >= 2) {
-      const columns = dateCells.map((d) => ({ endMonthDay: d.monthDay, year: d.year }));
+      // Same embedded-currency shape the duration parser handles: TSM's
+      // balance sheet heads its columns "Dec. 31, 2025 TWD ($)" next to
+      // "Dec. 31, 2025 USD ($)", so ONE instant date otherwise yields two
+      // values differing by the exchange rate (verified live: equity
+      // 5,396,219,200,000 TWD beside 172,018,500,000 USD for Dec 2025).
+      // Keep only the caller's currency when it is present; when the caller
+      // named one and no column is in it, this table is unusable, because
+      // the instant path has no conversion step either.
+      const embedded = dateCells.map((d) => d.currency).filter(Boolean);
+      let keepIdx = dateCells.map((_, idx) => idx);
+      if (embedded.length && new Set(embedded.map((c) => c.toUpperCase())).size > 1) {
+        const wanted = preferredCurrency ? preferredCurrency.toUpperCase() : null;
+        const matches = wanted && dateCells.some((d) => d.currency && d.currency.toUpperCase() === wanted);
+        if (wanted && !matches) continue;
+        keepIdx = dateCells
+          .map((d, idx) => {
+            if (matches) return !d.currency || d.currency.toUpperCase() === wanted ? idx : -1;
+            return d.currency && CONVENIENCE_TRANSLATION_CURRENCY.test(d.currency) ? -1 : idx;
+          })
+          .filter((idx) => idx !== -1);
+        if (!keepIdx.length) continue;
+      }
+      const columns = keepIdx.map((idx) => ({ endMonthDay: dateCells[idx].monthDay, year: dateCells[idx].year }));
+      if (keepIdx.length < dateCells.length) {
+        return { columns, dataStartRowIdx: i + 1, rawColumnCount: dateCells.length, valueIndices: keepIdx };
+      }
       const trailing = detectTrailingChangeColumns(cells, columns.length);
       return trailing ? { columns, dataStartRowIdx: i + 1, ...trailing } : { columns, dataStartRowIdx: i + 1 };
     }
@@ -2252,8 +2354,8 @@ function findExternalBareMonthDay($, allEls, startIdx, endIdx) {
 // prior-year-comparative snapshots are both real, previously-undisclosed-
 // elsewhere data points), so this returns one result per column rather than
 // a single target period.
-function extractFromInstantTable($, table, aliasMap, externalColumnDates = null, externalBareMonthDay = null) {
-  const parsed = parseInstantTableColumns($, table, externalColumnDates, externalBareMonthDay);
+function extractFromInstantTable($, table, aliasMap, externalColumnDates = null, externalBareMonthDay = null, preferredCurrency = null) {
+  const parsed = parseInstantTableColumns($, table, externalColumnDates, externalBareMonthDay, preferredCurrency);
   if (!parsed) return [];
   const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
   // See extractFromTable's identical rawColumnCount/valueIndices handling
@@ -2638,11 +2740,11 @@ function extractFromRFile($, targetEndYear, aliasMap, cumulativeFallbackConcepts
 // FilingSummary.xml already points straight at the exact balance-sheet
 // R-file (verified live: DHT's own manifest lists "Consolidated Statement
 // of Financial Position" as its own R-file, same as its cash-flow one).
-function extractFromInstantRFile($, aliasMap) {
+function extractFromInstantRFile($, aliasMap, preferredCurrency = null) {
   const tables = $('table').toArray();
   for (const table of tables) {
     if ($(table).find('tr').length < 5) continue;
-    const result = extractFromInstantTable($, table, aliasMap);
+    const result = extractFromInstantTable($, table, aliasMap, null, null, preferredCurrency);
     if (result.length) return result;
   }
   return [];
@@ -3235,7 +3337,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
  * it into their raw fact arrays via the exact same
  * dedupeAndClassify([...raw, ...new20FFacts]) idiom used everywhere else.
  */
-async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userAgent) {
+async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userAgent, preferredCurrency = null) {
   const submissions = await fetchJsonSec(`${SEC_SUBMISSIONS_BASE}/CIK${cik}.json`, userAgent);
   if (!submissions?.filings?.recent) return {};
 
@@ -3341,7 +3443,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
       if (instant) {
         let extractedList;
         try {
-          extractedList = extractFromInstantRFile($, aliases);
+          extractedList = extractFromInstantRFile($, aliases, preferredCurrency);
         } catch (e) {
           if (debug) console.error('DEBUG extractFromInstantRFile (20-F) threw', rUrl, e.message);
           continue;
@@ -3361,7 +3463,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
         if ($(table).find('tr').length < 5) continue;
         let extractedList;
         try {
-          extractedList = extractAllAnnualColumnsFromTable($, table, aliases);
+          extractedList = extractAllAnnualColumnsFromTable($, table, aliases, preferredCurrency);
         } catch (e) {
           if (debug) console.error('DEBUG extractAllAnnualColumnsFromTable threw', rUrl, e.message);
           continue;

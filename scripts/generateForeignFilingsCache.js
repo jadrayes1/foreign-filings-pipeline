@@ -282,7 +282,7 @@ const DERIVE_EBIT_FROM_EXPENSES_TICKERS = new Set(['HELP']);
 // consistently in USD), and revenueGrowth figures in the thousands of
 // percent. It stayed invisible only because the yearly series was ALSO
 // stale enough for isRecentEnough to suppress it entirely.
-function extractFactSeries(companyFacts, conceptCandidates) {
+function matchingFactEntries(companyFacts, conceptCandidates) {
   const entries = [];
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
     const facts = companyFacts?.facts?.[taxonomy];
@@ -291,16 +291,30 @@ function extractFactSeries(companyFacts, conceptCandidates) {
       if (facts[concept]?.units) entries.push(facts[concept]);
     }
   }
+  return entries;
+}
+
+// USD when ANY matched concept offers it -- the natural comparison currency
+// for a US-listed security. Exposed separately so the FILING-TEXT fallbacks
+// can denominate what they extract the same way, instead of each path
+// independently guessing and reintroducing the mismatch above.
+function detectPreferredUnit(companyFacts, conceptCandidates) {
+  const allUnits = new Set();
+  for (const entry of matchingFactEntries(companyFacts, conceptCandidates)) {
+    for (const unit of Object.keys(entry.units)) allUnits.add(unit);
+  }
+  if (!allUnits.size) return null;
+  return allUnits.has('USD') ? 'USD' : [...allUnits][0];
+}
+
+function extractFactSeries(companyFacts, conceptCandidates) {
+  const entries = matchingFactEntries(companyFacts, conceptCandidates);
   if (!entries.length) return [];
 
-  const allUnits = new Set();
-  for (const entry of entries) for (const unit of Object.keys(entry.units)) allUnits.add(unit);
-  // USD when ANY matched concept offers it -- the natural comparison
-  // currency for a US-listed security, and the same preference this
-  // function already applied per concept. A concept tagged only in another
-  // currency contributes nothing rather than mixing units into the series;
-  // losing a few periods beats a silent >30x denomination mismatch.
-  const preferredUnit = allUnits.has('USD') ? 'USD' : [...allUnits][0];
+  // A concept tagged only in another currency contributes nothing rather
+  // than mixing units into the series; losing a few periods beats a silent
+  // >30x denomination mismatch.
+  const preferredUnit = detectPreferredUnit(companyFacts, conceptCandidates);
 
   const merged = [];
   for (const entry of entries) {
@@ -522,6 +536,39 @@ function isAdjacent(prevEnd, currStart) {
 // anywhere in the year, not just at the end) — a year with 2+ gaps has more
 // unknowns than the one available equation (annual = sum of 4 quarters) can
 // solve without guessing a split, so it's left alone.
+// Drops a filing-text fact whose period spans ~a full year when the real
+// XBRL facts already cover that same year-end. The text fallbacks exist to
+// fill what the structured data lacks, never to restate what it has: two
+// values for one period let the dedupe decide, and for a dual-currency
+// filer the two are denominated differently (see the call sites).
+const ANNUAL_SPAN_MIN_DAYS = 300;
+const ANNUAL_SPAN_MAX_DAYS = 400;
+
+function dropAnnualPeriodsAlreadyInXbrl(textFacts, rawByConcept) {
+  const out = { ...textFacts };
+  for (const [concept, raw] of Object.entries(rawByConcept)) {
+    const facts = out[concept];
+    if (!Array.isArray(facts) || !facts.length) continue;
+    const xbrlAnnualEnds = new Set(
+      (raw || [])
+        .filter((f) => {
+          if (!f?.start || !f?.end) return false;
+          const days = daysBetween(f.start, f.end);
+          return days >= ANNUAL_SPAN_MIN_DAYS && days <= ANNUAL_SPAN_MAX_DAYS;
+        })
+        .map((f) => f.end)
+    );
+    if (!xbrlAnnualEnds.size) continue;
+    out[concept] = facts.filter((f) => {
+      if (!f?.start || !f?.end) return true;
+      const days = daysBetween(f.start, f.end);
+      const isAnnual = days >= ANNUAL_SPAN_MIN_DAYS && days <= ANNUAL_SPAN_MAX_DAYS;
+      return !(isAnnual && xbrlAnnualEnds.has(f.end));
+    });
+  }
+  return out;
+}
+
 function deriveMissingQuarterFromAnnual(quarterlyPoints, annualPoints) {
   const derived = [];
   for (const fy of annualPoints) {
@@ -1230,6 +1277,11 @@ function isGenuineForeignFiler(companyFacts) {
 
 async function processTicker(symbol, cik, isBank) {
   const companyFacts = await fetchJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  // The currency this ticker's XBRL series is denominated in (see
+  // detectPreferredUnit). Threaded into the filing-text fallbacks so a
+  // value they recover lands in the SAME currency as the XBRL facts it
+  // gets merged with, rather than each path choosing independently.
+  const preferredUnit = detectPreferredUnit(companyFacts, REVENUE_CONCEPTS);
   if (!companyFacts) return null;
 
   // See isGenuineForeignFiler's own comment for the full rationale —
@@ -1397,6 +1449,17 @@ async function processTicker(symbol, cik, isBank) {
         } catch (err) {
           console.warn(`  filing-text fallback failed for ${symbol}: ${err.message}`);
         }
+        // This fallback exists to recover QUARTERS the XBRL facts lack. Its
+        // annual-length extractions must not restate a full year the real
+        // XBRL already reports: verified live for TSM, whose February 6-K
+        // carries the whole consolidated annual report, so FY2018-FY2023
+        // each had both a structured USD fact and a text-extracted one, and
+        // whichever won the dedupe decided whether that year's profitMargin
+        // came out ~40% (right) or ~1.2% (wrong by the TWD/USD rate). Same
+        // gap-only rule already applied to the 20-F annual fallback below.
+        filingTextFacts = dropAnnualPeriodsAlreadyInXbrl(filingTextFacts, {
+          revenue: revenueRaw, netIncome: netIncomeRaw, ebit: ebitRaw, ocf: ocfRaw, capex: capexRaw,
+        });
         if (filingTextFacts.revenue?.length) revenue = dedupeAndClassify([...revenueRaw, ...filingTextFacts.revenue]);
         if (filingTextFacts.netIncome?.length) netIncome = dedupeAndClassify([...netIncomeRaw, ...filingTextFacts.netIncome]);
         if (filingTextFacts.ebit?.length) ebit = dedupeAndClassify([...ebitRaw, ...filingTextFacts.ebit]);
@@ -1484,9 +1547,21 @@ async function processTicker(symbol, cik, isBank) {
         };
         let annual20FFacts = {};
         try {
-          annual20FFacts = await extractAnnualFactsFrom20F(cik, needed20F, annualByEnd20F, SEC_USER_AGENT);
+          annual20FFacts = await extractAnnualFactsFrom20F(cik, needed20F, annualByEnd20F, SEC_USER_AGENT, preferredUnit);
         } catch (err) {
           console.warn(`  20-F annual fallback failed for ${symbol}: ${err.message}`);
+        }
+        // This fallback exists to FILL a period the real XBRL data is
+        // missing, never to restate one it already covers. Dropping any
+        // period the anchor map already holds keeps a text-extracted figure
+        // from competing with the structured fact for the same year --
+        // verified live for TSM, where both existed for 2021-2024 and the
+        // two were denominated differently, so whichever won the dedupe
+        // decided whether that year's ratio came out right.
+        for (const concept of Object.keys(annual20FFacts)) {
+          const alreadyCovered = annualByEnd20F[concept];
+          if (!alreadyCovered?.size) continue;
+          annual20FFacts[concept] = (annual20FFacts[concept] || []).filter((f) => !alreadyCovered.has(f.end));
         }
         // Layered on top of the ORIGINAL XBRL raw arrays (revenueRaw etc.)
         // plus whatever the 6-K pass above already recovered (filingTextFacts,
