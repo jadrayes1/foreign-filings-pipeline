@@ -270,19 +270,42 @@ const DERIVE_EBIT_FROM_EXPENSES_TICKERS = new Set(['HELP']);
 // tagged (the natural comparison currency for a US-listed security),
 // falling back to whichever single unit IS present otherwise -- rather
 // than merging every currency a filer happens to also tag.
+// The unit choice must be made ONCE across every matched concept, not per
+// concept: picking per concept still lets two DIFFERENT concepts in the
+// same candidate list contribute two different currencies to one series.
+// Verified live for TSM (Taiwan Semiconductor), whose REVENUE_CONCEPTS
+// match two entries at once -- `Revenue` is tagged in both TWD and USD (so
+// it chose USD) while `RevenueFromContractsWithCustomers` is tagged in TWD
+// only (so it chose TWD) -- leaving FY2018-FY2023 revenue denominated ~31x
+// differently from FY2017/FY2024. That produced a yearly profitMargin of
+// ~1.2% for those years against TSM's real ~40% (netIncome came through
+// consistently in USD), and revenueGrowth figures in the thousands of
+// percent. It stayed invisible only because the yearly series was ALSO
+// stale enough for isRecentEnough to suppress it entirely.
 function extractFactSeries(companyFacts, conceptCandidates) {
-  const merged = [];
+  const entries = [];
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
     const facts = companyFacts?.facts?.[taxonomy];
     if (!facts) continue;
     for (const concept of conceptCandidates) {
-      const entry = facts[concept];
-      if (!entry?.units) continue;
-      const unitKeys = Object.keys(entry.units);
-      const preferredUnit = unitKeys.includes('USD') ? 'USD' : unitKeys[0];
-      const unitFacts = entry.units[preferredUnit];
-      if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
+      if (facts[concept]?.units) entries.push(facts[concept]);
     }
+  }
+  if (!entries.length) return [];
+
+  const allUnits = new Set();
+  for (const entry of entries) for (const unit of Object.keys(entry.units)) allUnits.add(unit);
+  // USD when ANY matched concept offers it -- the natural comparison
+  // currency for a US-listed security, and the same preference this
+  // function already applied per concept. A concept tagged only in another
+  // currency contributes nothing rather than mixing units into the series;
+  // losing a few periods beats a silent >30x denomination mismatch.
+  const preferredUnit = allUnits.has('USD') ? 'USD' : [...allUnits][0];
+
+  const merged = [];
+  for (const entry of entries) {
+    const unitFacts = entry.units[preferredUnit];
+    if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
   }
   return merged;
 }
