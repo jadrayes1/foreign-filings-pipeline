@@ -2063,6 +2063,188 @@ function detectTableScale($, table) {
   return 1;
 }
 
+// A FOURTEENTH shape, and the first with no table markup at all: the whole
+// statement is ONE text blob inside a single <div>, with no <tr>/<td> and
+// no row-level elements of any kind. Verified live: ASML's EX-99.3
+// "Financial Statements US GAAP" exhibit from its 2025-07-16 6-K onward has
+// ZERO <table> elements (27KB, 38 divs) where the same exhibit one quarter
+// earlier had 8 real tables in 433KB, and those filings carry no XBRL
+// either (FilingSummary.xml 404s, no R-files), so nothing else in this file
+// can reach them. ASML's quarterly series consequently froze at 2025-03 and
+// the whole quarterly/TTM cadence aged past isRecentEnough's floor.
+//
+// The text itself is clean and the SAME logical shape the table parser
+// already handles -- period phrases, a month-day row, a year row, then one
+// label plus one number per column:
+//
+//   Three months ended Six months ended Jun 30, Jun 29, Jun 30, Jun 29,
+//   (unaudited, in millions EUR) 2024 2025 2024 2025
+//   Net system sales 4,760.9 5,596.1 8,726.8 11,336.5
+//
+// Rows are recovered as RUNS of adjacent financial numbers delimited by the
+// surrounding label text, and a run is used ONLY when its length equals the
+// column count exactly. That is what makes this safe without cell
+// boundaries: a row with a blank or missing cell yields a short run and is
+// dropped on its own, instead of shifting every row after it (the
+// positional-misalignment failure this file warns about elsewhere). A token
+// must carry a comma, a decimal point or parentheses to count as a figure,
+// so a bare year or a footnote index can't be mistaken for data.
+const TEXT_BLOCK_FIGURE = /\(?-?\d[\d,]*\.\d+\)?|\(?-?\d{1,3}(?:,\d{3})+\)?/g;
+const TEXT_BLOCK_MIN_COLUMNS = 2;
+const TEXT_BLOCK_MIN_ROWS = 3;
+// A clean label is short; anything longer means the row boundaries were not
+// recovered properly and the match can't be trusted.
+const TEXT_BLOCK_MAX_LABEL_CHARS = 90;
+// A ratio/per-share row states a PERCENTAGE or a per-share amount, not a
+// currency figure, and this path has no column units to tell them apart --
+// verified live: ASML's own "Ratios and Other Data" block sits in the same
+// exhibit and its "Gross profit as a percentage of net sales" row matched
+// the revenue alias, yielding 54.0 scaled to 54,000,000 as that quarter's
+// revenue. Excluded here rather than in the shared LABEL_ALIASES, which the
+// table path depends on for ~1100 other filers.
+const TEXT_BLOCK_NON_FIGURE_ROW = /percentage|per\s+share|\bratio\b|\bper\s+cent|%|\bshares\s+outstanding\b|\bnumber\s+of\b/i;
+
+function parseStatementTextBlockHeader(text) {
+  const phrases = [];
+  const phraseRe = /((?:nine|six|three|twelve|9|6|3|12)[\s-]months?(?:\s+periods?)?\s+ended|quarters?\s+ended|years?\s+ended)/gi;
+  let m;
+  while ((m = phraseRe.exec(text)) !== null) {
+    const parsed = parsePeriodPhrase(m[1]);
+    if (parsed?.months) phrases.push({ months: parsed.months, index: m.index });
+  }
+  if (!phrases.length) return null;
+
+  // Month-day tokens ("Jun 30,") sit between the last phrase and the year
+  // run, one per real column.
+  const afterPhrases = phrases[phrases.length - 1].index;
+  const monthDays = [];
+  const mdRe = /\b([A-Z][a-z]{2})\.?\s+(\d{1,2}),/g;
+  mdRe.lastIndex = afterPhrases;
+  while ((m = mdRe.exec(text)) !== null) {
+    if (MONTH_ABBR_INDEX[m[1].toLowerCase()] == null) continue;
+    monthDays.push({ monthDay: `${m[1]} ${m[2]}`, end: m.index + m[0].length });
+    if (monthDays.length >= 12) break;
+  }
+  if (!monthDays.length) return null;
+
+  // The first run of >= 2 adjacent 4-digit years after the month-days.
+  const yearRe = /\b((?:19|20)\d{2})\b/g;
+  yearRe.lastIndex = monthDays[monthDays.length - 1].end;
+  const years = [];
+  let lastEnd = null;
+  while ((m = yearRe.exec(text)) !== null) {
+    const gap = lastEnd == null ? 0 : text.slice(lastEnd, m.index);
+    if (lastEnd != null && /\d[\d,]*\.\d/.test(gap)) break; // a figure intervened -- the header is over
+    years.push(m[1]);
+    lastEnd = m.index + m[0].length;
+    if (years.length >= 12) break;
+  }
+  if (years.length < TEXT_BLOCK_MIN_COLUMNS) return null;
+
+  // One month-day per column when the counts line up; otherwise the
+  // month-days are shared across the year columns in order.
+  const columnCount = years.length;
+  const phraseByIdx = allocateItemsToPhrases(columnCount, phrases.map((p) => ({ months: p.months, colspan: 1 })));
+  if (!phraseByIdx) return null;
+  const columns = years.map((year, idx) => ({
+    months: phraseByIdx[idx].months,
+    endMonthDay: (monthDays[idx] || monthDays[idx % monthDays.length]).monthDay,
+    year,
+  }));
+  const scale = /in\s+millions/i.test(text) ? 1000000 : /in\s+thousands/i.test(text) ? 1000 : 1;
+  return { columns, dataStartIdx: lastEnd, scale };
+}
+
+function extractFromStatementTextBlock(text, targetEndYear, aliasMap) {
+  const header = parseStatementTextBlockHeader(text);
+  if (!header) return null;
+  const { columns, dataStartIdx, scale } = header;
+
+  const body = text.slice(dataStartIdx);
+  const rows = [];
+  TEXT_BLOCK_FIGURE.lastIndex = 0;
+  let m;
+  let run = null;
+  let prevRunEnd = 0;
+  while ((m = TEXT_BLOCK_FIGURE.exec(body)) !== null) {
+    const isAdjacentToRun = run && !/[A-Za-z]/.test(body.slice(run.end, m.index));
+    if (isAdjacentToRun) {
+      run.values.push(parseNumericCell(m[0]));
+      run.end = m.index + m[0].length;
+      continue;
+    }
+    if (run) {
+      rows.push(run);
+      prevRunEnd = run.end;
+    }
+    // The label is the text since the END of the previous run, never since
+    // its start -- otherwise it swallows the previous row's figures and a
+    // concept can match on a neighbouring row's words.
+    run = { label: body.slice(prevRunEnd, m.index).replace(/\s+/g, ' ').trim(), values: [parseNumericCell(m[0])], end: m.index + m[0].length };
+  }
+  if (run) rows.push(run);
+
+  const usable = rows.filter(
+    (r) =>
+      r.values.length === columns.length &&
+      r.values.every((v) => v != null) &&
+      r.label &&
+      r.label.length <= TEXT_BLOCK_MAX_LABEL_CHARS &&
+      !TEXT_BLOCK_NON_FIGURE_ROW.test(r.label)
+  );
+  if (usable.length < TEXT_BLOCK_MIN_ROWS) return null;
+
+  // Same column choice as extractFromTable: the shortest period for this
+  // year is the standalone figure, a longer one for the same year is its
+  // cumulative sibling, which lets Check A verify it unchanged.
+  const forYear = columns.map((c, idx) => ({ ...c, idx })).filter((c) => c.year === String(targetEndYear));
+  if (!forYear.length) return null;
+  forYear.sort((a, b) => a.months - b.months);
+  const primary = forYear[0];
+  const cumulative = forYear.find((c) => c.months > primary.months) || null;
+
+  const facts = {};
+  for (const [concept, rule] of Object.entries(aliasMap)) {
+    if (!rule) continue;
+    const matches = usable.filter((r) => rule.include.test(r.label) && !rule.exclude.test(r.label));
+    if (!matches.length) continue;
+    // Prefer the grand total over a component line, mirroring the same
+    // tiebreak extractFromTable applies -- verified live: ASML lists "Net
+    // system sales" (5,596.1) BEFORE "Total net sales" (7,691.7), and
+    // first-match-wins took the systems component alone, understating
+    // revenue by the 2,095.6 of service and field option sales.
+    const hit = matches.find((r) => /^total\b/i.test(r.label)) || matches[0];
+    const value = hit.values[primary.idx];
+    if (value == null) continue;
+    facts[concept] = {
+      label: hit.label,
+      [primary.months === 3 ? 'value3mo' : 'value']: value * scale,
+      valueCumulative: cumulative ? hit.values[cumulative.idx] * scale : null,
+    };
+  }
+  if (!Object.keys(facts).length) return null;
+  return { period: { months: primary.months, endMonthDay: primary.endMonthDay, year: String(targetEndYear) }, facts };
+}
+
+// Candidate blobs: elements whose own text carries a period phrase and
+// enough figures to be a statement, deduped by text so a parent and its
+// identical child aren't parsed twice, longest first.
+function statementTextBlocks($) {
+  const seen = new Set();
+  const blocks = [];
+  for (const el of $('div,section,p').toArray()) {
+    const text = $(el).text().replace(/\s+/g, ' ').trim();
+    if (text.length < 200 || text.length > 20000) continue;
+    if (!PERIOD_PHRASE_INDICATOR.test(text)) continue;
+    const figures = text.match(TEXT_BLOCK_FIGURE);
+    if (!figures || figures.length < 8) continue;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    blocks.push(text);
+  }
+  return blocks.sort((a, b) => b.length - a.length);
+}
+
 function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency = null) {
   const parsed = parseTableColumns($, table, [], preferredCurrency);
   if (!parsed) return [];
@@ -3037,6 +3219,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       // year and the one prior) rather than assuming which quarter it covers.
       const candidateYears = [String(new Date(filing.filingDate).getUTCFullYear()), String(new Date(filing.filingDate).getUTCFullYear() - 1)];
 
+      let anyTableResult = false;
       for (const heading of [STATEMENT_HEADINGS.income, STATEMENT_HEADINGS.cashflow, STATEMENT_HEADINGS.earningsPerShare]) {
         // shares included in incomeAliases too -- see the identical addition
         // (and its own comment) in the FilingSummary/R-file branch above.
@@ -3063,7 +3246,33 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
             continue;
           }
           if (debug) console.error('DEBUG extractStatement result', url, year, JSON.stringify(extracted));
+          if (extracted) anyTableResult = true;
           await recordExtracted(extracted, filing);
+        }
+      }
+
+      // LAST RESORT, only for a document whose tables yielded nothing at
+      // all: the statement may carry no table markup whatsoever. See
+      // extractFromStatementTextBlock. Gated this way so every filer whose
+      // tables already parse can never reach this path, and so a wrong
+      // parse here can only ever affect a document that was producing
+      // nothing before.
+      if (!anyTableResult) {
+        const blocks = statementTextBlocks($);
+        if (debug && blocks.length) console.error('DEBUG text-block candidates', url, blocks.length, blocks.map((b) => b.length).join(','));
+        for (const block of blocks) {
+          for (const year of candidateYears) {
+            let extracted;
+            try {
+              extracted = extractFromStatementTextBlock(block, year, aliasMap);
+            } catch (e) {
+              if (debug) console.error('DEBUG extractFromStatementTextBlock threw', url, e.message);
+              continue;
+            }
+            if (!extracted) continue;
+            if (debug) console.error('DEBUG text-block result', url, year, JSON.stringify(extracted).slice(0, 300));
+            await recordExtracted(extracted, filing);
+          }
         }
       }
 

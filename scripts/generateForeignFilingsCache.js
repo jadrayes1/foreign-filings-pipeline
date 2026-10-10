@@ -354,6 +354,8 @@ function daysBetween(startStr, endStr) {
   return (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
 }
 
+const QUARTER_LABEL_BACKDATE_DAYS = 5;
+
 function quarterLabelFromDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return null;
@@ -372,7 +374,18 @@ function quarterLabelFromDate(dateStr) {
   // ends on the 1st of a month, so this adjustment can't misclassify any
   // real date -- every normal month-end (Mar 31, Jun 30, Sep 30, Dec 31)
   // shifts back one day and stays within the same quarter.
-  const adjusted = new Date(d.getTime() - 24 * 60 * 60 * 1000);
+  // Widened from one day to five for the same reason, one case further
+  // out: a 52/53-WEEK filer's quarter closes on a fixed weekday, so it can
+  // land several days INTO the following month and get classified a whole
+  // quarter late. Verified live: ASML's quarters end Apr 4 / Jul 4 / Oct 3
+  // in 2021, which a one-day shift labelled Q2/Q3/Q4 '21 -- colliding with
+  // the real Q2/Q3/Q4 under identical labels and putting two different
+  // values on one point (its published revenueGrowth carried "Q4 '22"
+  // twice, at 0.102 and 0.290). Five days covers the drift a week-aligned
+  // calendar can produce while still leaving every ordinary month-end
+  // (Jan 31, Mar 31, Apr 30, Jun 30, Sep 30, Dec 31) in its own quarter,
+  // checked explicitly.
+  const adjusted = new Date(d.getTime() - QUARTER_LABEL_BACKDATE_DAYS * 24 * 60 * 60 * 1000);
   const q = Math.floor(adjusted.getUTCMonth() / 3) + 1;
   return `Q${q} '${String(adjusted.getUTCFullYear()).slice(-2)}`;
 }
