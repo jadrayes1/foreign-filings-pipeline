@@ -1829,8 +1829,29 @@ async function main() {
   // throughout this repo's sibling scripts -- bypasses the normal gap
   // list/rotation for fast, isolated debugging of specific tickers.
   if (process.env.TARGET_SYMBOL) {
-    const targets = new Set(process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
-    withCik = withCik.filter((c) => targets.has(c.symbol.toUpperCase()));
+    const targets = [...new Set(process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean))];
+    const knownBySymbol = new Map(withCik.map((c) => [c.symbol.toUpperCase(), c]));
+    // A target that isn't on the published foreign-filer list yet is built
+    // straight from the SEC ticker->CIK map instead of being dropped. The
+    // list is rebuilt on a weekly cadence by discoverForeignFilers.js, so
+    // filtering a targeted run down to it meant a newly-tracked filer could
+    // not be processed at all until that sweep came round -- verified live:
+    // ASML had just entered the universe (Finnhub tags it "NY Reg Shrs",
+    // see ALLOWED_TYPES in generateSectorMetrics.js) and a
+    // TARGET_SYMBOL=ASML run reported "Processed 0/0 tickers" rather than
+    // doing anything. processTicker's own ifrs-full gate still decides
+    // whether a target really is a foreign filer, so this only widens what
+    // a DEBUG run can reach; it cannot invent data for a domestic ticker.
+    withCik = targets
+      .map((symbol) => {
+        const known = knownBySymbol.get(symbol);
+        if (known) return known;
+        const cik = tickerToCik.get(symbol);
+        if (!cik) return null;
+        console.log(`  ${symbol} is not on the foreign-filer list yet — resolving it directly from the SEC CIK map for this targeted run.`);
+        return { symbol, industry: metricsDataset?.metrics?.[symbol]?.industry ?? null, cik };
+      })
+      .filter(Boolean);
     console.log(`TARGET_SYMBOL set — processing only ${withCik.map((c) => c.symbol).join(', ') || '(none found in universe)'}, ignoring the normal gap list/rotation.`);
   }
 
