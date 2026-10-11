@@ -2155,7 +2155,7 @@ function parseStatementTextBlockHeader(text) {
   return { columns, dataStartIdx: lastEnd, scale };
 }
 
-function extractFromStatementTextBlock(text, targetEndYear, aliasMap) {
+function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
   const header = parseStatementTextBlockHeader(text);
   if (!header) return null;
   const { columns, dataStartIdx, scale } = header;
@@ -2194,36 +2194,36 @@ function extractFromStatementTextBlock(text, targetEndYear, aliasMap) {
   );
   if (usable.length < TEXT_BLOCK_MIN_ROWS) return null;
 
-  // Same column choice as extractFromTable: the shortest period for this
-  // year is the standalone figure, a longer one for the same year is its
-  // cumulative sibling, which lets Check A verify it unchanged.
-  const forYear = columns.map((c, idx) => ({ ...c, idx })).filter((c) => c.year === String(targetEndYear));
-  if (!forYear.length) return null;
-  forYear.sort((a, b) => a.months - b.months);
-  const primary = forYear[0];
-  const cumulative = forYear.find((c) => c.months > primary.months) || null;
-
-  const facts = {};
-  for (const [concept, rule] of Object.entries(aliasMap)) {
-    if (!rule) continue;
-    const matches = usable.filter((r) => rule.include.test(r.label) && !rule.exclude.test(r.label));
-    if (!matches.length) continue;
-    // Prefer the grand total over a component line, mirroring the same
-    // tiebreak extractFromTable applies -- verified live: ASML lists "Net
-    // system sales" (5,596.1) BEFORE "Total net sales" (7,691.7), and
-    // first-match-wins took the systems component alone, understating
-    // revenue by the 2,095.6 of service and field option sales.
-    const hit = matches.find((r) => /^total\b/i.test(r.label)) || matches[0];
-    const value = hit.values[primary.idx];
-    if (value == null) continue;
-    facts[concept] = {
-      label: hit.label,
-      [primary.months === 3 ? 'value3mo' : 'value']: value * scale,
-      valueCumulative: cumulative ? hit.values[cumulative.idx] * scale : null,
-    };
+  // EVERY column in the block is a real period of its own, so emit them
+  // all rather than selecting one per year. ASML publishes five- and
+  // six-quarter "Quarterly Summary" blocks whose columns are consecutive
+  // standalone quarters (Jun 30 '24, Sep 29 '24, Dec 31 '24, Mar 30 '25,
+  // Jun 29 '25); choosing a single column per target year both picked an
+  // arbitrary one of them and threw the rest away, which is how ASML lost
+  // 2024-06, 2024-09 and 2025-03 depending on which column won. Each
+  // emitted period still has to survive dedupeAndClassify and
+  // reconcilePoints exactly like a table-extracted one.
+  const results = [];
+  for (const [idx, column] of columns.entries()) {
+    const facts = {};
+    for (const [concept, rule] of Object.entries(aliasMap)) {
+      if (!rule) continue;
+      const matches = usable.filter((r) => rule.include.test(r.label) && !rule.exclude.test(r.label));
+      if (!matches.length) continue;
+      // Prefer the grand total over a component line, mirroring the same
+      // tiebreak extractFromTable applies -- verified live: ASML lists "Net
+      // system sales" (5,596.1) BEFORE "Total net sales" (7,691.7), and
+      // first-match-wins took the systems component alone, understating
+      // revenue by the 2,095.6 of service and field option sales.
+      const hit = matches.find((r) => /^total\b/i.test(r.label)) || matches[0];
+      const value = hit.values[idx];
+      if (value == null) continue;
+      facts[concept] = { label: hit.label, [column.months === 3 ? 'value3mo' : 'value']: value * scale, valueCumulative: null };
+    }
+    if (!Object.keys(facts).length) continue;
+    results.push({ period: { months: column.months, endMonthDay: column.endMonthDay, year: column.year }, facts });
   }
-  if (!Object.keys(facts).length) return null;
-  return { period: { months: primary.months, endMonthDay: primary.endMonthDay, year: String(targetEndYear) }, facts };
+  return results.length ? results : null;
 }
 
 // Candidate blobs: elements whose own text carries a period phrase and
@@ -3261,18 +3261,16 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         const blocks = statementTextBlocks($);
         if (debug && blocks.length) console.error('DEBUG text-block candidates', url, blocks.length, blocks.map((b) => b.length).join(','));
         for (const block of blocks) {
-          for (const year of candidateYears) {
-            let extracted;
-            try {
-              extracted = extractFromStatementTextBlock(block, year, aliasMap);
-            } catch (e) {
-              if (debug) console.error('DEBUG extractFromStatementTextBlock threw', url, e.message);
-              continue;
-            }
-            if (!extracted) continue;
-            if (debug) console.error('DEBUG text-block result', url, year, JSON.stringify(extracted).slice(0, 300));
-            await recordExtracted(extracted, filing);
+          let extractedList;
+          try {
+            extractedList = extractAllPeriodsFromStatementTextBlock(block, aliasMap);
+          } catch (e) {
+            if (debug) console.error('DEBUG extractAllPeriodsFromStatementTextBlock threw', url, e.message);
+            continue;
           }
+          if (!extractedList) continue;
+          if (debug) console.error('DEBUG text-block results', url, extractedList.length, JSON.stringify(extractedList).slice(0, 300));
+          for (const extracted of extractedList) await recordExtracted(extracted, filing);
         }
       }
 
