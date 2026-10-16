@@ -1050,6 +1050,27 @@ function parseDateHeaderCell(text) {
   // prefix before the anchored date match rather than loosening the date
   // match itself, so this can't accidentally start matching non-date cells.
   const stripped = text.replace(/^as\s+(of|at)\s+/i, '').trim();
+  // A NUMERIC date header, verified live: Nu Holdings (NU) heads its
+  // interim statement columns "06/30/2026" / "06/30/2025" rather than
+  // "Jun 30, 2026", so every date cell failed to parse, parseTableColumns
+  // returned null, and NU had not a single quarterly fact for ANY concept
+  // despite filing full quarterly statements in clean HTML tables.
+  //
+  // Read as MM/DD/YYYY, the convention in SEC filings. The two components
+  // are swapped only when the first is impossible as a month and the second
+  // is possible (a DD/MM filer), which leaves a genuinely ambiguous date
+  // like 03/06 read the US way rather than guessed at. In practice a
+  // period-end day is almost always >12 (28/29/30/31), so the common case
+  // is unambiguous either way.
+  const numeric = stripped.match(/^(\d{1,2})\/(\d{1,2})\/((?:19|20)\d{2})$/);
+  if (numeric) {
+    let month = Number(numeric[1]);
+    let day = Number(numeric[2]);
+    if (month > 12 && day <= 12) [month, day] = [day, month];
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return { year: numeric[3], monthDay: `${MONTH_ABBREVIATIONS[month - 1]} ${day}`, currency: null };
+    }
+  }
   const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})\b([\s\S]*)$/);
   if (compound) {
     const tail = parseDateCellUnitTail(compound[4]);
@@ -1090,6 +1111,7 @@ function parseBareMonthDayCell(text) {
   return m ? `${m[1]} ${m[2]}` : null;
 }
 
+const MONTH_ABBREVIATIONS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const MONTH_ABBR_INDEX = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 
 // "Jan. 1 - Mar. 31, 2026" -> 3 (a whole-quarter span). Buckets the actual
@@ -2536,6 +2558,36 @@ function findExternalBareMonthDay($, allEls, startIdx, endIdx) {
 // prior-year-comparative snapshots are both real, previously-undisclosed-
 // elsewhere data points), so this returns one result per column rather than
 // a single target period.
+// detectTableScale only reads the TABLE's own first rows, but a filer can
+// put the units caption in a sibling element just ABOVE the table instead,
+// where that check can never see it. Verified live: Nu Holdings (NU) heads
+// its interim balance sheet with "(In thousands of U.S. Dollars)" as a
+// separate preceding element, and its own table carries no units text at
+// all -- so equity came through 1000x too small (~$18 million against a
+// real ~$18 billion) while the SAME filing's income-statement tables were
+// scaled correctly, and quarterly roic computed to 217.84, a nonsensical
+// 21,784%. Exactly the failure the comment above describes for ASR, just
+// with the caption one element out of reach.
+//
+// Only consulted when the table itself yields no scale, and only the few
+// nearest preceding siblings, so a caption belonging to some other
+// statement further up the document can't be picked up by mistake.
+const INSTANT_SCALE_LOOKBACK_SIBLINGS = 4;
+
+function detectInstantTableScale($, table) {
+  const own = detectTableScale($, table);
+  if (own !== 1) return own;
+  const preceding = $(table)
+    .prevAll()
+    .slice(0, INSTANT_SCALE_LOOKBACK_SIBLINGS)
+    .map((_, el) => $(el).text())
+    .get()
+    .join(' ');
+  if (/in\s+thousands/i.test(preceding)) return 1000;
+  if (/in\s+millions/i.test(preceding)) return 1000000;
+  return 1;
+}
+
 function extractFromInstantTable($, table, aliasMap, externalColumnDates = null, externalBareMonthDay = null, preferredCurrency = null) {
   const parsed = parseInstantTableColumns($, table, externalColumnDates, externalBareMonthDay, preferredCurrency);
   if (!parsed) return [];
@@ -2557,7 +2609,7 @@ function extractFromInstantTable($, table, aliasMap, externalColumnDates = null,
   // scaled to ~17 billion -- without this fix, roic (NOPAT ÷ invested
   // capital, which uses this unscaled equity) computed to 306.83 (a
   // nonsensical 30,683%) instead of a real, plausible figure.
-  const scale = detectTableScale($, table);
+  const scale = detectInstantTableScale($, table);
 
   const rows = $(table).find('tr').toArray();
   const candidatesByColumn = columns.map(() => ({})); // concept -> [{label, value}]
