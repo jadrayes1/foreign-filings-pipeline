@@ -722,8 +722,28 @@ const LABEL_ALIASES = {
     // all (missing the second "s" before the apostrophe), silently
     // dropping PAC's equity row from EVERY cadence -- same failure shape
     // whether the row is otherwise perfectly clean or not.
-    include: /total (shareholder|stockholder)s?('s|s'|s)?\s+equity|total equity|^equity$/i,
-    exclude: /per share/i,
+    // "and liabilities" excluded -- an IFRS balance sheet closes with
+    // "Total equity and liabilities", the grand total that equals TOTAL
+    // ASSETS, and it contains the substring "total equity", so the include
+    // above matched it outright. The mirror phrasing "Total liabilities and
+    // equity" never matched the include in the first place, which is why
+    // only IFRS-ordered filers could hit this. A real equity row never
+    // carries the word "liabilities". Found while investigating PAC, but
+    // NOT PAC's bug -- PAC labels its row "Total stockholder's equity" and
+    // extracts correctly; its equity really did rise 21,032,285 ->
+    // 55,264,256 (+162.8%) per the 2026-07-14 6-K, with total assets up
+    // 78,188,058 -> 140,372,310 alongside it. No currently-tracked filer
+    // was observed hitting this exclusion, so it is a guard against a
+    // shape that exists in the wild rather than a fix for an observed
+    // break.
+    // Both apostrophe forms accepted: a filer may typeset the possessive
+    // with a curly U+2019 rather than an ASCII quote, and the ASCII-only
+    // pattern then missed the row entirely. Verified live: ASML writes
+    // "Total shareholders U+2019 equity", which failed this include in the
+    // TABLE path exactly as it did in the text-block path -- the table path
+    // had never been fixed when the text-block one was.
+    include: /total (shareholder|stockholder)s?(['\u2019]s|s['\u2019]|s)?\s+equity|total equity|^equity$/i,
+    exclude: /per share|and liabilities|liabilities and/i,
   },
   debt: {
     // Verified live: both STNG and IAG split debt into two real balance-
