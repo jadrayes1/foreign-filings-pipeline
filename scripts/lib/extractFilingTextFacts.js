@@ -2113,6 +2113,9 @@ function detectTableScale($, table) {
 // so a bare year or a footnote index can't be mistaken for data.
 const TEXT_BLOCK_FIGURE = /\(?-?\d[\d,]*\.\d+\)?|\(?-?\d{1,3}(?:,\d{3})+\)?/g;
 const TEXT_BLOCK_MIN_COLUMNS = 2;
+// A header's date cells sit next to each other; anything further apart
+// belongs to a different part of the statement.
+const TEXT_BLOCK_HEADER_GAP_CHARS = 12;
 const TEXT_BLOCK_MIN_ROWS = 3;
 // A clean label is short; anything longer means the row boundaries were not
 // recovered properly and the match can't be trusted.
@@ -2177,12 +2180,30 @@ function parseStatementTextBlockHeader(text) {
   return { columns, dataStartIdx: lastEnd, scale };
 }
 
-function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
-  const header = parseStatementTextBlockHeader(text);
-  if (!header) return null;
-  const { columns, dataStartIdx, scale } = header;
+// Recovers a text blob's rows as RUNS of adjacent figures delimited by the
+// surrounding label text, keeping only a run whose length equals the column
+// count exactly. That is what makes this safe with no cell boundaries: a row
+// with a blank or missing cell yields a short run and is dropped on its own
+// instead of shifting every row after it. Shared by the duration and
+// instant extractors so both agree on what a row is.
+// A filer's own typography can defeat a label match: ASML writes "Total
+// shareholders RSQUO equity" with a curly U+2019, and LABEL_ALIASES.equity
+// expects an ASCII apostrophe, so its "s'" alternative never matched and
+// the following "\s+equity" ran straight into the quote character. Its real
+// equity row sat in the extracted block with five correct values and was
+// skipped, leaving quarterly roic uncomputable. Curly quotes and dashes are
+// folded to their ASCII equivalents for matching only, in THIS path, rather
+// than reworking the shared aliases every other filer depends on.
+function normalizeLabelPunctuation(raw) {
+  return raw
+    .replace(/[\u2018\u2019\u201A\u201B\u02BC\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u2033]/g, '"')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  const body = text.slice(dataStartIdx);
+function textBlockDataRows(body, columnCount) {
   const rows = [];
   TEXT_BLOCK_FIGURE.lastIndex = 0;
   let m;
@@ -2202,18 +2223,36 @@ function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
     // The label is the text since the END of the previous run, never since
     // its start -- otherwise it swallows the previous row's figures and a
     // concept can match on a neighbouring row's words.
-    run = { label: body.slice(prevRunEnd, m.index).replace(/\s+/g, ' ').trim(), values: [parseNumericCell(m[0])], end: m.index + m[0].length };
+    run = { label: normalizeLabelPunctuation(body.slice(prevRunEnd, m.index)), values: [parseNumericCell(m[0])], end: m.index + m[0].length };
   }
   if (run) rows.push(run);
 
-  const usable = rows.filter(
+  return rows.filter(
     (r) =>
-      r.values.length === columns.length &&
+      r.values.length === columnCount &&
       r.values.every((v) => v != null) &&
       r.label &&
       r.label.length <= TEXT_BLOCK_MAX_LABEL_CHARS &&
       !TEXT_BLOCK_NON_FIGURE_ROW.test(r.label)
   );
+}
+
+// Values are emitted UNSCALED on purpose. detectScaleMultiplier already
+// infers the right multiplier for every filing-text fact by scoring them
+// against the real annual XBRL figures, and it applies to duration and
+// instant concepts alike. Pre-multiplying by this block's own caption on
+// top of that double-applied it: verified live, ASML's quarterly EBIT came
+// out 3,157,800,000,000,000 against a real ~EUR 3.2 billion, exactly 1e6
+// too large, and only roic exposed it -- profitMargin and revenueGrowth are
+// ratios, so a uniform scale error cancels and they looked perfectly fine.
+// clampImplausible then discarded the roic points, which is why roic read
+// as ABSENT rather than absurd.
+function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
+  const header = parseStatementTextBlockHeader(text);
+  if (!header) return null;
+  const { columns, dataStartIdx, scale } = header;
+
+  const usable = textBlockDataRows(text.slice(dataStartIdx), columns.length);
   if (usable.length < TEXT_BLOCK_MIN_ROWS) return null;
 
   // EVERY column in the block is a real period of its own, so emit them
@@ -2240,12 +2279,98 @@ function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
       const hit = matches.find((r) => /^total\b/i.test(r.label)) || matches[0];
       const value = hit.values[idx];
       if (value == null) continue;
-      facts[concept] = { label: hit.label, [column.months === 3 ? 'value3mo' : 'value']: value * scale, valueCumulative: null };
+      facts[concept] = { label: hit.label, [column.months === 3 ? 'value3mo' : 'value']: value, valueCumulative: null };
     }
     if (!Object.keys(facts).length) continue;
     results.push({ period: { months: column.months, endMonthDay: column.endMonthDay, year: column.year }, facts });
   }
   return results.length ? results : null;
+}
+
+// Instant counterpart to extractAllPeriodsFromStatementTextBlock: a
+// balance sheet has no "months ended" phrase, because an instant has no
+// duration, so the duration parser's required period phrase can never
+// match and the block is skipped entirely. Verified live: ASML's EX-99.3
+// carries a FIVE-column quarterly balance sheet as one text blob
+// ("Jun 30, Sep 29, Dec 31, Mar 30, Jun 29, (unaudited, in millions EUR)
+// 2024 2024 2024 2025 2025 / Cash and cash equivalents 4,813.6 ..."), which
+// is the only source of its quarter-end equity -- without it its equity
+// instants are December-only and quarterly roic cannot be computed at all.
+//
+// Requires a month-day run and a matching year run, and refuses any block
+// that DOES carry a period phrase so a duration statement can never be
+// read as a set of instants.
+function parseInstantTextBlockHeader(text) {
+  if (PERIOD_PHRASE_INDICATOR.test(text)) return null;
+  // Only the FIRST CONTIGUOUS run of month-days is the header. A balance
+  // sheet repeats a date further down (ASML's does, ~1,270 characters in),
+  // and scanning the whole blob collected ten of them, pushed the year
+  // search past the real header and made the counts disagree, so every
+  // instant block was rejected. A run ends at the first sizeable gap or any
+  // intervening figure.
+  const monthDays = [];
+  const mdRe = /\b([A-Z][a-z]{2})\.?\s+(\d{1,2}),/g;
+  let m;
+  let runEnd = null;
+  while ((m = mdRe.exec(text)) !== null) {
+    if (MONTH_ABBR_INDEX[m[1].toLowerCase()] == null) continue;
+    if (runEnd != null) {
+      const gap = text.slice(runEnd, m.index);
+      if (gap.length > TEXT_BLOCK_HEADER_GAP_CHARS || /\d[\d,]*\.\d/.test(gap)) break;
+    }
+    monthDays.push({ monthDay: `${m[1]} ${m[2]}`, end: m.index + m[0].length });
+    runEnd = m.index + m[0].length;
+    if (monthDays.length >= 12) break;
+  }
+  if (monthDays.length < TEXT_BLOCK_MIN_COLUMNS) return null;
+
+  const yearRe = /\b((?:19|20)\d{2})\b/g;
+  yearRe.lastIndex = monthDays[monthDays.length - 1].end;
+  const years = [];
+  let lastEnd = null;
+  while ((m = yearRe.exec(text)) !== null) {
+    if (lastEnd != null && /\d[\d,]*\.\d/.test(text.slice(lastEnd, m.index))) break;
+    years.push(m[1]);
+    lastEnd = m.index + m[0].length;
+    if (years.length >= 12) break;
+  }
+  // One year per column; anything else means the header wasn't recovered.
+  if (years.length !== monthDays.length) return null;
+
+  const columns = years.map((year, idx) => ({ endMonthDay: monthDays[idx].monthDay, year }));
+  const scale = /in\s+millions/i.test(text) ? 1000000 : /in\s+thousands/i.test(text) ? 1000 : 1;
+  return { columns, dataStartIdx: lastEnd, scale };
+}
+
+// Instants ARE pre-scaled here, unlike the duration extractor above:
+// detectScaleMultiplier's correction reaches duration concepts only, so an
+// unscaled balance-sheet figure stays raw. Verified live: with ASML's
+// instants left to that step, invested capital came through as 15,564.7
+// against a real ~EUR 15.6 billion while its EBIT was scaled correctly, so
+// roic was wrong by the full 1e6 in the other direction.
+function extractInstantPeriodsFromTextBlock(text, aliasMap) {
+  const header = parseInstantTextBlockHeader(text);
+  if (!header) return [];
+  const { columns, dataStartIdx, scale } = header;
+  const usable = textBlockDataRows(text.slice(dataStartIdx), columns.length);
+  if (usable.length < TEXT_BLOCK_MIN_ROWS) return [];
+
+  const results = [];
+  for (const [idx, column] of columns.entries()) {
+    const facts = {};
+    for (const [concept, rule] of Object.entries(aliasMap)) {
+      if (!rule) continue;
+      const matches = usable.filter((r) => rule.include.test(r.label) && !rule.exclude.test(r.label));
+      if (!matches.length) continue;
+      const hit = matches.find((r) => /^total\b/i.test(r.label)) || matches[0];
+      const value = hit.values[idx];
+      if (value == null) continue;
+      facts[concept] = { label: hit.label, value: value * scale };
+    }
+    if (!Object.keys(facts).length) continue;
+    results.push({ period: { endMonthDay: column.endMonthDay, year: column.year }, facts });
+  }
+  return results;
 }
 
 // Candidate blobs: elements whose own text carries a period phrase and
@@ -2258,6 +2383,28 @@ function statementTextBlocks($) {
     const text = $(el).text().replace(/\s+/g, ' ').trim();
     if (text.length < 200 || text.length > 20000) continue;
     if (!PERIOD_PHRASE_INDICATOR.test(text)) continue;
+    const figures = text.match(TEXT_BLOCK_FIGURE);
+    if (!figures || figures.length < 8) continue;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    blocks.push(text);
+  }
+  return blocks.sort((a, b) => b.length - a.length);
+}
+
+// Instant-block candidates. statementTextBlocks requires a period phrase,
+// which is exactly what a balance sheet never has, so instant blobs were
+// filtered out before any parser saw them. This selects on a month-day run
+// instead, and explicitly rejects anything carrying a period phrase so a
+// duration block can only ever be handled by the duration path.
+function instantTextBlocks($) {
+  const seen = new Set();
+  const blocks = [];
+  for (const el of $('div,section,p').toArray()) {
+    const text = $(el).text().replace(/\s+/g, ' ').trim();
+    if (text.length < 200 || text.length > 20000) continue;
+    if (PERIOD_PHRASE_INDICATOR.test(text)) continue;
+    if (!/\b[A-Z][a-z]{2}\.?\s+\d{1,2},/.test(text)) continue;
     const figures = text.match(TEXT_BLOCK_FIGURE);
     if (!figures || figures.length < 8) continue;
     if (seen.has(text)) continue;
@@ -3357,6 +3504,27 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           extractedList = [];
         }
         if (debug) console.error('DEBUG extractInstantStatement result', url, JSON.stringify(extractedList));
+        // LAST RESORT for a balance sheet with no table markup, mirroring
+        // the duration-side text-block fallback above and gated the same
+        // way: only when the table search produced nothing for this
+        // document, so a filer whose balance-sheet tables already parse can
+        // never reach it. Verified live: this is the only source of ASML's
+        // quarter-end equity (its instants were December-only from XBRL),
+        // and without it quarterly roic cannot be computed at all.
+        if (!extractedList.length) {
+          for (const block of instantTextBlocks($)) {
+            let fromBlock;
+            try {
+              fromBlock = extractInstantPeriodsFromTextBlock(block, balanceSheetAliases);
+            } catch (e) {
+              if (debug) console.error('DEBUG extractInstantPeriodsFromTextBlock threw', url, e.message);
+              continue;
+            }
+            if (!fromBlock.length) continue;
+            if (debug) console.error('DEBUG instant text-block result', url, fromBlock.length, JSON.stringify(fromBlock).slice(0, 240));
+            extractedList = extractedList.concat(fromBlock);
+          }
+        }
         await recordExtractedInstant(extractedList, filing);
       }
     }
