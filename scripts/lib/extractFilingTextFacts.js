@@ -2318,12 +2318,25 @@ function normalizeLabelPunctuation(raw) {
 // flows from operating activities:" and does not appear inside a statement
 // row's own label. A filer that puts a subtotal on the heading row itself
 // would be stripped to nothing, so an empty result keeps the original.
+// A colon only ends a lead-in when at least two words follow it. A real row
+// label can carry a colon with a SHORT qualifier after it, and there the
+// words BEFORE the colon are the label -- verified live: ASML states its
+// share count on "Weighted average number of ordinary shares (in millions)
+// used in computing per share amounts: Basic", where stripping at the colon
+// would leave just "Basic". The lead-ins this strip exists for
+// ("Adjustments to reconcile ...: Depreciation and amortization") always
+// have a full label after the colon.
+const TEXT_BLOCK_MIN_WORDS_AFTER_COLON = 2;
+
 function stripStatementSectionHeading(label) {
   let out = label;
   for (let pass = 0; pass < 3; pass++) {
     const before = out;
     const colon = out.lastIndexOf(':');
-    if (colon !== -1) out = out.slice(colon + 1).trim();
+    if (colon !== -1) {
+      const after = out.slice(colon + 1).trim();
+      if (after.split(/\s+/).filter(Boolean).length >= TEXT_BLOCK_MIN_WORDS_AFTER_COLON) out = after;
+    }
     out = out.replace(/^cash flows? (?:from|used in|provided by|generated from)\s+(?:\w+\s+){0,2}activities\b[\s:,-]*/i, '').trim();
     if (out === before) break;
   }
