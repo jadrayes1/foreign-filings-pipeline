@@ -2149,25 +2149,58 @@ const TEXT_BLOCK_MAX_LABEL_CHARS = 90;
 // table path depends on for ~1100 other filers.
 const TEXT_BLOCK_NON_FIGURE_ROW = /percentage|per\s+share|\bratio\b|\bper\s+cent|%|\bshares\s+outstanding\b|\bnumber\s+of\b/i;
 
-function parseStatementTextBlockHeader(text) {
-  const phrases = [];
+// The period phrases of ONE header sit side by side ("Three months ended
+// Nine months ended"), separated at most by a month-day or a units caption.
+// A phrase much further along is a DIFFERENT header -- a statement that
+// spans a page break repeats its own header partway down the blob, and the
+// page footer repeats it again at the end.
+const TEXT_BLOCK_PHRASE_GROUP_GAP_CHARS = 80;
+// The year cells of a header are adjacent too. Without a cap the run ran on
+// past the header and swallowed any later stray year in the blob -- verified
+// live: ASML's page footer reads "ASML Financial statements US GAAP Q3 2026
+// 5", and that "2026" joined a 4-year header as a phantom 5th column, which
+// then failed allocateItemsToPhrases against the header's 2 phrases and
+// rejected the whole block.
+const TEXT_BLOCK_YEAR_RUN_GAP_CHARS = 16;
+
+// Groups the blob's period phrases into header OCCURRENCES. A statement
+// long enough to break across a page carries its header more than once, so
+// the phrase list is not one header's worth of phrases.
+function statementTextBlockPhraseGroups(text) {
   const phraseRe = /((?:nine|six|three|twelve|9|6|3|12)[\s-]months?(?:\s+periods?)?\s+ended|quarters?\s+ended|years?\s+ended)/gi;
+  const groups = [];
   let m;
   while ((m = phraseRe.exec(text)) !== null) {
     const parsed = parsePeriodPhrase(m[1]);
-    if (parsed?.months) phrases.push({ months: parsed.months, index: m.index });
+    if (!parsed?.months) continue;
+    const phrase = { months: parsed.months, index: m.index, end: m.index + m[0].length };
+    const last = groups[groups.length - 1];
+    if (last && phrase.index - last[last.length - 1].end <= TEXT_BLOCK_PHRASE_GROUP_GAP_CHARS) last.push(phrase);
+    else groups.push([phrase]);
   }
-  if (!phrases.length) return null;
+  return groups;
+}
 
+// Parses ONE header occurrence: the month-day run and year run that follow
+// its last phrase, and the span those occupy.
+function parseStatementTextBlockHeaderOccurrence(text, group) {
   // Month-day tokens ("Jun 30,") sit between the last phrase and the year
-  // run, one per real column.
-  const afterPhrases = phrases[phrases.length - 1].index;
+  // run, one per real column, in a single contiguous run. Scanning past the
+  // end of that run reached the NEXT occurrence's month-days and made the
+  // span -- and so the data boundary -- wrong.
   const monthDays = [];
   const mdRe = /\b([A-Z][a-z]{2})\.?\s+(\d{1,2}),/g;
-  mdRe.lastIndex = afterPhrases;
+  mdRe.lastIndex = group[group.length - 1].end;
+  let m;
+  let runEnd = null;
   while ((m = mdRe.exec(text)) !== null) {
     if (MONTH_ABBR_INDEX[m[1].toLowerCase()] == null) continue;
+    if (runEnd != null) {
+      const gap = text.slice(runEnd, m.index);
+      if (gap.length > TEXT_BLOCK_HEADER_GAP_CHARS || /\d[\d,]*\.\d/.test(gap)) break;
+    }
     monthDays.push({ monthDay: `${m[1]} ${m[2]}`, end: m.index + m[0].length });
+    runEnd = m.index + m[0].length;
     if (monthDays.length >= 12) break;
   }
   if (!monthDays.length) return null;
@@ -2178,8 +2211,11 @@ function parseStatementTextBlockHeader(text) {
   const years = [];
   let lastEnd = null;
   while ((m = yearRe.exec(text)) !== null) {
-    const gap = lastEnd == null ? 0 : text.slice(lastEnd, m.index);
-    if (lastEnd != null && /\d[\d,]*\.\d/.test(gap)) break; // a figure intervened -- the header is over
+    if (lastEnd != null) {
+      const gap = text.slice(lastEnd, m.index);
+      // a figure or a long stretch of prose intervened -- the header is over
+      if (gap.length > TEXT_BLOCK_YEAR_RUN_GAP_CHARS || /\d[\d,]*\.\d/.test(gap)) break;
+    }
     years.push(m[1]);
     lastEnd = m.index + m[0].length;
     if (years.length >= 12) break;
@@ -2189,15 +2225,57 @@ function parseStatementTextBlockHeader(text) {
   // One month-day per column when the counts line up; otherwise the
   // month-days are shared across the year columns in order.
   const columnCount = years.length;
-  const phraseByIdx = allocateItemsToPhrases(columnCount, phrases.map((p) => ({ months: p.months, colspan: 1 })));
+  const phraseByIdx = allocateItemsToPhrases(columnCount, group.map((p) => ({ months: p.months, colspan: 1 })));
   if (!phraseByIdx) return null;
   const columns = years.map((year, idx) => ({
     months: phraseByIdx[idx].months,
     endMonthDay: (monthDays[idx] || monthDays[idx % monthDays.length]).monthDay,
     year,
   }));
+  return { columns, span: [group[0].index, lastEnd] };
+}
+
+// Returns the block's columns plus the SEGMENTS of the blob that hold its
+// data rows, since the data is not always one run after one header.
+//
+// Verified live: ASML's EX-99.3 cash-flow statements are long enough to
+// break across a page, so each one's header appears in the middle of the
+// blob (after the operating and investing sections) and again in the page
+// footer. Anchoring on the LAST phrase group put the data boundary at the
+// footer, leaving zero rows after it, and the whole block was rejected --
+// which is why ASML had no quarterly fcfMargin and no quarterly P/FCF at
+// all while its income statement, from a blob short enough to fit one page,
+// parsed fine.
+//
+// A header that repeats with IDENTICAL columns is a page-break repeat of one
+// statement, so every stretch of the blob outside those headers is that
+// statement's data. That equality is the gate: two DIFFERENT headers in one
+// blob mean a container element holding two different statements, and there
+// the old "data follows the header" reading is kept so rows can never be
+// read against another statement's columns.
+function parseStatementTextBlockHeader(text) {
+  const groups = statementTextBlockPhraseGroups(text);
+  if (!groups.length) return null;
+  const occurrences = groups.map((g) => parseStatementTextBlockHeaderOccurrence(text, g)).filter(Boolean);
+  if (!occurrences.length) return null;
+
   const scale = /in\s+millions/i.test(text) ? 1000000 : /in\s+thousands/i.test(text) ? 1000 : 1;
-  return { columns, dataStartIdx: lastEnd, scale };
+  const key = (o) => JSON.stringify(o.columns);
+  const repeats = occurrences.filter((o) => key(o) === key(occurrences[0]));
+
+  if (repeats.length === occurrences.length && occurrences.length > 1) {
+    const segments = [];
+    let cursor = 0;
+    for (const o of occurrences) {
+      if (o.span[0] > cursor) segments.push([cursor, o.span[0]]);
+      cursor = Math.max(cursor, o.span[1]);
+    }
+    if (cursor < text.length) segments.push([cursor, text.length]);
+    return { columns: occurrences[0].columns, segments, scale };
+  }
+
+  const first = occurrences[0];
+  return { columns: first.columns, segments: [[first.span[1], text.length]], scale };
 }
 
 // Recovers a text blob's rows as RUNS of adjacent figures delimited by the
@@ -2223,6 +2301,35 @@ function normalizeLabelPunctuation(raw) {
     .trim();
 }
 
+// A row's label is the text since the PREVIOUS row's figures, so a
+// figure-less SECTION HEADING sitting above a row gets glued onto that
+// row's label: the cash-flow statement's first row arrives as "Cash flows
+// from operating activities Net income". A contaminated label then matches
+// the WRONG concept -- verified live on ASML's EX-99.3, where
+// LABEL_ALIASES.ocf matched the heading half of exactly that label and took
+// Net income's values as operating cash flow, so ocf came through identical
+// to netIncome in all five quarters. (The table path never has this problem:
+// cell boundaries give it the row's own label, and it searches one statement
+// at a time.)
+//
+// Only a leading clause that is unmistakably a heading is removed: a
+// recognised cash-flow section heading, or anything up to a colon, which
+// ends a lead-in such as "Adjustments to reconcile net income to net cash
+// flows from operating activities:" and does not appear inside a statement
+// row's own label. A filer that puts a subtotal on the heading row itself
+// would be stripped to nothing, so an empty result keeps the original.
+function stripStatementSectionHeading(label) {
+  let out = label;
+  for (let pass = 0; pass < 3; pass++) {
+    const before = out;
+    const colon = out.lastIndexOf(':');
+    if (colon !== -1) out = out.slice(colon + 1).trim();
+    out = out.replace(/^cash flows? (?:from|used in|provided by|generated from)\s+(?:\w+\s+){0,2}activities\b[\s:,-]*/i, '').trim();
+    if (out === before) break;
+  }
+  return out || label;
+}
+
 function textBlockDataRows(body, columnCount) {
   const rows = [];
   TEXT_BLOCK_FIGURE.lastIndex = 0;
@@ -2243,7 +2350,11 @@ function textBlockDataRows(body, columnCount) {
     // The label is the text since the END of the previous run, never since
     // its start -- otherwise it swallows the previous row's figures and a
     // concept can match on a neighbouring row's words.
-    run = { label: normalizeLabelPunctuation(body.slice(prevRunEnd, m.index)), values: [parseNumericCell(m[0])], end: m.index + m[0].length };
+    run = {
+      label: stripStatementSectionHeading(normalizeLabelPunctuation(body.slice(prevRunEnd, m.index))),
+      values: [parseNumericCell(m[0])],
+      end: m.index + m[0].length,
+    };
   }
   if (run) rows.push(run);
 
@@ -2270,9 +2381,12 @@ function textBlockDataRows(body, columnCount) {
 function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
   const header = parseStatementTextBlockHeader(text);
   if (!header) return null;
-  const { columns, dataStartIdx, scale } = header;
+  const { columns, segments, scale } = header;
 
-  const usable = textBlockDataRows(text.slice(dataStartIdx), columns.length);
+  // Each segment is scanned on its own, never as one concatenated string --
+  // a run of figures must not be able to straddle a header the blob places
+  // between them.
+  const usable = segments.flatMap(([from, to]) => textBlockDataRows(text.slice(from, to), columns.length));
   if (usable.length < TEXT_BLOCK_MIN_ROWS) return null;
 
   // EVERY column in the block is a real period of its own, so emit them
@@ -3477,12 +3591,26 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       // parse here can only ever affect a document that was producing
       // nothing before.
       if (!anyTableResult) {
-        const blocks = statementTextBlocks($);
+        // Duration concepts ONLY. The table path reaches each statement
+        // through its own heading and so searches income concepts in the
+        // income statement and ocf/capex in the cash-flow statement; this
+        // path has no heading to go by and was handed the WHOLE alias map,
+        // so a balance-sheet concept could be matched against a duration
+        // statement's rows. Verified live on ASML's EX-99.3: `cash` matched
+        // the cash-flow statement's "Net increase (decrease) in cash and
+        // cash equivalents" row and recorded -2,117.0 as the quarter's cash
+        // balance against a real 5,126.5. Instants come from
+        // extractInstantPeriodsFromTextBlock below, which is already handed
+        // balanceSheetAliases alone.
+        const durationBlockAliases = Object.fromEntries(
+          Object.entries(aliasMap).filter(([c]) => !INSTANT_CONCEPTS.has(c))
+        );
+        const blocks = Object.keys(durationBlockAliases).length ? statementTextBlocks($) : [];
         if (debug && blocks.length) console.error('DEBUG text-block candidates', url, blocks.length, blocks.map((b) => b.length).join(','));
         for (const block of blocks) {
           let extractedList;
           try {
-            extractedList = extractAllPeriodsFromStatementTextBlock(block, aliasMap);
+            extractedList = extractAllPeriodsFromStatementTextBlock(block, durationBlockAliases);
           } catch (e) {
             if (debug) console.error('DEBUG extractAllPeriodsFromStatementTextBlock threw', url, e.message);
             continue;
