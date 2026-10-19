@@ -78,6 +78,10 @@ on:
         description: 'Optional: process only this ticker (or comma-separated list), ignoring the normal gap list/rotation'
         required: false
         type: string
+      recomputeMetrics:
+        description: 'Optional: comma-separated metrics whose PUBLISHED points this run may overwrite instead of union-protecting (RECOMPUTE_METRICS), e.g. roic. Needed after a deliberate formula change -- without it a corrected value is dropped because its label is already published. Leave blank for normal runs.'
+        required: false
+        type: string
       enableBusinessQuant:
         description: 'Optional: set to 1 to also try the BusinessQuant last-resort fallback for this run (staged manual testing only -- see the header comment above)'
         required: false
@@ -126,6 +130,7 @@ jobs:
           SHARD_INDEX: '3'
           SHARD_COUNT: '3'
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          RECOMPUTE_METRICS: ${{ inputs.recomputeMetrics }}
           ENABLE_BUSINESSQUANT_FALLBACK: ${{ inputs.enableBusinessQuant }}
           BUSINESSQUANT_API_KEY: ${{ secrets.BUSINESSQUANT_API_KEY }}
           FILING_TEXT_FALLBACK_TICKERS: ${{ inputs.enableBusinessQuant && inputs.symbol || '' }}
