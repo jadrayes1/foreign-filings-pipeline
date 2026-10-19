@@ -840,6 +840,13 @@ function buildAnnualRatioTrend(numeratorAnnual, denominatorAnnual, combine) {
 // separate quarterly/annual invested-capital computation needed.
 // ---------------------------------------------------------------------------
 
+// Fraction of a non-bank filer's cash balance treated as EXCESS and netted
+// out of invested capital. MUST stay equal to generateSectorMetrics.js's
+// EXCESS_CASH_NETTING_FRACTION, which carries the full rationale and the
+// live ASML/PLTR/BMO evidence. 0 = net none of it (product decision
+// 2026-10-18); 1 restores the original net-everything behaviour.
+const EXCESS_CASH_NETTING_FRACTION = 0;
+
 function investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank) {
   if (process.env.DEBUG_CUMULATIVE_IDX) {
     console.error('DEBUG investedCapitalByEnd equityInstant', JSON.stringify(equityInstant));
@@ -860,7 +867,13 @@ function investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank) {
     // deliberate exclusion of deposits above).
     const cash = isBank ? 0 : cashByEnd.get(e.end) || 0;
     const debt = debtByEnd.get(e.end) || 0;
-    const investedCapital = debt + e.value - cash;
+    // EXCESS_CASH_NETTING_FRACTION mirrors generateSectorMetrics.js's
+    // identically-named constant -- see its full rationale there. 0 = treat
+    // the whole balance as operating cash. Kept as the same explicit
+    // multiplier rather than deleting the cash term so the two pipelines
+    // stay tunable together; they MUST agree, or the same company's ROIC
+    // depends on which pipeline happens to cover it.
+    const investedCapital = debt + e.value - cash * EXCESS_CASH_NETTING_FRACTION;
     // Published even when negative (e.g. accumulated losses pushing book
     // equity deeply negative with no offsetting debt) rather than excluded
     // — see computeInvestedCapital's identical comment in the main
@@ -959,12 +972,47 @@ function parseLabelToOrdinal(label) {
 // recover previously-missing older quarters, not just newer ones) and
 // re-capped at the same QUARTERS_OF_HISTORY rolling window the builders
 // already use.
-function pickTrendToPublish(existingPoints, freshPoints) {
+// Metrics whose published points this run is allowed to REPLACE rather than
+// union-protect, as a comma-separated list (RECOMPUTE_METRICS=roic).
+//
+// The union below keeps every published point forever and never overwrites
+// one, which is right for guarding against a transiently-wrong fresh run but
+// makes a deliberate FORMULA change impossible to land: the corrected value
+// carries the same label as the published one, so it is dropped every time.
+// Verified live 2026-10-18 -- changing EXCESS_CASH_NETTING_FRACTION to 0
+// moved ASML's invested capital from 15.99B to 24.02B, yet a 14-ticker run
+// over 168 series reported ZERO roic changes, because every label was
+// already published. The same union exists verbatim in
+// generateSectorMetrics.js, so this applied to both pipelines and to every
+// value-level correction, not just this one.
+//
+// Deliberately an explicit opt-in per run rather than a change to the merge
+// itself: the protection is load-bearing (a fresh run CAN come back subtly
+// wrong for one filer and must not be able to overwrite good history), so it
+// is lifted only for the named metrics, only when a human asks for it.
+const RECOMPUTE_METRICS = new Set(
+  (process.env.RECOMPUTE_METRICS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
+  // A recomputed metric is STILL a union -- only the precedence flips, so
+  // fresh overwrites a label it recomputed while every published label fresh
+  // does NOT cover survives untouched.
+  //
+  // Returning freshPoints outright instead was tried first and lost real
+  // data: fresh is often narrower than the accumulated published series, and
+  // once the newest labels went missing the isRecentEnough gate downstream
+  // discarded the whole thing. Verified live -- PAC's and TSM's yearly roic
+  // (11 and 9 real points) both emptied completely.
+  const recomputing = metricKey && RECOMPUTE_METRICS.has(metricKey);
   const merged = new Map();
   for (const p of existingPoints) merged.set(p.label, p);
-  for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
+  for (const p of freshPoints) if (recomputing || !merged.has(p.label)) merged.set(p.label, p);
   return [...merged.values()]
     .sort((a, b) => {
       const oa = parseLabelToOrdinal(a.label);
@@ -1085,7 +1133,7 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
     const merged = {};
     for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin', 'roic']) {
       const existingPoints = sanitizeCadencePoints(cadence, existing[cadence]?.[key]);
-      const picked = pickTrendToPublish(existingPoints, freshEntry?.[cadence]?.[key]);
+      const picked = pickTrendToPublish(existingPoints, freshEntry?.[cadence]?.[key], key);
       if (picked.length && isRecentEnough(picked)) merged[key] = picked;
     }
     if (Object.keys(merged).length) out[cadence] = merged;
