@@ -750,8 +750,29 @@ const LABEL_ALIASES = {
     // sheet lines — "Current portion of long-term debt" and "Long-term
     // debt" — neither a subtotal of the other. Summed via the same
     // capex-style tiebreak below (extended to cover debt too).
-    include: /long-?term debt|borrowings?|loans? payable|notes payable/i,
-    exclude: /proceeds|repayment|issuance/i,
+    // "bank loans?" added -- verified live: PAC (Grupo Aeroportuario del
+    // Pacifico) names its two real debt lines "Bank loans and interest
+    // payable" (current, 12,935,662) and "Bank loans" (non-current,
+    // 6,372,418), and NEITHER matched. "loans? payable" needs the two words
+    // adjacent, so "loans and interest payable" missed it, and the
+    // non-current line carries no qualifier at all. PAC's XBRL stopped
+    // carrying debt facts (ifrs-full Borrowings/LongtermBorrowings have
+    // nothing from 2025 on), so filing text is its ONLY debt source -- its
+    // invested capital was equity alone, which is most of why its ROIC read
+    // 318%. Equity and cash were extracting correctly from the same table
+    // all along.
+    //
+    // "receivable" excluded so a lender's or a bank's own ASSET side can
+    // never be read as its debt ("Bank loans receivable", "Loans
+    // receivable"), which the bare "bank loans?" alternative would
+    // otherwise match.
+    include: /long-?term debt|borrowings?|loans? payable|notes payable|bank loans?/i,
+    // "interest expense" excluded as belt-and-braces: these aliases are
+    // only ever applied to a balance sheet, where an income-statement row
+    // like "Interest expense on bank loans and overdrafts" (a real PAC
+    // concept) cannot appear -- but the bare "bank loans?" alternative
+    // would match it if one ever did.
+    exclude: /proceeds|repayment|issuance|receivable|interest expense/i,
   },
   cash: {
     include: /cash and cash equivalents/i,
