@@ -146,10 +146,10 @@ jobs:
             ) && { echo "Published on attempt $attempt."; break; }
             attempt=$((attempt + 1))
             if [ "$attempt" -gt 5 ]; then
-              echo "::error::Publish rejected 5 times in a row -- the gist kept changing underneath this run. Not forcing; re-dispatch once things settle."
+              echo "::error::Publish failed 5 times in a row. The cause is in the git error printed before each retry: 'stale info' or 'rejected' means another run updated the gist first; 'could not read Username' means authentication failed. Not forcing."
               exit 1
             fi
-            echo "Push rejected (remote moved since clone) — retrying with a fresh fetch (attempt ${attempt}/5)..."
+            echo "Push failed -- see the git error just above for why. Retrying with a fresh fetch (attempt ${attempt}/5)..."
           done
 
       - name: Report failure
