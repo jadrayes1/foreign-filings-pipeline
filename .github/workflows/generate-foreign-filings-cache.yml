@@ -190,6 +190,19 @@ jobs:
             echo "::error::foreignFilingsCache.json was never written this run (the generate step likely crashed before its first checkpoint, e.g. an OOM kill -- see generateForeignFilingsCache.js's own comment). Nothing to publish; failing loudly (via the existing Report-failure issue) instead of the confusing raw 'cp: cannot stat' error, and instead of silently reporting success with nothing published."
             exit 1
           fi
+          # Fallback credentials for when GitHub REDIRECTS the gist push.
+          # git drops credentials embedded in a URL when it follows a redirect,
+          # then tries to prompt for a username -- and with no terminal it dies
+          # with "could not read Username for 'https://gist.github.com'".
+          # Verified live 2026-10-19/20: the sector-metrics publish, foreign
+          # shard 3/3 and two trending-social runs all failed this way, each
+          # log showing "warning: redirecting to https://gist.github.com/***.git/"
+          # immediately before the auth error. Intermittent because the
+          # redirect only sometimes happens. The helper is consulted ONLY when
+          # git would otherwise prompt, so the normal no-redirect path is
+          # untouched. The retry loop below then reported "remote moved since
+          # clone", which was never the cause.
+          git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=${GIST_TOKEN}"; }; f'
           CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
           attempt=1
           while true; do
