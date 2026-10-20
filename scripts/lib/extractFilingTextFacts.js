@@ -2160,7 +2160,15 @@ const TEXT_BLOCK_HEADER_GAP_CHARS = 12;
 const TEXT_BLOCK_MIN_ROWS = 3;
 // A clean label is short; anything longer means the row boundaries were not
 // recovered properly and the match can't be trusted.
-const TEXT_BLOCK_MAX_LABEL_CHARS = 90;
+// Raised from 90: a real share-count row can be long. Verified live, ASML
+// states its count as "Weighted average number of ordinary shares (in
+// millions) used in computing per share amounts: Basic" -- 102 characters,
+// dropped by the old limit before any alias could see it. The guard exists
+// to catch a row whose boundaries were not recovered properly, and the
+// other conditions carry that weight independently: a kept row must still
+// have EXACTLY columnCount values, all non-null. Raising the ceiling can
+// only ADD candidate rows, each of which still has to match a concept.
+const TEXT_BLOCK_MAX_LABEL_CHARS = 120;
 // A ratio/per-share row states a PERCENTAGE or a per-share amount, not a
 // currency figure, and this path has no column units to tell them apart --
 // verified live: ASML's own "Ratios and Other Data" block sits in the same
@@ -2169,6 +2177,37 @@ const TEXT_BLOCK_MAX_LABEL_CHARS = 90;
 // revenue. Excluded here rather than in the shared LABEL_ALIASES, which the
 // table path depends on for ~1100 other filers.
 const TEXT_BLOCK_NON_FIGURE_ROW = /percentage|per\s+share|\bratio\b|\bper\s+cent|%|\bshares\s+outstanding\b|\bnumber\s+of\b/i;
+
+// `shares` is the ONE concept whose real row is a COUNT, not a currency
+// figure, so the exclusion above -- built to stop a ratio row being read as
+// money -- also discards the only row `shares` ever wants. ASML's count
+// row matches both "number of" and "per share". A non-figure row is
+// therefore offered to `shares` alone and to no other concept.
+//
+// Its label also never matched LABEL_ALIASES.shares, which requires
+// "weighted average ... (common )?shares" -- "ordinary shares" is not
+// covered -- and whose `exclude: /per share/` rejects it outright. A
+// TEXT-BLOCK-LOCAL pattern is used rather than widening the shared alias,
+// exactly as TEXT_BLOCK_NON_FIGURE_ROW itself is local: the table path
+// depends on that alias for ~1100 other filers, and admitting a "per share"
+// label there risks matching a real EPS row.
+//
+// Empty shares.quarterly is what blocked ASML's quarterly AND TTM P/FCF and
+// P/E even with real quarterly OCF, capex and net income all present --
+// buildForeignPfcfQuarterly filters on `shares > 0`.
+const TEXT_BLOCK_SHARES_INCLUDE = /(weighted[\s-]average )?number of (ordinary |common )?shares\b|weighted[\s-]average (number of )?(basic |diluted )?(ordinary |common )?shares?\b/i;
+// Still rejects the per-share AMOUNT rows, which is what the shared alias's
+// blanket "per share" exclusion was protecting against.
+const TEXT_BLOCK_SHARES_EXCLUDE = /(income|earnings|loss|profit|dividend|sales|revenue)\s+per\b|per (ordinary |common )?share amounts?$/i;
+
+function textBlockConceptMatches(rows, concept, rule) {
+  if (concept === 'shares') {
+    const own = rows.filter((r) => TEXT_BLOCK_SHARES_INCLUDE.test(r.label) && !TEXT_BLOCK_SHARES_EXCLUDE.test(r.label));
+    if (own.length) return own;
+  }
+  // Every other concept sees only the rows that really carry money.
+  return rows.filter((r) => !r.nonFigure && rule.include.test(r.label) && !rule.exclude.test(r.label));
+}
 
 // The period phrases of ONE header sit side by side ("Three months ended
 // Nine months ended"), separated at most by a month-day or a units caption.
@@ -2392,14 +2431,19 @@ function textBlockDataRows(body, columnCount) {
   }
   if (run) rows.push(run);
 
-  return rows.filter(
-    (r) =>
-      r.values.length === columnCount &&
-      r.values.every((v) => v != null) &&
-      r.label &&
-      r.label.length <= TEXT_BLOCK_MAX_LABEL_CHARS &&
-      !TEXT_BLOCK_NON_FIGURE_ROW.test(r.label)
-  );
+  // A non-figure row is KEPT but FLAGGED, so textBlockConceptMatches can
+  // offer it to `shares` and withhold it from every other concept. It used
+  // to be dropped outright here, which is what left `shares` with nothing to
+  // match in this path at all.
+  return rows
+    .filter(
+      (r) =>
+        r.values.length === columnCount &&
+        r.values.every((v) => v != null) &&
+        r.label &&
+        r.label.length <= TEXT_BLOCK_MAX_LABEL_CHARS
+    )
+    .map((r) => ({ ...r, nonFigure: TEXT_BLOCK_NON_FIGURE_ROW.test(r.label) }));
 }
 
 // Values are emitted UNSCALED on purpose. detectScaleMultiplier already
@@ -2421,7 +2465,7 @@ function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
   // a run of figures must not be able to straddle a header the blob places
   // between them.
   const usable = segments.flatMap(([from, to]) => textBlockDataRows(text.slice(from, to), columns.length));
-  if (usable.length < TEXT_BLOCK_MIN_ROWS) return null;
+  if (usable.filter((r) => !r.nonFigure).length < TEXT_BLOCK_MIN_ROWS) return null;
 
   // EVERY column in the block is a real period of its own, so emit them
   // all rather than selecting one per year. ASML publishes five- and
@@ -2437,7 +2481,7 @@ function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
     const facts = {};
     for (const [concept, rule] of Object.entries(aliasMap)) {
       if (!rule) continue;
-      const matches = usable.filter((r) => rule.include.test(r.label) && !rule.exclude.test(r.label));
+      const matches = textBlockConceptMatches(usable, concept, rule);
       if (!matches.length) continue;
       // Prefer the grand total over a component line, mirroring the same
       // tiebreak extractFromTable applies -- verified live: ASML lists "Net
@@ -2521,14 +2565,14 @@ function extractInstantPeriodsFromTextBlock(text, aliasMap) {
   if (!header) return [];
   const { columns, dataStartIdx, scale } = header;
   const usable = textBlockDataRows(text.slice(dataStartIdx), columns.length);
-  if (usable.length < TEXT_BLOCK_MIN_ROWS) return [];
+  if (usable.filter((r) => !r.nonFigure).length < TEXT_BLOCK_MIN_ROWS) return [];
 
   const results = [];
   for (const [idx, column] of columns.entries()) {
     const facts = {};
     for (const [concept, rule] of Object.entries(aliasMap)) {
       if (!rule) continue;
-      const matches = usable.filter((r) => rule.include.test(r.label) && !rule.exclude.test(r.label));
+      const matches = textBlockConceptMatches(usable, concept, rule);
       if (!matches.length) continue;
       const hit = matches.find((r) => /^total\b/i.test(r.label)) || matches[0];
       const value = hit.values[idx];
