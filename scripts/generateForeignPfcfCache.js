@@ -466,7 +466,16 @@ function buildForeignPfcfTTM(ocfQuarterly, capexQuarterly, sharesQuarterly, mont
     .map(({ quarters, anchor, partial }) => {
       const price = findClosestMonthlyPrice(monthlyPrices, anchor.end);
       if (!isOcfScalePlausible(anchor.ocf, price, anchor.shares)) return null;
-      const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
+      // Annualized when the window is PARTIAL -- see the identical note in
+      // stock-metrics-pipeline's generatePfcfTrendCache.js. A valuation
+      // ratio divides a whole share price by a period's flow, so a 1-3
+      // quarter window inflates it ~4x/2x/1.33x. Verified live: ASML read
+      // Q4'23=130.9(q1,partial) through Q2'24=157.7(q3,partial), snapping
+      // to 92.1 and 32.0 once full, against a FY'23 yearly P/FCF of 104.2.
+      // The margin builders correctly leave partial windows unscaled,
+      // because there both numerator and denominator cover the same
+      // quarters; only a ratio against a full PRICE needs this.
+      const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0) * (4 / quarters.length);
       const ttmFcfPerShare = ttmFcf / anchor.shares;
       const value = price != null && ttmFcfPerShare !== 0 ? price / ttmFcfPerShare : null;
       return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
@@ -555,7 +564,16 @@ function buildForeignPeTTM(netIncomeQuarterly, sharesQuarterly, monthlyPrices) {
     .map(({ quarters, anchor, partial }) => {
       const price = findClosestMonthlyPrice(monthlyPrices, anchor.end);
       if (!isOcfScalePlausible(anchor.netIncome, price, anchor.shares)) return null;
-      const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0);
+      // Annualized when the window is PARTIAL -- see the identical note in
+      // stock-metrics-pipeline's generatePfcfTrendCache.js. A valuation
+      // ratio divides a whole share price by a period's flow, so a 1-3
+      // quarter window inflates it ~4x/2x/1.33x. Verified live: ASML read
+      // Q4'23=130.9(q1,partial) through Q2'24=157.7(q3,partial), snapping
+      // to 92.1 and 32.0 once full, against a FY'23 yearly P/FCF of 104.2.
+      // The margin builders correctly leave partial windows unscaled,
+      // because there both numerator and denominator cover the same
+      // quarters; only a ratio against a full PRICE needs this.
+      const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0) * (4 / quarters.length);
       const ttmEps = ttmNetIncome / anchor.shares;
       const value = price != null && ttmEps !== 0 ? price / ttmEps : null;
       return value != null ? { label: quarterLabelFromDate(anchor.end), value, partial, quartersUsed: quarters.length } : null;
