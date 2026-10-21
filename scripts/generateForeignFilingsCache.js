@@ -1644,7 +1644,20 @@ async function processTicker(symbol, cik, isBank) {
         // magnitude; downstream fcfMargin math (ocf.value - capex.value)
         // assumes XBRL's convention.
         if (annual20FFacts.capex?.length) {
-          capex = dedupeAndClassify([...capexRaw, ...(filingTextFacts.capex || []), ...annual20FFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
+          // The 6-K text capex is negated HERE TOO, exactly as in the normal
+          // merge above (`filingTextFacts.capex.map(... -f.val)`). It was
+          // passed through un-negated, so whenever the 20-F path returned any
+          // capex, every 6-K quarterly capex value flipped sign and FCF became
+          // OCF + capex instead of OCF - capex. Verified live on TSM: Q1'24
+          // FCF margin read 1.042 instead of 0.431 -- exactly (436 + 181)/592
+          // rather than (436 - 181)/592 in NT$ billions. Latent until the 20-F
+          // path started extracting TSM's FY2025 capex; any other filer whose
+          // 20-F AND 6-K text both yield capex has been hitting it already.
+          capex = dedupeAndClassify([
+            ...capexRaw,
+            ...(filingTextFacts.capex || []).map((f) => ({ ...f, val: -f.val })),
+            ...annual20FFacts.capex.map((f) => ({ ...f, val: -f.val })),
+          ]);
         }
         if (annual20FFacts.equity?.length) equityInstant = dedupeInstantFacts([...equityRaw, ...(filingTextFacts.equity || []), ...annual20FFacts.equity]);
         if (annual20FFacts.debt?.length) debtInstant = dedupeInstantFacts([...debtRaw, ...(filingTextFacts.debt || []), ...annual20FFacts.debt]);
