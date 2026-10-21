@@ -2063,7 +2063,15 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
       results[concept] = { label: resolved.sum.map((d) => d.label).join(' + '), value3mo, valueCumulative };
     }
   }
-  return Object.keys(results).length ? { period: targetPeriod, facts: results } : null;
+  // captionScale rides along UNAPPLIED -- durations are still left raw for
+  // detectScaleMultiplier. It is only consulted when that detector had no
+  // evidence at all -- see the "scale-from-caption" block after detectScaleMultiplier is called.
+  // detectInstantTableScale despite the name: it is the generic reader (the
+  // table's own header first, then up to INSTANT_SCALE_LOOKBACK_SIBLINGS
+  // preceding siblings), and a 6-K often captions its units in a paragraph
+  // ABOVE the table -- verified live on ASR, whose caption never appears in
+  // the table's first rows, so the header-only reader found nothing.
+  return Object.keys(results).length ? { period: targetPeriod, facts: results, captionScale: detectInstantTableScale($, table) } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2527,7 +2535,7 @@ function extractAllPeriodsFromStatementTextBlock(text, aliasMap) {
       facts[concept] = { label: hit.label, [column.months === 3 ? 'value3mo' : 'value']: value, valueCumulative: null };
     }
     if (!Object.keys(facts).length) continue;
-    results.push({ period: { months: column.months, endMonthDay: column.endMonthDay, year: column.year }, facts });
+    results.push({ period: { months: column.months, endMonthDay: column.endMonthDay, year: column.year }, facts, captionScale: scale });
   }
   return results.length ? results : null;
 }
@@ -3023,8 +3031,22 @@ function detectInstantTableScale($, table) {
     .join(' ');
   if (/in\s+thousands/i.test(preceding)) return 1000;
   if (/in\s+millions/i.test(preceding)) return 1000000;
+  // A caption that is its own short line with no "in": ASR's audited
+  // statements sit under a bare "Thousands of Mexican pesos" paragraph
+  // (verified live, 6-K 0001104659-26-083137), so its FY2025 revenue stayed
+  // 37,237,431 against 31,332,787,000 for FY2024. Only a SHORT sibling that
+  // STARTS with the unit counts -- prose such as "thousands of passengers"
+  // mid-sentence must not.
+  for (const el of $(table).prevAll().slice(0, INSTANT_SCALE_LOOKBACK_SIBLINGS).toArray()) {
+    const line = $(el).text().replace(/\s+/g, ' ').trim();
+    if (line.length > STANDALONE_SCALE_CAPTION_MAX_CHARS) continue;
+    if (/^\(?\s*thousands\s+of\b/i.test(line)) return 1000;
+    if (/^\(?\s*millions\s+of\b/i.test(line)) return 1000000;
+  }
   return 1;
 }
+
+const STANDALONE_SCALE_CAPTION_MAX_CHARS = 60;
 
 function extractFromInstantTable($, table, aliasMap, externalColumnDates = null, externalBareMonthDay = null, preferredCurrency = null) {
   const parsed = parseInstantTableColumns($, table, externalColumnDates, externalBareMonthDay, preferredCurrency);
@@ -3570,7 +3592,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       }
       const list = collected[concept].get(endIso) || [];
       if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
-        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
+        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber, captionScale: extracted.captionScale ?? null });
       }
       collected[concept].set(endIso, list);
     }
@@ -3943,7 +3965,48 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // concept with no strong disagreeing evidence of its own; `perConcept`
   // (from a concept whose OWN evidence actually disagrees) overrides it
   // for just that concept, resolved per concept below via `scaleFor`.
-  const { global: globalScale, perConcept: conceptScaleOverrides } = detectScaleMultiplier(pointsByConcept, annualByEnd);
+  const detected = detectScaleMultiplier(pointsByConcept, annualByEnd);
+  const conceptScaleOverrides = detected.perConcept;
+  // When the detector made NO comparisons at all, its x1 is not a finding --
+  // it is the absence of one. Fall back to the scale the filing's own
+  // statements are captioned in ("in thousands of pesos") rather than
+  // silently leaving every duration figure raw.
+  //
+  // Verified live, three filers hit by this: ASR's FY2025 revenue published
+  // as 37,237,431 against 31,332,787,000 for FY2024, so its profit margin read
+  // 293.379 -- exactly 1000x its real 0.2934 (net income 10,924,697 over
+  // revenue 37,237,431, both in thousands, per its own 20-F). PAC's quarterly
+  // EBIT came out ~1000x too small and PSHG's ~1000x too large. The detector
+  // scores a scale by checking a year's 6-K figures against that year's XBRL
+  // annual, and all three filers' XBRL stops after FY2024 while their 6-K
+  // figures start in 2025 -- for ASR it made exactly zero comparisons. Net
+  // income meanwhile arrived correctly scaled from the 20-F, whose own path
+  // applies its caption, so revenue and net income sat on different scales.
+  //
+  // Deliberately limited to the zero-evidence case. Whenever the detector has
+  // anchors its verdict stands, because pre-applying a caption on top of a
+  // working detector is exactly the double-scaling this file already
+  // documents (ASML's EBIT once came out 3,157,800,000,000,000).
+  const globalScale = detected.global;
+  // PER FIGURE, in the units of the table each one came from -- never one
+  // modal caption applied across the board. Tried that first and it broke
+  // ASR's ROIC (0.183 -> 182.7): 24 of its 6-K figures were captioned "in
+  // thousands" but its EBIT came from a table with no such caption, and a
+  // single global x1000 inflated EBIT along with everything else. A 6-K's
+  // tables need not share units, so each figure keeps its own.
+  if (detected.comparisons === 0 && globalScale === 1 && !conceptScaleOverrides.size) {
+    let scaled = 0;
+    for (const [concept, points] of pointsByConcept) {
+      if (INSTANT_CONCEPTS.has(concept) || NON_ADDITIVE_CONCEPTS.has(concept)) continue;
+      for (const p of points) {
+        if (!(p.captionScale > 1)) continue;
+        p.val *= p.captionScale;
+        if (p.valueCumulative != null) p.valueCumulative *= p.captionScale;
+        scaled++;
+      }
+    }
+    if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG scale-from-caption (no anchors) scaled', scaled, 'figures by their own table caption');
+  }
   if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG scale-resolution', 'global', globalScale, 'perConcept', JSON.stringify([...conceptScaleOverrides]));
   const scaleFor = (concept) => conceptScaleOverrides.get(concept) ?? globalScale;
   if (globalScale !== 1 || conceptScaleOverrides.size) {
@@ -4313,6 +4376,7 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
   };
   let bestScale = 1;
   let bestScore = -1;
+  let comparisons = 0; // annual anchors actually scored against, at any scale
   for (const scale of SCALE_CANDIDATES) {
     let score = 0;
     for (const [concept, points] of pointsByConcept) {
@@ -4372,6 +4436,7 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
         // Comparing magnitudes only is safe for same-signed concepts too
         // (abs of two already-matching signs is a no-op).
         const ratio = Math.abs(sum) / Math.abs(annual.value);
+        comparisons++;
         if (process.env.DEBUG_FILING_EXTRACT) console.error('DEBUG detectScaleMultiplier', concept, fyEndYear, 'scale', scale, 'candidates', JSON.stringify(candidates), 'sum', sum, 'annual.value', annual.value, 'ratio', ratio);
         // 2-3 real quarters of a real fiscal year should land roughly in
         // [30%, 105%] of that year's total (generous bounds for
@@ -4421,6 +4486,7 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
         for (const annual of annuals.values()) {
           if (!annual.value || annual.end.slice(0, 4) === year) continue;
           const ratio = Math.abs(p.val * scale) / Math.abs(annual.value);
+          comparisons++;
           if (process.env.DEBUG_FILING_EXTRACT) {
             console.error('DEBUG detectScaleMultiplier crossYear', concept, year, 'vs', annual.end, 'scale', scale, 'val', p.val, 'annual.value', annual.value, 'ratio', ratio);
           }
@@ -4460,7 +4526,7 @@ function detectScaleMultiplier(pointsByConcept, annualByEnd) {
     }
   }
 
-  return { global, perConcept };
+  return { global, perConcept, comparisons };
 }
 
 const INSTANT_CONCEPTS = new Set(['equity', 'debt', 'cash']);
