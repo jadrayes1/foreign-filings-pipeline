@@ -665,6 +665,14 @@ const RECOMPUTE_METRICS = new Set(
     .filter(Boolean)
 );
 
+// Set by the workflow only for a scheduled recompute sweep (see its "Resolve
+// recompute sweep" step): the sweep's start. A ticker refreshed since then
+// has already been recomputed once and is merged normally from here on.
+const SWEEP_SINCE = process.env.SWEEP_SINCE ? Date.parse(process.env.SWEEP_SINCE) : null;
+function alreadySwept(fetchedAt) {
+  return SWEEP_SINCE != null && !!fetchedAt && Date.parse(fetchedAt) >= SWEEP_SINCE;
+}
+
 function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
   // Retraction only on a TARGET_SYMBOL run that names this metric, same
@@ -1077,7 +1085,12 @@ async function main() {
 
     // Only a computation that actually ran may recompute -- a skipped or
     // failed ticker leaves fresh empty, which a recompute reads as retract.
-    const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh, computed ? 'pfcfRatio' : null);
+    // During a scheduled sweep, also only a ticker not yet refreshed since
+    // the sweep began, so each is recomputed exactly once. The rotation is
+    // already stalest-first across every foreign filer, so it reaches all
+    // of them without reordering.
+    const mayRecompute = computed && !alreadySwept(cache[symbol]?.fetchedAt);
+    const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh, mayRecompute ? 'pfcfRatio' : null);
     cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences };
     if (cadences.ttm.length || cadences.quarterly.length || cadences.yearly.length) {
       resolved++;
@@ -1093,7 +1106,7 @@ async function main() {
     // OWN top-level ttm/quarterly/yearly (P/FCF) fields untouched; this
     // script is never the source of truth for those (foreignPfcfCache.json
     // is, via its own separate app-side fetch chain).
-    const peCadences = pickCadenceTrendsToPublish(peCache[symbol]?.pe, freshPe, computed ? 'peRatio' : null);
+    const peCadences = pickCadenceTrendsToPublish(peCache[symbol]?.pe, freshPe, mayRecompute ? 'peRatio' : null);
     if (peCadences.ttm.length || peCadences.quarterly.length || peCadences.yearly.length) {
       peCache[symbol] = { ...peCache[symbol], fetchedAt: new Date().toISOString(), pe: peCadences };
     }

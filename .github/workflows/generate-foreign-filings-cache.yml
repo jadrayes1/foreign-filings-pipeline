@@ -129,13 +129,38 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # A scheduled recompute sweep, without adding runs: the repo variable
+      # SWEEP_PLAN maps a workflow name to {metrics, from, until} (ISO UTC),
+      # and only a SCHEDULED run that starts inside that window recomputes.
+      # Manual dispatches use their own recomputeMetrics input only -- a
+      # targeted recompute can retract points, which a sweep must never do.
+      # Expires on its own at `until`; clear SWEEP_PLAN afterwards. SWEEP_SINCE
+      # (= from) lets the rotating P/FCF scripts recompute each ticker once.
+      - name: Resolve recompute sweep
+        env:
+          INPUT_RECOMPUTE: ${{ inputs.recomputeMetrics }}
+          SWEEP_PLAN: ${{ vars.SWEEP_PLAN }}
+        run: |
+          node -e "
+          const input = (process.env.INPUT_RECOMPUTE || '').trim();
+          let out = input, why = 'manual input', since = '';
+          if (!out && process.env.GITHUB_EVENT_NAME === 'schedule') {
+            let plan = {};
+            try { plan = JSON.parse(process.env.SWEEP_PLAN || '{}'); } catch (e) { console.log('::warning::SWEEP_PLAN is not valid JSON -- no sweep this run'); }
+            const p = plan[process.env.GITHUB_WORKFLOW], now = Date.now();
+            if (p && now >= Date.parse(p.from) && now < Date.parse(p.until)) { out = p.metrics; since = p.from; why = 'scheduled sweep ' + p.from + ' to ' + p.until; }
+          }
+          if (out) console.log('::notice::RECOMPUTE_METRICS=' + out + ' (' + why + ')');
+          require('fs').appendFileSync(process.env.GITHUB_ENV, 'RESOLVED_RECOMPUTE_METRICS=' + out + '\nSWEEP_SINCE=' + since + '\n');
+          "
+
       - name: Generate foreign filings cache
         env:
           ENABLE_FILING_TEXT_FALLBACK: '1'
           SHARD_INDEX: '1'
           SHARD_COUNT: '3'
           TARGET_SYMBOL: ${{ inputs.symbol }}
-          RECOMPUTE_METRICS: ${{ inputs.recomputeMetrics }}
+          RECOMPUTE_METRICS: ${{ env.RESOLVED_RECOMPUTE_METRICS }}
           DEBUG_FILING_EXTRACT: ${{ inputs.debugFilingExtract }}
           # Defaults to on (previously only set by a manual dispatch's own
           # input, never by the daily schedule trigger -- scheduled runs
