@@ -298,13 +298,25 @@ function matchingFactEntries(companyFacts, conceptCandidates) {
 // for a US-listed security. Exposed separately so the FILING-TEXT fallbacks
 // can denominate what they extract the same way, instead of each path
 // independently guessing and reintroducing the mismatch above.
+//
+// Otherwise the unit with the MOST facts -- the filer's reporting currency
+// -- not whichever unit happened to be seen first. Verified live: ASR tags
+// ifrs-full:Borrowings both in MXN (its consolidated figure, 30 facts) and
+// in COP (its Colombian subsidiary Airplan's, 11 facts, 440,000,000,000 at
+// end-2023), COP came first, and ASR's whole XBRL debt series was read in
+// Colombian pesos -- FY '23 ROIC published as 0.024 beside 0.186 for
+// FY '24. Scanned all 1,114 foreign filers' concept lists: ASR's debt is
+// the only one this changes.
 function detectPreferredUnit(companyFacts, conceptCandidates) {
-  const allUnits = new Set();
+  const factCountByUnit = new Map();
   for (const entry of matchingFactEntries(companyFacts, conceptCandidates)) {
-    for (const unit of Object.keys(entry.units)) allUnits.add(unit);
+    for (const [unit, facts] of Object.entries(entry.units)) {
+      factCountByUnit.set(unit, (factCountByUnit.get(unit) || 0) + (Array.isArray(facts) ? facts.length : 0));
+    }
   }
-  if (!allUnits.size) return null;
-  return allUnits.has('USD') ? 'USD' : [...allUnits][0];
+  if (!factCountByUnit.size) return null;
+  if (factCountByUnit.has('USD')) return 'USD';
+  return [...factCountByUnit.entries()].reduce((best, cur) => (cur[1] > best[1] ? cur : best))[0];
 }
 
 function extractFactSeries(companyFacts, conceptCandidates) {
@@ -346,6 +358,23 @@ function derivePretaxFromNetIncomeAndTax(netIncomeRaw, taxExpenseRaw) {
     derived.push({ start: ni.start, end: ni.end, val: ni.val + tax.val, filed: new Date(ni.filed) > new Date(tax.filed) ? ni.filed : tax.filed });
   }
   return derived;
+}
+
+// IFRS's continuing-operations OCF, used ONLY by a filer that tags no
+// OCF_CONCEPTS fact at all. Verified live: National Grid (NGG) tags its
+// operating cash flow solely as ifrs-full:CashFlowsFromUsedInOperating
+// ActivitiesContinuingOperations (GBP 6,808M for FY2025) and never the
+// total, so it had revenue growth, profit margin and ROIC but no FCF margin
+// at all; Philips (PHG) and Cosan (CSAN) are the same, the only three of
+// 579 IFRS foreign filers. Not appended to OCF_CONCEPTS, and not used to
+// fill single missing periods either (13 more filers would qualify for
+// that): with discontinued operations the two figures differ, and mixing
+// them inside one fiscal year corrupts the quarters decumulated from its
+// year-to-date totals.
+const OCF_CONTINUING_OPERATIONS_CONCEPTS = ['CashFlowsFromUsedInOperatingActivitiesContinuingOperations'];
+function withContinuingOperationsOcf(companyFacts, ocfRaw) {
+  if (ocfRaw.length) return ocfRaw;
+  return extractFactSeries(companyFacts, OCF_CONTINUING_OPERATIONS_CONCEPTS);
 }
 
 function daysBetween(startStr, endStr) {
@@ -1356,7 +1385,7 @@ async function processTicker(symbol, cik, isBank) {
   if (!isGenuineForeignFiler(companyFacts)) return null;
 
   const revenueRaw = extractFactSeries(companyFacts, REVENUE_CONCEPTS);
-  const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
+  const ocfRaw = withContinuingOperationsOcf(companyFacts, extractFactSeries(companyFacts, OCF_CONCEPTS));
   const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
   const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS);
   const ebitRaw = extractFactSeries(companyFacts, EBIT_CONCEPTS);
