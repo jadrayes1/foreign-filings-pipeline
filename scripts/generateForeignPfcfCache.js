@@ -652,12 +652,31 @@ function parseLabelToOrdinal(label) {
 // not just more recent ones) and re-capped at the same rolling-window
 // size the builders themselves use, so the window still ages out its
 // oldest quarter as newer ones arrive rather than growing without bound.
-function pickTrendToPublish(existingPoints, freshPoints) {
+// Metrics this run may REPLACE rather than union-protect (pfcfRatio and/or
+// peRatio) -- the same opt-in as RECOMPUTE_METRICS in
+// generateForeignFilingsCache.js, which carries the full rationale. The
+// union above drops any corrected value whose label is already published:
+// verified, the partial-TTM-window annualization (commit 6b86641) can
+// never reach a published point without this.
+const RECOMPUTE_METRICS = new Set(
+  (process.env.RECOMPUTE_METRICS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
+  // Retraction only on a TARGET_SYMBOL run that names this metric, same
+  // narrow rule as generateForeignFilingsCache.js.
+  const recomputing = !!metricKey && RECOMPUTE_METRICS.has(metricKey);
+  if (recomputing && process.env.TARGET_SYMBOL && (!freshPoints || freshPoints.length === 0)) return [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
   const merged = new Map();
   for (const p of existingPoints) merged.set(p.label, p);
-  for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
+  // Still a union when recomputing: fresh wins a label it recomputed, and
+  // every published label it does not cover survives.
+  for (const p of freshPoints) if (recomputing || !merged.has(p.label)) merged.set(p.label, p);
   return [...merged.values()]
     .sort((a, b) => {
       const oa = parseLabelToOrdinal(a.label);
@@ -667,11 +686,11 @@ function pickTrendToPublish(existingPoints, freshPoints) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-function pickCadenceTrendsToPublish(existingEntry, fresh) {
+function pickCadenceTrendsToPublish(existingEntry, fresh, metricKey = null) {
   return {
-    ttm: pickTrendToPublish(existingEntry?.ttm, fresh.ttm),
-    quarterly: pickTrendToPublish(existingEntry?.quarterly, fresh.quarterly),
-    yearly: pickTrendToPublish(existingEntry?.yearly, fresh.yearly),
+    ttm: pickTrendToPublish(existingEntry?.ttm, fresh.ttm, metricKey),
+    quarterly: pickTrendToPublish(existingEntry?.quarterly, fresh.quarterly, metricKey),
+    yearly: pickTrendToPublish(existingEntry?.yearly, fresh.yearly, metricKey),
   };
 }
 
@@ -758,6 +777,7 @@ async function main() {
     }
     let fresh = { ttm: [], quarterly: [], yearly: [] };
     let freshPe = { ttm: [], quarterly: [], yearly: [] };
+    let computed = false;
     try {
       const companyFacts = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
       await sleep(SEC_REQUEST_SPACING_MS);
@@ -1039,6 +1059,7 @@ async function main() {
           quarterly: buildForeignPeQuarterly(netIncome.quarterly, shares.quarterly, monthlyPrices),
           yearly: buildForeignPeYearly(netIncome.annual, shares.annual, monthlyPrices),
         };
+        computed = true;
       }
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
@@ -1046,7 +1067,9 @@ async function main() {
       // cached for this symbol rather than losing it over one failed request.
     }
 
-    const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh);
+    // Only a computation that actually ran may recompute -- a skipped or
+    // failed ticker leaves fresh empty, which a recompute reads as retract.
+    const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh, computed ? 'pfcfRatio' : null);
     cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences };
     if (cadences.ttm.length || cadences.quarterly.length || cadences.yearly.length) {
       resolved++;
@@ -1062,7 +1085,7 @@ async function main() {
     // OWN top-level ttm/quarterly/yearly (P/FCF) fields untouched; this
     // script is never the source of truth for those (foreignPfcfCache.json
     // is, via its own separate app-side fetch chain).
-    const peCadences = pickCadenceTrendsToPublish(peCache[symbol]?.pe, freshPe);
+    const peCadences = pickCadenceTrendsToPublish(peCache[symbol]?.pe, freshPe, computed ? 'peRatio' : null);
     if (peCadences.ttm.length || peCadences.quarterly.length || peCadences.yearly.length) {
       peCache[symbol] = { ...peCache[symbol], fetchedAt: new Date().toISOString(), pe: peCadences };
     }

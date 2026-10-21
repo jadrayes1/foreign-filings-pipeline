@@ -37,6 +37,10 @@ on:
         description: 'Optional: process only this ticker (debugging), ignoring the normal gap list/rotation'
         required: false
         type: string
+      recomputeMetrics:
+        description: 'Optional: pfcfRatio and/or peRatio (comma-separated) -- lets this run overwrite already-published points for those metrics (RECOMPUTE_METRICS). Needed after a deliberate calculation change. Leave blank for normal runs.'
+        required: false
+        type: string
       debug:
         description: 'Optional: set to 1 for verbose extraction/reconciliation tracing (DEBUG_FILING_EXTRACT)'
         required: false
@@ -84,6 +88,7 @@ jobs:
         env:
           TWELVEDATA_FOREIGN_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_FOREIGN_PIPELINE_API_KEY }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          RECOMPUTE_METRICS: ${{ inputs.recomputeMetrics }}
           DEBUG_FILING_EXTRACT: ${{ inputs.debug }}
         run: node scripts/generateForeignPfcfCache.js
 
