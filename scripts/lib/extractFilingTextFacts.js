@@ -1978,6 +1978,7 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
   const rows = $(table).find('tr').toArray();
   const candidates = {}; // concept -> [{label, value3mo, valueCumulative}]
   let currentSection = null;
+  let advanceToSection = null; // see NEXT_CASH_FLOW_SECTION
   // Most recent header-only row's own text (a row with no numeric values --
   // parseDataRow returns null for it below) -- disambiguates a BARE
   // "Basic"/"Diluted" subrow, which carries no meaning on its own. Verified
@@ -2005,9 +2006,15 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     // RAW cell text, independent of whether the row ends up a real data
     // row at all.
     const rowText = cells.map((c) => c.text).join(' ');
+    if (advanceToSection) {
+      currentSection = advanceToSection;
+      advanceToSection = null;
+    }
     if (/operating activities/i.test(rowText)) currentSection = 'operating';
     else if (/investing activities/i.test(rowText)) currentSection = 'investing';
     else if (/financing activities/i.test(rowText)) currentSection = 'financing';
+    // A section subtotal closes its section -- see NEXT_CASH_FLOW_SECTION.
+    if (SECTION_SUBTOTAL_PATTERN.test(rowText)) advanceToSection = NEXT_CASH_FLOW_SECTION[cashFlowSectionNamedIn(rowText)] || null;
     const row = parseDataRow(cells, parsedRowColumnCount);
     if (!row) {
       if (rowText.trim()) pendingSectionLabel = rowText.trim();
@@ -2085,6 +2092,32 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
 // -166,421, matching that column's own disclosed "Net cash used in
 // investing activities" subtotal to the dollar.
 const SECTION_SUBTOTAL_PATTERN = /^net (cash|increase|decrease)\b.*(operating|investing|financing) activities/i;
+
+// A cash-flow statement always runs operating -> investing -> financing, and
+// each section closes with its own "Net cash ... activities" subtotal. So the
+// row after that subtotal begins the NEXT section even when the filer prints
+// no header for it.
+//
+// Verified live: TSM's FY2025 20-F cash-flow statement (R6) has no "Cash
+// flows from investing activities" row at all -- after "Net cash generated
+// by operating activities" it goes straight to an "Acquisitions of:"
+// sub-header and a bare "Property, plant and equipment" row of
+// (1,272,410.5). The section tracker only changed section on a header row,
+// so it was still 'operating' there, and capex -- restricted to the
+// investing section by SECTION_RESTRICTED_CONCEPTS -- was skipped. That is
+// why TSM had no FY2025 capex and so no FY2025 yearly fcfMargin, while OCF
+// and revenue came out of the same filing fine. Its FY2024 20-F printed the
+// header, so 2024 and earlier were unaffected.
+//
+// An explicit header still sets the section directly wherever one exists,
+// so a filer that prints all three headers behaves exactly as before.
+const NEXT_CASH_FLOW_SECTION = { operating: 'investing', investing: 'financing' };
+function cashFlowSectionNamedIn(rowText) {
+  if (/operating activities/i.test(rowText)) return 'operating';
+  if (/investing activities/i.test(rowText)) return 'investing';
+  if (/financing activities/i.test(rowText)) return 'financing';
+  return null;
+}
 
 // SEC's auto-rendered R-files state their own unit convention directly in
 // the table's own header caption -- e.g. "Consolidated Statement of Cash
@@ -2641,11 +2674,32 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
   const candidatesByColumn = annualIdxs.map(() => ({})); // concept -> [{label, value}]
   const sectionDataByColumn = annualIdxs.map(() => ({})); // section -> {sum, subtotal}
   let currentSection = null;
+  let advanceToSection = null; // see NEXT_CASH_FLOW_SECTION
+  // Text of the most recent lead-in sub-header -- a value-less row ending in
+  // a colon, such as "Acquisitions of:" -- prefixed onto the rows under it
+  // before matching. Verified live: TSM's FY2025 cash-flow statement lists
+  // TWO rows labelled just "Property, plant and equipment", one under
+  // "Acquisitions of:" (1,272,410.5) and one under "Proceeds from disposal or
+  // redemption of:" (797.0). Matched bare, both passed the capex alias and
+  // the capex tiebreak SUMMED them, booking a disposal INFLOW as negative
+  // capex: -1,271,613.5 instead of -1,272,410.5, and shifting FY2024 from the
+  // -956,006.5 its own 20-F reports to -955,111.9 in the same way. With the
+  // lead-in attached, the first reads "Acquisitions of: Property, plant and
+  // equipment" and the second is caught by capex's own `proceeds|disposal`
+  // exclusion -- the statement's own structure resolving it, exactly as a
+  // reader does. Same idea as extractFromTable's pendingSectionLabel for
+  // bare "Basic"/"Diluted" rows. Cleared at any other header and at every
+  // subtotal so it never leaks past its own block.
+  let leadIn = null;
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
     const rowText = cells.map((c) => c.text).join(' ');
     const isSubtotalRow = SECTION_SUBTOTAL_PATTERN.test(rowText);
+    if (advanceToSection) {
+      currentSection = advanceToSection;
+      advanceToSection = null;
+    }
     // Same section-tracking as extractFromTable -- see its own comment for
     // why this runs on raw cell text, independent of whether the row ends
     // up a real parseable data row at all. A subtotal row names its own
@@ -2655,9 +2709,18 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
       if (/operating activities/i.test(rowText)) currentSection = 'operating';
       else if (/investing activities/i.test(rowText)) currentSection = 'investing';
       else if (/financing activities/i.test(rowText)) currentSection = 'financing';
+    } else {
+      // Applied on the NEXT row, so this subtotal is still credited to the
+      // section it closes (sectionDataByColumn below reads currentSection).
+      advanceToSection = NEXT_CASH_FLOW_SECTION[cashFlowSectionNamedIn(rowText)] || null;
     }
+    if (isSubtotalRow) leadIn = null;
     const row = parseDataRow(cells, parsedRowColumnCount);
-    if (!row) continue;
+    if (!row) {
+      const headerText = rowText.trim();
+      leadIn = headerText.endsWith(':') ? headerText : null;
+      continue;
+    }
     if (valueIndices) row.values = valueIndices.map((idx) => row.values[idx]);
     if (scale !== 1) row.values = row.values.map((v) => v * scale);
 
@@ -2688,7 +2751,23 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
     }
 
     for (const concept of Object.keys(aliasMap)) {
-      if (!matchesConcept(row.label, concept)) continue;
+      // The lead-in's own trailing colon is dropped when joined -- "Acquisitions
+      // of: Property, plant and equipment" fails capex's "acquisition(s)? of
+      // ... property" alternative purely on that colon.
+      // Scoped to capex ONLY. Applied to every concept first, it broke PAC:
+      // its income statement opens with a "Revenues (Note 20):" header whose
+      // rows are revenue COMPONENTS (aeronautical, non-aeronautical,
+      // concession improvements) followed by the "Revenues" total, and
+      // prefixing the header onto each component made all of them read as
+      // revenue -- verified live, PAC's FY2025 revenue came out ~46.1B
+      // against the 41,408,540 thousand its own 20-F reports, moving its
+      // profit margin from the correct 0.2415 to 0.217. A noun header like
+      // that groups components; only the verb lead-ins of an investing
+      // section ("Acquisitions of:", "Proceeds from disposal of:") change
+      // what a row MEANS, and the identical-label ambiguity they resolve
+      // only ever arose for capex.
+      const matchLabel = concept === 'capex' && leadIn ? `${leadIn.replace(/:\s*$/, '')} ${row.label}` : row.label;
+      if (!matchesConcept(matchLabel, concept)) continue;
       const requiredSection = SECTION_RESTRICTED_CONCEPTS[concept];
       if (requiredSection && currentSection !== requiredSection) continue;
       for (let ci = 0; ci < annualIdxs.length; ci++) {
