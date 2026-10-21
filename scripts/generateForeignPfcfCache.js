@@ -676,7 +676,15 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   for (const p of existingPoints) merged.set(p.label, p);
   // Still a union when recomputing: fresh wins a label it recomputed, and
   // every published label it does not cover survives.
-  for (const p of freshPoints) if (recomputing || !merged.has(p.label)) merged.set(p.label, p);
+  // A recompute only ever REPLACES a published value with a real number.
+  // A fresh null (or NaN) for a label that is already published is not
+  // written -- a recompute must correct values, never blank them -- and
+  // since this is a union, a label fresh does not cover is never dropped,
+  // so a recompute can never leave a series narrower than it found it.
+  for (const p of freshPoints) {
+    if (!merged.has(p.label)) merged.set(p.label, p);
+    else if (recomputing && Number.isFinite(p.value)) merged.set(p.label, p);
+  }
   return [...merged.values()]
     .sort((a, b) => {
       const oa = parseLabelToOrdinal(a.label);
