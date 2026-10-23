@@ -4638,6 +4638,30 @@ function reconcileInstantPoints(points, knownByEnd, accessionToDates, trustSingl
   if (accessionToDates) {
     const baseVerified = new Set(verified);
     const byEnd = new Map(points.map((p) => [p.end, p]));
+    // The scale half of the rule above applies to EVERY column, including
+    // one already verified as a single uncontested source: that check
+    // accepts a value without ever looking at its units. Verified live:
+    // trivago (TRVG)'s 6-K balance sheets put the prior fiscal year-end
+    // beside the current quarter; the year-end column matched XBRL at x1000
+    // and was scaled, while the quarter column -- already trusted -- stayed
+    // in raw thousands (equity 190,111 next to 197,605,000), so quarterly
+    // invested capital was 1000x too small and quarterly ROIC 1000x too
+    // large. Exposed by the 2026-10-22 recompute sweep across 27 filers.
+    // Only a point with no scale of its own takes its sibling's, so nothing
+    // is ever scaled twice.
+    for (const p of points) {
+      if (p.appliedScale != null) continue;
+      for (const accession of p.accessionNumbers || []) {
+        const siblingEnds = accessionToDates.get(accession);
+        if (!siblingEnds) continue;
+        const sibling = [...siblingEnds].map((end) => byEnd.get(end)).find((q) => q && q !== p && q.appliedScale != null && q.appliedScale !== 1);
+        if (sibling) {
+          p.val *= sibling.appliedScale;
+          p.appliedScale = sibling.appliedScale;
+          break;
+        }
+      }
+    }
     for (const p of points) {
       if (verified.has(p)) continue;
       for (const accession of p.accessionNumbers || []) {
@@ -4645,7 +4669,10 @@ function reconcileInstantPoints(points, knownByEnd, accessionToDates, trustSingl
         if (!siblingEnds) continue;
         const sibling = [...siblingEnds].map((end) => byEnd.get(end)).find((q) => q && q !== p && baseVerified.has(q));
         if (sibling) {
-          if (sibling.appliedScale) p.val *= sibling.appliedScale;
+          if (sibling.appliedScale && p.appliedScale == null) {
+            p.val *= sibling.appliedScale;
+            p.appliedScale = sibling.appliedScale;
+          }
           verified.add(p);
           break;
         }
