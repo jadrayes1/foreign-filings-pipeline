@@ -201,9 +201,21 @@ function daysBetween(startStr, endStr) {
   return (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
 }
 
+// A 52/53-week filer's period closes on a fixed weekday, so it can end a
+// few days INTO the next month (TDY's FY2022 ended 2023-01-01; SWK's
+// quarters end Apr 4 / Jul 4 / Oct 3). Labelled straight from that date it
+// lands a whole quarter late and collides with the real next period under
+// the same label, one value overwriting the other -- verified live: TDY's
+// yearly ROIC skipped FY '13/'15/'20, SWK's skipped FY '20/'25 and Q4 '25,
+// and the 2026-10-23 P/FCF recompute dropped KELYA/TDY FY '22. Backdated
+// QUARTER_LABEL_BACKDATE_DAYS first, the same rule (and the same 5 days)
+// as generateForeignFilingsCache.js's quarterLabelFromPeriod, which found it on
+// ASML; every ordinary month-end stays in its own quarter.
+const QUARTER_LABEL_BACKDATE_DAYS = 5;
 function quarterLabelFromDate(dateStr) {
-  const d = new Date(dateStr);
-  if (Number.isNaN(d.getTime())) return null;
+  const raw = new Date(dateStr);
+  if (Number.isNaN(raw.getTime())) return null;
+  const d = new Date(raw.getTime() - QUARTER_LABEL_BACKDATE_DAYS * 24 * 60 * 60 * 1000);
   const q = Math.floor(d.getUTCMonth() / 3) + 1;
   return `Q${q} '${String(d.getUTCFullYear()).slice(-2)}`;
 }
