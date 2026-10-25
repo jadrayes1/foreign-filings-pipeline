@@ -690,7 +690,10 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   // Retraction only on a TARGET_SYMBOL run that names this metric, same
   // narrow rule as generateForeignFilingsCache.js.
   const recomputing = !!metricKey && RECOMPUTE_METRICS.has(metricKey);
-  if (recomputing && process.env.TARGET_SYMBOL && (!freshPoints || freshPoints.length === 0)) return [];
+  // Retraction (a fresh empty result blanking a published series) is opt-in
+  // on top of a targeted recompute: RECOMPUTE_ALLOW_RETRACT=1. A recompute
+  // otherwise only adds points or replaces values -- never narrows a series.
+  if (recomputing && process.env.TARGET_SYMBOL && process.env.RECOMPUTE_ALLOW_RETRACT === '1' && (!freshPoints || freshPoints.length === 0)) return [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
   const merged = new Map();
   for (const p of existingPoints) merged.set(p.label, p);
