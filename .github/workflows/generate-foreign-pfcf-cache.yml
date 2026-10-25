@@ -163,8 +163,10 @@ jobs:
               break
             fi
             EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+            node scripts/guardTrendSeries.js snapshot gist-clone foreignPfcfCache.json pfcfTrendCache.json
             cp foreignPfcfCache.json gist-clone/foreignPfcfCache.json
             cp pfcfTrendCache.json gist-clone/pfcfTrendCache.json
+            node scripts/guardTrendSeries.js check gist-clone foreignPfcfCache.json pfcfTrendCache.json
             ( cd gist-clone
               git config user.email "actions@github.com"
               git config user.name "foreign-filings-pipeline"
