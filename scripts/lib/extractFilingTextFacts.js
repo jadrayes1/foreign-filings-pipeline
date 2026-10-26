@@ -2869,6 +2869,8 @@ function detectTrailingChangeColumns(headerCells, realColumnCount) {
   return { rawColumnCount: realColumnCount + 1, valueIndices: Array.from({ length: realColumnCount }, (_, idx) => idx) };
 }
 
+const MONTH_NAME_PATTERN = /^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sep(t|tember)?|oct(ober)?|nov(ember)?|dec(ember)?)$/i;
+
 function parseInstantTableColumns($, table, externalColumnDates = null, externalBareMonthDay = null, preferredCurrency = null) {
   const rows = $(table).find('tr').toArray();
   for (let i = 0; i < rows.length; i++) {
@@ -2903,6 +2905,25 @@ function parseInstantTableColumns($, table, externalColumnDates = null, external
       }
       const trailing = detectTrailingChangeColumns(cells, columns.length);
       return trailing ? { columns, dataStartRowIdx: i + 1, ...trailing } : { columns, dataStartRowIdx: i + 1 };
+    }
+  }
+  // Month/day and year on two separate header rows, paired by position --
+  // verified live: Sea Limited (SE)'s 6-K balance sheets head their columns
+  // "As of December 31," | "As of September 30," over a "2024" | "2025" row,
+  // and neither row alone is a full date, so no SE balance sheet was ever
+  // read and its quarterly ROIC had only fiscal-year-end points. Tried only
+  // after the single-row shape above has failed for every row.
+  for (let i = 0; i < rows.length; i++) {
+    const cells = nonEmptyCells($, rows[i]);
+    const monthDays = cells
+      .map((c) => c.text.replace(/^as\s+(of|at)\s+/i, '').trim().match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?$/))
+      .filter((m) => m && MONTH_NAME_PATTERN.test(m[1]));
+    if (monthDays.length < 2 || monthDays.length !== cells.length) continue;
+    for (let j = i + 1; j <= Math.min(i + 2, rows.length - 1); j++) {
+      const yearCells = nonEmptyCells($, rows[j]).filter((c) => isYearCell(c.text));
+      if (yearCells.length !== monthDays.length) continue;
+      const columns = monthDays.map((m, idx) => ({ endMonthDay: `${m[1]} ${m[2]}`, year: extractYear(yearCells[idx].text) }));
+      return { columns, dataStartRowIdx: j + 1 };
     }
   }
   // A bare-year-only header row ("2025 | 2026 | Change | %", no month/day
@@ -3382,6 +3403,7 @@ function extractInstantStatement($, headingRegex, aliasMap) {
   // DATE COLUMN rather than a single result.
   let best = null;
   let bestFactCount = 0;
+  const allResults = [];
   for (const headingIdx of headingIdxs) {
     for (const table of findStatementTables($, allEls, headingIdx)) {
       const tableIdx = allEls.indexOf(table);
@@ -3396,13 +3418,30 @@ function extractInstantStatement($, headingRegex, aliasMap) {
       const externalBareMonthDay = externalColumnDates.length < 2 && tableIdx >= headingIdx ? findExternalBareMonthDay($, allEls, headingIdx, tableIdx) : null;
       const result = extractFromInstantTable($, table, aliasMap, externalColumnDates, externalBareMonthDay);
       const factCount = result.reduce((sum, r) => sum + Object.keys(r.facts).length, 0);
+      if (result.length) allResults.push(result);
       if (result.length && factCount > bestFactCount) {
         best = result;
         bestFactCount = factCount;
       }
     }
   }
-  return best || [];
+  if (!best) return [];
+  // A balance sheet split over page breaks into several tables, each under
+  // its own repeated heading -- verified live: Sea Limited (SE)'s 6-Ks put
+  // assets, liabilities and equity in three tables, one concept each, and
+  // the single best table (assets: cash) won, dropping equity and debt.
+  // The best table stays the base; the others only fill a concept for a
+  // date the base lacks, so a value the base already has is never changed.
+  const byDate = new Map(best.map((r) => [`${r.period.endMonthDay}|${r.period.year}`, { period: r.period, facts: { ...r.facts } }]));
+  for (const result of allResults) {
+    if (result === best) continue;
+    for (const r of result) {
+      const entry = byDate.get(`${r.period.endMonthDay}|${r.period.year}`);
+      if (!entry) continue;
+      for (const [concept, fact] of Object.entries(r.facts)) if (!(concept in entry.facts)) entry.facts[concept] = fact;
+    }
+  }
+  return [...byDate.values()];
 }
 
 // SEC auto-renders each individual XBRL-tagged statement of an Inline XBRL

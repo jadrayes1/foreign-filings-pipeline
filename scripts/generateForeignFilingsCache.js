@@ -1196,7 +1196,7 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   }
   // Fresh run's verdict wins when it produced anything; otherwise keep the
   // previous one rather than silently dropping a still-true disclosure fact.
-  for (const flag of ['semiAnnualCashFlow', 'semiAnnualBalanceSheet']) {
+  for (const flag of ['semiAnnualCashFlow', 'semiAnnualBalanceSheet', 'noQuarterlyCapex']) {
     const hasFresh = freshEntry && Object.keys(freshEntry).length;
     if (hasFresh ? freshEntry[flag] : existingEntry?.[flag]) out[flag] = true;
   }
@@ -1849,6 +1849,11 @@ async function processTicker(symbol, cik, isBank) {
   // Dec 31. Neither will ever yield a standalone quarter.
   if (isSemiAnnualFlow(ocf)) result.semiAnnualCashFlow = true;
   if (isSemiAnnualInstant(equityInstant)) result.semiAnnualBalanceSheet = true;
+  // Quarterly releases that carry operating cash flow but never break out
+  // capex -- verified live: Sea Limited (SE)'s 6-K cash-flow table is a
+  // summary (net operating / investing / financing only); its capex appears
+  // only in prose, so quarterly FCF is impossible while the 20-F's is not.
+  if (lacksQuarterlyCapex(ocf, capex)) result.noQuarterlyCapex = true;
   return Object.keys(result).length ? result : null;
 }
 
@@ -1859,6 +1864,12 @@ function isSemiAnnualFlow(flow) {
   const cutoff = Date.now() - SEMI_ANNUAL_LOOKBACK_DAYS * 86400000;
   const recent = (points) => (points || []).filter((p) => new Date(p.end).getTime() >= cutoff);
   return recent(flow.h1).length > 0 && recent(flow.quarterly).length === 0;
+}
+
+function lacksQuarterlyCapex(ocf, capex) {
+  const cutoff = Date.now() - SEMI_ANNUAL_LOOKBACK_DAYS * 86400000;
+  const recent = (points) => (points || []).filter((p) => new Date(p.end).getTime() >= cutoff);
+  return recent(ocf.quarterly).length > 0 && recent(capex.quarterly).length === 0 && recent(capex.h1).length === 0 && (capex.annual || []).length > 0;
 }
 
 // Recent balance-sheet dates spaced ~6 months apart: no gap under ~5
