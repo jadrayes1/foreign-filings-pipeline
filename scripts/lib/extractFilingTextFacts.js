@@ -1026,7 +1026,12 @@ function nonEmptyCells($, row) {
 // was unaffected). Same newline-vs-space artifact already fixed for
 // STATEMENT_HEADINGS' own internal spaces (see HXHX's comment there) --
 // just never extended to this indicator.
-const PERIOD_PHRASE_INDICATOR = /months?\s+(periods?\s+)?ended|quarters?\s+(periods?\s+)?ended|years?\s+(periods?\s+)?ended/i;
+// \s* (not \s+) -- verified live: Sea Limited (SE)'s statement of operations
+// heads its columns "For the Nine Monthsended September 30," (a line break
+// in the source with no text node between "Months" and "ended"), so no
+// quarterly figure was ever read from any SE 6-K and its quarterly and TTM
+// trends were empty for every metric.
+const PERIOD_PHRASE_INDICATOR = /months?\s*(periods?\s*)?ended|quarters?\s*(periods?\s*)?ended|years?\s*(periods?\s*)?ended/i;
 
 function parsePeriodPhrase(text) {
   // "months?" (not just plural "months") on every count -- verified live:
