@@ -2035,7 +2035,16 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     // The ORIGINAL bare label is still what gets stored on the candidate
     // below -- resolveConceptCandidates' own basic/diluted tiebreak already
     // depends on that exact bare wording.
-    const effectiveLabel = /^(basic|diluted)$/i.test(row.label.trim()) && pendingSectionLabel ? `${pendingSectionLabel} ${row.label}` : row.label;
+    //
+    // A lead-in that NAMES the EPS computation it serves is still the share
+    // count's heading, not an EPS row -- verified live: Sea Limited (SE)'s
+    // reads "Weighted average shares used in earnings per share
+    // computation:", and its "per share" tripped the shares rule's exclude,
+    // so SE never had a quarterly share count and no quarterly P/E or P/FCF.
+    // That purpose clause is dropped before matching; "Earnings per share:"
+    // + "Basic" still never matches (no "weighted" anywhere in it).
+    const leadIn = pendingSectionLabel ? pendingSectionLabel.replace(/\s+used\s+(in|for)\s+(the\s+)?((computation|calculation)\s+of\s+)?(basic\s+and\s+diluted\s+)?(earnings|net\s+(income|loss)|loss)\s+per\s+(ordinary\s+|common\s+)?share(\s+(computation|calculation))?/i, '') : pendingSectionLabel;
+    const effectiveLabel = /^(basic|diluted)$/i.test(row.label.trim()) && leadIn ? `${leadIn} ${row.label}` : row.label;
     for (const concept of Object.keys(aliasMap)) {
       if (!matchesConcept(effectiveLabel, concept)) continue;
       const requiredSection = SECTION_RESTRICTED_CONCEPTS[concept];
