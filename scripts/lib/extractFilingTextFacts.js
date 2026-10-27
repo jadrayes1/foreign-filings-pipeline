@@ -921,7 +921,10 @@ async function fetchJsonSec(url, userAgent) {
 // the same way (C$/A$/HK$/NT$/S$ two-or-three-letter-code-plus-$, plus
 // bare £/€/¥ for filers that use those instead of a letter-code form).
 function parseNumericCell(text) {
-  const t = text.trim().replace(/^(\()?[A-Z]{0,3}\$/, '$1').replace(/^(\()?[£€¥]/, '$1').trim();
+  // "Ps." too -- verified live: BBB Foods (TBBB) prints every figure in its
+  // earnings releases as "Ps. 26,002,293" / "(Ps. 2,598)", so none of those
+  // statements parsed and its quarterly profit margin and ROIC were empty.
+  const t = text.trim().replace(/^(\()?[A-Z]{0,3}\$/, '$1').replace(/^(\()?[£€¥]/, '$1').replace(/^(\()?Ps\.\s*/, '$1').trim();
   if (t === '' || /^[-—–]$/.test(t)) return 0;
   const negative = /^\(.*\)$/.test(t);
   const cleaned = t.replace(/[()$,\s]/g, '');
@@ -1683,6 +1686,12 @@ function parseDataRow(cells, columnCount) {
       valueCandidates.pop();
       continue;
     }
+    // The same percent-change column with its "%" inside the value's own
+    // cell -- verified live: BBB Foods (TBBB) earnings-release rows read
+    // "Total Revenue | 26,037,292 | 18,769,679 | 38.7%", and that one cell
+    // made every row malformed, so no quarterly figure was read from any of
+    // its releases. Only a value that IS a percentage is skipped.
+    if (valueCandidates.length && /^\(?[-+]?\d[\d.,]*\s*%\)?$/.test(cells[i].text.trim())) continue;
     const val = parseNumericCell(cells[i].text);
     if (val === null) return null; // non-numeric cell after values started — malformed, bail
     valueCandidates.push({ raw: cells[i].text, val });

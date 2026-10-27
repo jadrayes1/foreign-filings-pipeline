@@ -708,13 +708,17 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
     if (!merged.has(p.label)) merged.set(p.label, p);
     else if (recomputing && Number.isFinite(p.value)) merged.set(p.label, p);
   }
-  return [...merged.values()]
-    .sort((a, b) => {
-      const oa = parseLabelToOrdinal(a.label);
-      const ob = parseLabelToOrdinal(b.label);
-      return oa != null && ob != null ? oa - ob : 0;
-    })
-    .slice(-QUARTERS_OF_HISTORY);
+  const sorted = [...merged.values()].sort((a, b) => {
+    const oa = parseLabelToOrdinal(a.label);
+    const ob = parseLabelToOrdinal(b.label);
+    return oa != null && ob != null ? oa - ob : 0;
+  });
+  // Leading null points carry no data -- a null in the MIDDLE marks a real
+  // gap and stays, but nulls before the first real value are placeholders.
+  // Verified live: SE's TTM P/E opened with "Q1-Q4 '12" nulls, years before
+  // the company existed, ahead of its real points.
+  const firstReal = sorted.findIndex((p) => p.value != null);
+  return (firstReal > 0 ? sorted.slice(firstReal) : sorted).slice(-QUARTERS_OF_HISTORY);
 }
 
 function pickCadenceTrendsToPublish(existingEntry, fresh, metricKey = null) {

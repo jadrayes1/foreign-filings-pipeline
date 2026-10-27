@@ -20,6 +20,7 @@
 //     series holds, and the new series is no shorter than the old one;
 //   - it was relabelled: its exact value (finite, non-zero) is still there
 //     under another label;
+//   - it had no value at all (a null placeholder);
 // otherwise it is put back. A series or whole entry that disappeared is put
 // back too -- except a ticker absent from the --alive file (marketMetrics),
 // which the pipeline deliberately stopped publishing (delisted / dead).
@@ -68,6 +69,7 @@ function guardSeries(oldSeries, newSeries, where, report) {
   const restore = [];
   for (const p of oldSeries) {
     if (newLabels.has(p.label)) continue;
+    if (p.value == null) continue; // a placeholder with no value -- nothing to keep
     if (Number.isFinite(p.value) && p.value !== 0 && newValues.has(p.value)) continue; // relabelled
     const o = labelOrdinal(p.label);
     if (rolledForward && o != null && oldestNew != null && o < oldestNew) continue; // window roll
