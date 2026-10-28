@@ -34,7 +34,7 @@ const path = require('path');
 // side effects (its own `if (require.main === module)` guard means main()
 // only runs when THIS file is the entry point, not when it's required).
 const { isGenuineForeignFiler, needsFilingTextBackfill, needsAnnual20FBackfill } = require('./generateForeignFilingsCache');
-const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, computeCumulativeFallbackConcepts } = require('./lib/extractFilingTextFacts');
+const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, computeCumulativeFallbackConcepts, convertNativeCurrencyToUsd } = require('./lib/extractFilingTextFacts');
 const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
@@ -179,7 +179,15 @@ const NET_INCOME_CONCEPTS = ['ProfitLoss', 'NetIncomeLoss'];
 // this function for the full rationale (verified live for IMPP: it
 // switches which XBRL concept it tags capex under between early 6-K
 // filings and its 20-F annual reports).
-function extractFactSeries(companyFacts, conceptCandidates) {
+//
+// `unit`, when given, keeps only facts in that unit. Monetary concepts need
+// it: a filer that tags its own currency AND a USD convenience translation
+// (ZBAO: CNY plus USD for the latest year) otherwise gets both merged into
+// one series, and the unconverted native figures divided by a USD price --
+// verified live: MGN's P/E published as 143,277 (MYR net income over a USD
+// price) instead of 29.4, ZBAO's exactly 6.9x off. Share counts carry a
+// single 'shares' unit and are left unfiltered.
+function extractFactSeries(companyFacts, conceptCandidates, unit = null) {
   const merged = [];
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
     const facts = companyFacts?.facts?.[taxonomy];
@@ -187,12 +195,53 @@ function extractFactSeries(companyFacts, conceptCandidates) {
     for (const concept of conceptCandidates) {
       const entry = facts[concept];
       if (!entry?.units) continue;
-      for (const unitFacts of Object.values(entry.units)) {
+      for (const [entryUnit, unitFacts] of Object.entries(entry.units)) {
+        if (unit && entryUnit !== unit) continue;
         if (Array.isArray(unitFacts) && unitFacts.length) merged.push(...unitFacts);
       }
     }
   }
   return merged;
+}
+
+// The one currency this filer's monetary series are read in: whichever unit
+// carries the most net income / OCF / capex facts. A convenience USD
+// translation covers a year or two, so it never outvotes the reporting
+// currency; a USD reporter's stray native-currency fact never outvotes USD.
+function detectReportingCurrency(companyFacts) {
+  const counts = new Map();
+  for (const taxonomy of ['ifrs-full', 'us-gaap']) {
+    const facts = companyFacts?.facts?.[taxonomy];
+    if (!facts) continue;
+    for (const concept of [...NET_INCOME_CONCEPTS, ...OCF_CONCEPTS, ...CAPEX_CONCEPTS]) {
+      for (const [unit, unitFacts] of Object.entries(facts[concept]?.units || {})) {
+        counts.set(unit, (counts.get(unit) || 0) + (Array.isArray(unitFacts) ? unitFacts.length : 0));
+      }
+    }
+  }
+  if (!counts.size) return 'USD';
+  return [...counts.entries()].reduce((best, cur) => (cur[1] > best[1] || (cur[1] === best[1] && cur[0] === 'USD') ? cur : best))[0];
+}
+
+// Converts a classified {quarterly, annual} series to USD, each point at
+// the average rate over its own [start, end] -- the same convention
+// convertNativeCurrencyToUsd documents for TSM. Done once, after every
+// source (XBRL, 20-F, 6-K text) has been merged and the quarters derived,
+// so the 6-K extractor's scale detection still compares like with like
+// (native figures against native annual anchors). A point with no rate is
+// dropped, never published unconverted; a currency with no verified FRED
+// series (PEN, ILS...) therefore produces no P/FCF or P/E at all.
+async function convertSeriesToUsd(series, currency) {
+  if (currency === 'USD') return series;
+  const convert = async (points) => {
+    const out = [];
+    for (const p of points) {
+      const value = await convertNativeCurrencyToUsd(p.value, currency, { start: p.start, end: p.end });
+      if (value != null && Number.isFinite(value)) out.push({ ...p, value });
+    }
+    return out;
+  };
+  return { quarterly: await convert(series.quarterly), annual: await convert(series.annual) };
 }
 
 function daysBetween(startStr, endStr) {
@@ -832,12 +881,13 @@ async function main() {
       const isForeignFiler = isGenuineForeignFiler(companyFacts);
 
       if (isForeignFiler) {
-        const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS);
-        const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
+        const reportingCurrency = detectReportingCurrency(companyFacts);
+        const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS, reportingCurrency);
+        const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS, reportingCurrency);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
         // For P/E -- same raw-XBRL-first, 20-F-recovery, 6-K-text-extraction
         // fallback chain as capex/ocf/shares below, just for net income.
-        const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS);
+        const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS, reportingCurrency);
         let ocf = dedupeAndClassify(ocfRaw);
         let capex = dedupeAndClassify(capexRaw);
         let shares = dedupeAndClassify(sharesRaw, 'shares');
@@ -1067,6 +1117,16 @@ async function main() {
           } catch (err) {
             console.log(`  BusinessQuant shares fallback failed for ${symbol}: ${err.message}`);
           }
+        }
+
+        // Prices are USD; bring every monetary series to USD to match. The
+        // 20-F and 6-K text paths both keep the filer's own column and drop
+        // a USD convenience one, so their facts are in reportingCurrency too.
+        if (reportingCurrency !== 'USD') {
+          ocf = await convertSeriesToUsd(ocf, reportingCurrency);
+          capex = await convertSeriesToUsd(capex, reportingCurrency);
+          netIncome = await convertSeriesToUsd(netIncome, reportingCurrency);
+          console.log(`  ${symbol}: reports in ${reportingCurrency}, converted to USD`);
         }
 
         const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);

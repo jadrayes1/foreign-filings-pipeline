@@ -139,14 +139,45 @@ const FX_SERIES_BY_CURRENCY = {
   // verification against a real, filer-disclosed USD figure (see comment
   // above) -- an unverified series id or rate direction would silently
   // corrupt every value it touches, which is worse than leaving the gap.
+  //
+  // CNY, MYR and JPY were checked the same way, against each filer's own
+  // USD convenience facts in companyfacts (2026-10-28): PDD/ZBAO CNY within
+  // 0.14% across 64 periods, MGN MYR exact, TM JPY within 0.47%. The rest
+  // have no filer-disclosed USD figure in XBRL to check against, so their
+  // direction was checked against each series' own FRED title instead
+  // ("Canadian Dollars to U.S. Dollar" = units per dollar; "U.S. Dollars to
+  // Euro" = the inverse, marked `inverted`). Every rate this returns is
+  // units of the currency per US dollar.
   TWD: 'DEXTAUS',
+  CNY: 'DEXCHUS',
+  MYR: 'DEXMAUS',
+  JPY: 'DEXJPUS',
+  CAD: 'DEXCAUS',
+  MXN: 'DEXMXUS',
+  BRL: 'DEXBZUS',
+  KRW: 'DEXKOUS',
+  HKD: 'DEXHKUS',
+  INR: 'DEXINUS',
+  CHF: 'DEXSZUS',
+  SEK: 'DEXSDUS',
+  NOK: 'DEXNOUS',
+  DKK: 'DEXDNUS',
+  SGD: 'DEXSIUS',
+  ZAR: 'DEXSFUS',
+  THB: 'DEXTHUS',
+  EUR: { id: 'DEXUSEU', inverted: true },
+  GBP: { id: 'DEXUSUK', inverted: true },
+  AUD: { id: 'DEXUSAL', inverted: true },
+  NZD: { id: 'DEXUSNZ', inverted: true },
 };
 
 const fxRateSeriesCache = new Map(); // currency code -> sorted [{date, rate}] | null, fetched at most once per process
 
 async function fetchFxRateSeries(currency) {
   if (fxRateSeriesCache.has(currency)) return fxRateSeriesCache.get(currency);
-  const seriesId = FX_SERIES_BY_CURRENCY[currency];
+  const seriesDef = FX_SERIES_BY_CURRENCY[currency];
+  const seriesId = typeof seriesDef === 'string' ? seriesDef : seriesDef?.id;
+  const inverted = typeof seriesDef === 'object' && seriesDef?.inverted;
   if (!seriesId) {
     fxRateSeriesCache.set(currency, null);
     return null;
@@ -163,7 +194,8 @@ async function fetchFxRateSeries(currency) {
         .map((line) => {
           const [date, rawVal] = line.split(',');
           const rate = Number(rawVal);
-          return date && Number.isFinite(rate) ? { date, rate } : null;
+          if (!date || !Number.isFinite(rate) || rate <= 0) return null;
+          return { date, rate: inverted ? 1 / rate : rate };
         })
         .filter(Boolean);
     }
@@ -3647,7 +3679,9 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     for (const [concept, fact] of Object.entries(extracted.facts)) {
       let val = fact.value3mo;
       let valueCumulative = fact.valueCumulative;
-      if (nativeCurrency) {
+      // A share count is not money -- converting it divided TSM-style
+      // filers' extracted shares by the exchange rate.
+      if (nativeCurrency && concept !== 'shares') {
         val = val != null ? await convertNativeCurrencyToUsd(val, nativeCurrency, { start: startIso, end: endIso }) : null;
         valueCumulative = valueCumulative != null ? await convertNativeCurrencyToUsd(valueCumulative, nativeCurrency, { start: startIso, end: endIso }) : null;
         if (val == null) continue; // FX fetch/lookup failed -- never record a half-converted or fabricated figure
@@ -3670,7 +3704,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       if (!endIso) continue;
       for (const [concept, fact] of Object.entries(extracted.facts)) {
         let val = fact.value;
-        if (nativeCurrency) {
+        if (nativeCurrency && concept !== 'shares') {
           val = val != null ? await convertNativeCurrencyToUsd(val, nativeCurrency, { end: endIso }) : null;
           if (val == null) continue;
         }
@@ -5147,4 +5181,6 @@ module.exports = {
   throttleSecRequest,
   isAdjacentDate,
   computeCumulativeFallbackConcepts,
+  convertNativeCurrencyToUsd,
+  FX_SERIES_BY_CURRENCY,
 };
