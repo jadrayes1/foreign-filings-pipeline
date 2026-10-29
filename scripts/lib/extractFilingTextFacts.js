@@ -2214,6 +2214,29 @@ function cashFlowSectionNamedIn(rowText) {
 // confirming the displayed ~$100-300K-looking figures needed x1000);
 // IMPP's caption has no unit qualifier at all (raw dollars, needs no
 // scaling) -- both handled by the same simple text check.
+// "(thousands)", "(in thousands)", "in thousands of shares", "(000s)",
+// "(millions)" at the END of a row label (a unit for that row only).
+function labelScale(label) {
+  const text = String(label || '').trim();
+  if (/\((?:in\s+)?thousands(?:\s+of\s+shares)?\)$|\(['’]?000s?\)$/i.test(text)) return 1000;
+  if (/\((?:in\s+)?millions(?:\s+of\s+shares)?\)$/i.test(text)) return 1000000;
+  return 1;
+}
+
+// The "shares in Thousands/Millions/Units" part of an XBRL R-file heading as
+// {scale, implicit}, or null when the table is not SEC-rendered and names none.
+function detectShareScale($, table) {
+  const headerText = $(table).find('tr').slice(0, 3).map((_, tr) => $(tr).text()).get().join(' ');
+  // Not "$ / shares in Units" -- that is the per-share figures' unit.
+  const m = headerText.match(/(?<!\/\s?)\bshares in (thousands|millions|units)/i);
+  // SEC's own rendering (class="report") lists a scale per unit, so naming
+  // none for shares means they are shown as-is -- verified live: STNG's
+  // income statement heading is just "$ in Thousands" over a share count of
+  // 46,554,200, read as 46.6 billion (same for DHT, ASC).
+  if (!m) return /\breport\b/.test($(table).attr('class') || '') ? { scale: 1, implicit: true } : null;
+  return { scale: { thousands: 1000, millions: 1000000, units: 1 }[m[1].toLowerCase()], implicit: false };
+}
+
 function detectTableScale($, table) {
   // Checks the first THREE rows, not just the first -- verified live:
   // ITRN's own balance sheet puts its "(In thousands)" caption in its
@@ -2747,6 +2770,7 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
   const annualIdxs = columns.map((c, i) => (c.months === 12 ? i : -1)).filter((i) => i !== -1);
   if (!annualIdxs.length) return [];
   const scale = detectTableScale($, table);
+  const shareScale = detectShareScale($, table);
 
   const rows = $(table).find('tr').toArray();
   const candidatesByColumn = annualIdxs.map(() => ({})); // concept -> [{label, value}]
@@ -2802,7 +2826,28 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
       continue;
     }
     if (valueIndices) row.values = valueIndices.map((idx) => row.values[idx]);
-    if (scale !== 1) row.values = row.values.map((v) => v * scale);
+    // A unit stated on the row itself, used only when the table states none
+    // (so never doubled) -- verified live: Bradesco's 20-F EPS note reads
+    // "Weighted average number of common shares outstanding (thousands)"
+    // under a header with no unit, and its FY2025 share count came through
+    // as 5,297,305 against a real 5.30 billion, publishing P/E 0.005.
+    // An XBRL R-file heading states each unit's scale separately -- verified
+    // live: AMX's EPS details read "$ in Thousands, shares in Millions", and
+    // the first-match table scale applied x1000 to its share count (60.5M
+    // instead of 60.5B, P/E 0.27). A share-count row takes the heading's own
+    // "shares in ..." scale when there is one.
+    const isShareCountRow = /\bshares?\b/i.test(row.label) && !/per share|\$|earnings|dividend/i.test(row.label);
+    // Precedence: the heading's explicit share scale, then the row's own
+    // "(thousands)" (Bradesco's EPS note is SEC-rendered too, with the unit
+    // only in the label), then the SEC-rendered as-is default, then the
+    // table scale.
+    const ownScale = labelScale(row.label);
+    let rowScale;
+    if (isShareCountRow && shareScale && !shareScale.implicit) rowScale = shareScale.scale;
+    else if (ownScale !== 1 && (scale === 1 || isShareCountRow)) rowScale = ownScale;
+    else if (isShareCountRow && shareScale) rowScale = shareScale.scale;
+    else rowScale = scale;
+    if (rowScale !== 1) row.values = row.values.map((v) => v * rowScale);
 
     if (isSubtotalRow && currentSection) {
       for (let ci = 0; ci < annualIdxs.length; ci++) {
