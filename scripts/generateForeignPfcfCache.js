@@ -121,6 +121,68 @@ async function fetchSecJson(url) {
   return res.json();
 }
 
+// --- ADS ratio ----------------------------------------------------------
+// The price is per US-listed share, but the share counts in a filer's XBRL
+// are its ordinary shares. When each American Depositary Share stands for
+// several ordinary shares, earnings per ordinary share divided into an ADS
+// price overstates P/E and P/FCF by exactly that ratio -- verified live:
+// PDD published P/E 41.5 against a real ~11 (one ADS = four Class A
+// shares), BCS ~27 against ~7 (four), TSM 150 against ~25 (five). Read from
+// the filer's latest 20-F, which states it in prose ("each ADS represents
+// four ordinary shares"); checked against 26 known ADRs (2026-10-28),
+// including fractional VIPS (0.2) and YMM (20). A ratio change is a split
+// of the ADS, which the price series is already adjusted for, so the latest
+// ratio applies to every period.
+const NUMBER_WORDS = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, fifteen: 15, sixteen: 16, twenty: 20, thirty: 30, forty: 40, fifty: 50, hundred: 100,
+};
+const RATIO_NUMBER = `(\\d+(?:\\.\\d+)?|${Object.keys(NUMBER_WORDS).join('|')})(?:\\s*\\(\\d+\\))?`;
+const ORDINARY_SHARES = '(?:of\\s+(?:our|the company\'s)\\s+)?(?:class [a-z]\\s+)?(?:ordinary|common|equity)?\\s*shares?';
+const ADS_RATIO_PATTERNS = [
+  `(?:each|one|every)\\s+(?:american depositary share|ads)s?\\s*(?:\\([^)]{0,20}\\))?,?\\s*(?:represents?|representing|equals?|is equivalent to|corresponds to)\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
+  `(?:american depositary shares|adss)\\s*(?:\\([^)]{0,30}\\))?,?\\s*each\\s+(?:representing|represents?)\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
+  `${RATIO_NUMBER}\\s+(?:class [a-z]\\s+)?(?:ordinary|common)\\s+shares?\\s+(?:per|for each|represented by one|=)\\s*(?:one\\s+)?(?:american depositary share|ads)`,
+];
+function parseRatioNumber(text) {
+  const t = text.toLowerCase().trim();
+  if (NUMBER_WORDS[t] != null) return NUMBER_WORDS[t];
+  const n = Number(t.replace(/,/g, ''));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// Ordinary shares per ADS: 1 when the filer files no 20-F (40-F and us-gaap
+// 10-K-style filers list their shares directly) or names no ratio (ASML,
+// NVO: the listed share is the ordinary share); null when the 20-F names
+// two ratios equally often, which the caller treats as "can't compute".
+async function fetchAdsRatio(cik) {
+  const submissions = await fetchSecJson(`https://data.sec.gov/submissions/CIK${cik}.json`);
+  const r = submissions?.filings?.recent;
+  const idx = r ? r.form.findIndex((f) => f === '20-F') : -1;
+  if (idx < 0) return 1;
+  await sleep(SEC_REQUEST_SPACING_MS);
+  const url = `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${r.accessionNumber[idx].replace(/-/g, '')}/${r.primaryDocument[idx]}`;
+  const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  const text = (await res.text())
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;|&#xa0;/gi, ' ')
+    .replace(/\s+/g, ' ');
+  const counts = new Map();
+  for (const source of ADS_RATIO_PATTERNS) {
+    const re = new RegExp(source, 'gi');
+    let m;
+    while ((m = re.exec(text))) {
+      const v = parseRatioNumber(m[1]);
+      if (v) counts.set(v, (counts.get(v) || 0) + 1);
+    }
+  }
+  if (!counts.size) return 1;
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) return null;
+  return ranked[0][0];
+}
+
 async function fetchTickerToCikMap() {
   const data = await fetchSecJson(SEC_TICKERS_URL);
   const map = new Map();
@@ -1124,6 +1186,15 @@ async function main() {
         // Prices are USD; bring every monetary series to USD to match. The
         // 20-F and 6-K text paths both keep the filer's own column and drop
         // a USD convenience one, so their facts are in reportingCurrency too.
+        // Shares per US-listed share -- see fetchAdsRatio. An unreadable
+        // ratio leaves no share count, so nothing per-share is published.
+        const adsRatio = await fetchAdsRatio(cik);
+        await sleep(SEC_REQUEST_SPACING_MS);
+        if (adsRatio !== 1) {
+          const perAds = (points) => (adsRatio ? points.map((p) => ({ ...p, value: p.value / adsRatio })) : []);
+          shares = { quarterly: perAds(shares.quarterly), annual: perAds(shares.annual) };
+          console.log(`  ${symbol}: ${adsRatio ? `each ADS = ${adsRatio} shares` : 'ADS ratio ambiguous, no per-share figures'}`);
+        }
         if (reportingCurrency !== 'USD') {
           ocf = await convertSeriesToUsd(ocf, reportingCurrency);
           capex = await convertSeriesToUsd(capex, reportingCurrency);
