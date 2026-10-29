@@ -195,6 +195,170 @@ async function fetchAdsRatio(cik) {
   return ranked[0][0];
 }
 
+// --- Share splits -------------------------------------------------------
+// Prices are split-adjusted to today's share basis; filed share counts are
+// on whatever basis held when they were filed. A period's latest filing is
+// restated after a split, but older periods never are -- verified live:
+// BriaCell (BCTX) did a 1-for-15 and then a 1-for-10 reverse split, and its
+// FY '22-'24 P/E (-43 to -66) used pre-split share counts against a price
+// adjusted 150x, against a real ~-0.5; IXHL (1-for-30) likewise.
+//
+// Splits are read from the filer's own restatements: the same period's
+// share count re-filed at a clean whole-number ratio (BCTX: 15,981,726 ->
+// 1,065,448 = 15; 2,224,979 -> 222,498 = 10; across both, 150). Each split
+// is pinned between the last filing on the old basis and the first on the
+// new one. A restatement alone is not enough -- across all 1,109 foreign
+// filers it also flags unit-tagging errors (AMX x1e-6 then x1e6), and a
+// filer switching between ordinary and ADS-equivalent counts (PDD x927) --
+// so each split must also show in the cover-page shares outstanding, which
+// is always ordinary shares: some consecutive pair of cover counts in the
+// window must move at least halfway toward the ratio (on a log scale) and
+// end within 3x of it. 3x leaves room for heavy issuance: BCTX's cover
+// count went 6.78M -> 1.88M across its 1-for-10 while it sold new shares.
+// Real ratios seen run to 1-for-300 (BCTX 2020); larger is a unit error.
+const MAX_SPLIT_RATIO = 300;
+
+function cleanSplitFactor(older, newer) {
+  if (!(older > 0 && newer > 0)) return null;
+  const r = newer / older;
+  const big = r >= 1 ? r : 1 / r;
+  const n = Math.round(big);
+  if (n < 2 || n > MAX_SPLIT_RATIO || Math.abs(big / n - 1) > 0.02) return null;
+  return r >= 1 ? n : 1 / n;
+}
+
+function detectSplitEvents(sharesFacts, coverFacts = [], yahooSplits = []) {
+  const byPeriod = new Map();
+  for (const f of sharesFacts) {
+    if (!f.start || !f.end || !f.filed || !(f.val > 0)) continue;
+    const key = `${f.start}|${f.end}`;
+    if (!byPeriod.has(key)) byPeriod.set(key, []);
+    byPeriod.get(key).push(f);
+  }
+  const candidates = [];
+  for (const facts of byPeriod.values()) {
+    facts.sort((a, b) => a.filed.localeCompare(b.filed));
+    for (let i = 1; i < facts.length; i++) {
+      const prev = facts[i - 1];
+      const cur = facts[i];
+      if (cur.filed === prev.filed) continue;
+      const factor = cleanSplitFactor(prev.val, cur.val);
+      if (factor) candidates.push({ after: prev.filed, by: cur.filed, factor });
+    }
+  }
+  // One event per ratio, pinned to the intersection of every window that
+  // shows it. A ratio that is the product of two smaller ones (BCTX's 150)
+  // is two splits seen across one window, not a third split.
+  const groups = new Map();
+  for (const c of candidates) {
+    const key = c.factor.toPrecision(6);
+    const g = groups.get(key);
+    if (!g) groups.set(key, { ...c });
+    else {
+      if (c.after > g.after) g.after = c.after;
+      if (c.by < g.by) g.by = c.by;
+    }
+  }
+  const events = [];
+  const sorted = [...groups.values()].sort((a, b) => Math.abs(Math.log(a.factor)) - Math.abs(Math.log(b.factor)));
+  for (const g of sorted) {
+    const isProduct = events.some((x, i) => events.some((y, j) => j > i && Math.abs(x.factor * y.factor / g.factor - 1) < 0.02));
+    if (isProduct) continue;
+    if (g.after >= g.by) continue; // windows that don't agree on when it happened -- not a clean split
+    const cover = corroborateSplit(g, coverFacts);
+    if (cover) {
+      events.push({ ...g, after: cover.after, by: cover.by, miss: cover.miss });
+      continue;
+    }
+    const listed = yahooSplits.find((y) => y.date > g.after && y.date <= g.by && Math.abs(y.factor / g.factor - 1) < 0.02);
+    if (listed) events.push({ ...g, miss: 0 });
+  }
+  // Two ratios pinned to overlapping windows are one split seen through
+  // dilution (TCOM 7 and 8) -- keep the one the cover count matches best.
+  return events.filter((e) => !events.some((o) => o !== e && o.after < e.by && e.after < o.by && o.miss < e.miss));
+}
+
+// Total cover-page shares outstanding per filing (classes summed), oldest
+// first; returns the narrowed window and how far off the ratio it was, or
+// null when no consecutive pair in the window bears the split out.
+function corroborateSplit(event, coverFacts) {
+  const byAccession = new Map();
+  for (const f of coverFacts) {
+    if (!(f.val > 0) || !f.filed || !f.accn) continue;
+    const g = byAccession.get(f.accn) || { filed: f.filed, val: 0 };
+    g.val += f.val;
+    byAccession.set(f.accn, g);
+  }
+  const points = [...byAccession.values()].sort((a, b) => a.filed.localeCompare(b.filed));
+  const first = points.findIndex((p) => p.filed > event.after);
+  const lastIdx = points.findIndex((p) => p.filed >= event.by);
+  if (first < 1 || lastIdx < 0) return null;
+  const want = Math.log(event.factor);
+  let best = null;
+  for (let i = first - 1; i < lastIdx; i++) {
+    const got = Math.log(points[i + 1].val / points[i].val);
+    if (Math.sign(got) !== Math.sign(want) || Math.abs(got) < Math.abs(want) / 2) continue;
+    const miss = Math.abs(got - want);
+    if (miss > Math.log(3)) continue;
+    if (!best || miss < best.miss) best = { after: points[i].filed, by: points[i + 1].filed, miss };
+  }
+  if (!best) return null;
+  // The cover pair can only narrow the restatement window, never move it.
+  return { after: best.after > event.after ? best.after : event.after, by: best.by < event.by ? best.by : event.by, miss: best.miss };
+}
+
+// Yahoo's public chart endpoint lists split dates and ratios. It is the
+// second witness for a restatement when the filer tags no cover-page share
+// count (NVO's 2023 2-for-1), and the only source for a split after the
+// newest filing, which has no restatement to read yet -- verified live:
+// ZBAO's 1-for-50 took effect 2026-10-12, after its last filing, with its
+// price already adjusted 50x. Never used alone for an earlier split: it has
+// no record of BCTX's 1-for-15. Any failure just means an empty list.
+async function fetchYahooSplits(symbol) {
+  try {
+    const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=max&interval=3mo&events=split`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const out = [];
+    for (const sp of Object.values(data?.chart?.result?.[0]?.events?.splits || {})) {
+      if (!(sp.numerator > 0 && sp.denominator > 0)) continue;
+      const factor = sp.numerator / sp.denominator; // shares after per share before
+      const n = factor >= 1 ? factor : 1 / factor;
+      if (Math.abs(n - Math.round(n)) > 1e-9 || Math.round(n) < 2) continue;
+      out.push({ date: new Date(sp.date * 1000).toISOString().slice(0, 10), factor });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// Puts every share count on today's basis: multiplied by each later split's
+// factor. A count filed between the last old-basis filing and the first
+// new-basis one could be either, so it is dropped; a count with no filing
+// date is left as it is.
+function splitAdjust(facts, events) {
+  if (!events.length) return facts;
+  const out = [];
+  for (const f of facts) {
+    if (!f.filed) {
+      out.push(f);
+      continue;
+    }
+    let factor = 1;
+    let ambiguous = false;
+    for (const e of events) {
+      if (f.filed <= e.after) factor *= e.factor;
+      else if (f.filed < e.by) ambiguous = true;
+    }
+    if (ambiguous) continue;
+    out.push(factor === 1 ? f : { ...f, val: f.val * factor });
+  }
+  return out;
+}
+
 async function fetchTickerToCikMap() {
   const data = await fetchSecJson(SEC_TICKERS_URL);
   const map = new Map();
@@ -964,7 +1128,21 @@ async function main() {
         const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS, reportingCurrency);
         let ocf = dedupeAndClassify(ocfRaw);
         let capex = dedupeAndClassify(capexRaw);
-        let shares = dedupeAndClassify(sharesRaw, 'shares');
+        // Every share series below goes through splitAdjust -- see
+        // detectSplitEvents.
+        const yahooSplits = await fetchYahooSplits(symbol);
+        const splitEvents = detectSplitEvents(sharesRaw, companyFacts?.facts?.dei?.EntityCommonStockSharesOutstanding?.units?.shares || [], yahooSplits);
+        const latestSharesFiled = sharesRaw.reduce((m, f) => (f.filed && f.filed > m ? f.filed : m), '');
+        for (const y of yahooSplits) {
+          // Dated exactly, so anything filed before it is on the old basis.
+          const dayBefore = new Date(Date.parse(y.date) - 86400000).toISOString().slice(0, 10);
+          if (latestSharesFiled && y.date > latestSharesFiled) splitEvents.push({ after: dayBefore, by: y.date, factor: y.factor });
+        }
+        if (splitEvents.length) {
+          console.log(`  ${symbol}: share splits ${splitEvents.map((e) => `x${+e.factor.toPrecision(4)} between ${e.after} and ${e.by}`).join('; ')}`);
+        }
+        const classifyShares = (facts) => dedupeAndClassify(splitAdjust(facts, splitEvents), 'shares');
+        let shares = classifyShares(sharesRaw);
         let netIncome = dedupeAndClassify(netIncomeRaw);
 
         // Per-ticker, per-concept -- see computeCumulativeFallbackConcepts'
@@ -1056,7 +1234,7 @@ async function main() {
             const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['shares'], annualByEnd, SEC_USER_AGENT);
             if (annual20FFacts.shares?.length) {
               annual20FSharesFacts = annual20FFacts.shares;
-              shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts], 'shares');
+              shares = classifyShares([...sharesRaw, ...annual20FSharesFacts]);
             }
           } catch (err) {
             console.log(`  20-F shares fallback failed for ${symbol}: ${err.message}`);
@@ -1153,7 +1331,7 @@ async function main() {
               ocf = dedupeAndClassify([...ocfRaw, ...annual20FOcfFacts, ...ocfFilingTextFacts.ocf]);
             }
             if (sharesFilingTextFacts.shares?.length) {
-              shares = dedupeAndClassify([...sharesRaw, ...annual20FSharesFacts, ...sharesFilingTextFacts.shares], 'shares');
+              shares = classifyShares([...sharesRaw, ...annual20FSharesFacts, ...sharesFilingTextFacts.shares]);
             }
             if (netIncomeFilingTextFacts.netIncome?.length) {
               netIncome = dedupeAndClassify([...netIncomeRaw, ...annual20FNetIncomeFacts, ...netIncomeFilingTextFacts.netIncome]);
@@ -1189,7 +1367,7 @@ async function main() {
               }
             }
             const bqFacts = await fetchBusinessQuantFacts(symbol, ['shares'], { shares: groundTruth }, process.env.BUSINESSQUANT_API_KEY);
-            if (bqFacts.shares?.length) shares = dedupeAndClassify([...sharesRaw, ...bqFacts.shares], 'shares');
+            if (bqFacts.shares?.length) shares = classifyShares([...sharesRaw, ...bqFacts.shares]);
           } catch (err) {
             console.log(`  BusinessQuant shares fallback failed for ${symbol}: ${err.message}`);
           }
@@ -1291,6 +1469,9 @@ async function main() {
 
 module.exports = {
   fetchAdsRatio,
+  detectSplitEvents,
+  splitAdjust,
+  fetchYahooSplits,
   extractFactSeries,
   dedupeAndClassify,
   buildTrailingWindows,
