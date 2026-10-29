@@ -172,6 +172,11 @@ async function fetchAdsRatio(cik) {
   const r = submissions?.filings?.recent;
   const idx = r ? r.form.findIndex((f) => f === '20-F') : -1;
   if (idx < 0) return 1;
+  // A filer that has since moved to 10-K reporting lists its shares directly
+  // -- verified live: IXHL redomiciled to the US, and its last 20-F's "each
+  // ADS = 25 shares" divided a 10-K share count by 25. recent[] is newest
+  // first, so a 10-K at a lower index was filed after the 20-F.
+  if (r.form.slice(0, idx).some((f) => f === '10-K')) return 1;
   await sleep(SEC_REQUEST_SPACING_MS);
   const url = `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${r.accessionNumber[idx].replace(/-/g, '')}/${r.primaryDocument[idx]}`;
   const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT } });
@@ -335,6 +340,21 @@ async function fetchYahooSplits(symbol) {
   }
 }
 
+// A share count 300x or more away from every neighbouring period is a unit
+// error, never a real change -- splits are already adjusted out by then,
+// and no issuance or buyback moves a count that far in one period. Verified
+// live: PDD's FY2022 count came from a filing tagged in thousands, giving
+// P/E 0.03. Dropped rather than rescaled: which side is wrong isn't known.
+function dropShareOutliers(points) {
+  const sorted = [...points].sort((a, b) => a.end.localeCompare(b.end));
+  const far = (a, b) => Math.abs(Math.log(a / b)) >= Math.log(300);
+  return sorted.filter((p, i) => {
+    const neighbours = [sorted[i - 1], sorted[i + 1]].filter((n) => n && n.value > 0);
+    if (!neighbours.length || !(p.value > 0)) return true;
+    return !neighbours.every((n) => far(p.value, n.value));
+  });
+}
+
 // Puts every share count on today's basis: multiplied by each later split's
 // factor. A count filed between the last old-basis filing and the first
 // new-basis one could be either, so it is dropped; a count with no filing
@@ -370,8 +390,14 @@ async function fetchTickerToCikMap() {
   return map;
 }
 
+// Ten years: one credit per request whatever the length, and a period
+// older than the price history can never be recomputed -- verified live:
+// with 48 months, BCTX's FY '22 P/E (-43, from pre-split share counts)
+// stayed published through every fix, since no run could produce it again.
+const PRICE_HISTORY_MONTHS = 120;
+
 async function fetchMonthlyPrices(symbol, apiKey) {
-  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=48&apikey=${apiKey}`);
+  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=${PRICE_HISTORY_MONTHS}&apikey=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching Twelve Data prices for ${symbol}`);
   const data = await res.json();
   if (data?.status !== 'ok' || !Array.isArray(data.values)) return [];
@@ -1141,7 +1167,10 @@ async function main() {
         if (splitEvents.length) {
           console.log(`  ${symbol}: share splits ${splitEvents.map((e) => `x${+e.factor.toPrecision(4)} between ${e.after} and ${e.by}`).join('; ')}`);
         }
-        const classifyShares = (facts) => dedupeAndClassify(splitAdjust(facts, splitEvents), 'shares');
+        const classifyShares = (facts) => {
+          const classified = dedupeAndClassify(splitAdjust(facts, splitEvents), 'shares');
+          return { quarterly: dropShareOutliers(classified.quarterly), annual: dropShareOutliers(classified.annual) };
+        };
         let shares = classifyShares(sharesRaw);
         let netIncome = dedupeAndClassify(netIncomeRaw);
 
