@@ -344,15 +344,25 @@ async function fetchYahooSplits(symbol) {
 // error, never a real change -- splits are already adjusted out by then,
 // and no issuance or buyback moves a count that far in one period. Verified
 // live: PDD's FY2022 count came from a filing tagged in thousands, giving
-// P/E 0.03. Dropped rather than rescaled: which side is wrong isn't known.
-function dropShareOutliers(points) {
+// P/E 0.03. Never rescaled by guesswork: the same period's figure from
+// another filing is used when one sits within reach of the neighbours (PDD
+// filed FY2022 correctly the first time), and otherwise the point is dropped.
+function dropShareOutliers(points, facts = []) {
   const sorted = [...points].sort((a, b) => a.end.localeCompare(b.end));
   const far = (a, b) => Math.abs(Math.log(a / b)) >= Math.log(300);
-  return sorted.filter((p, i) => {
+  const out = [];
+  sorted.forEach((p, i) => {
     const neighbours = [sorted[i - 1], sorted[i + 1]].filter((n) => n && n.value > 0);
-    if (!neighbours.length || !(p.value > 0)) return true;
-    return !neighbours.every((n) => far(p.value, n.value));
+    if (!neighbours.length || !(p.value > 0) || !neighbours.every((n) => far(p.value, n.value))) {
+      out.push(p);
+      return;
+    }
+    const alternative = facts
+      .filter((f) => f.start === p.start && f.end === p.end && f.val > 0 && neighbours.every((n) => !far(f.val, n.value)))
+      .sort((a, b) => String(b.filed).localeCompare(String(a.filed)))[0];
+    if (alternative) out.push({ ...p, value: alternative.val });
   });
+  return out;
 }
 
 // Puts every share count on today's basis: multiplied by each later split's
@@ -1168,8 +1178,9 @@ async function main() {
           console.log(`  ${symbol}: share splits ${splitEvents.map((e) => `x${+e.factor.toPrecision(4)} between ${e.after} and ${e.by}`).join('; ')}`);
         }
         const classifyShares = (facts) => {
-          const classified = dedupeAndClassify(splitAdjust(facts, splitEvents), 'shares');
-          return { quarterly: dropShareOutliers(classified.quarterly), annual: dropShareOutliers(classified.annual) };
+          const adjusted = splitAdjust(facts, splitEvents);
+          const classified = dedupeAndClassify(adjusted, 'shares');
+          return { quarterly: dropShareOutliers(classified.quarterly, adjusted), annual: dropShareOutliers(classified.annual, adjusted) };
         };
         let shares = classifyShares(sharesRaw);
         let netIncome = dedupeAndClassify(netIncomeRaw);
