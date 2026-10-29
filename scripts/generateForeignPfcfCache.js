@@ -138,11 +138,23 @@ const NUMBER_WORDS = {
   eleven: 11, twelve: 12, fifteen: 15, sixteen: 16, twenty: 20, thirty: 30, forty: 40, fifty: 50, hundred: 100,
 };
 const RATIO_NUMBER = `(\\d+(?:\\.\\d+)?|${Object.keys(NUMBER_WORDS).join('|')})(?:\\s*\\(\\d+\\))?`;
-const ORDINARY_SHARES = '(?:of\\s+(?:our|the company\'s)\\s+)?(?:class [a-z]\\s+)?(?:ordinary|common|equity)?\\s*shares?';
+// Up to two words between the number and "shares": a class ("Class A",
+// "20 B Shares" -- AMX) or the company's own name ("four Diageo ordinary
+// shares" -- DEO).
+const ORDINARY_SHARES = "(?:of\\s+(?:our|the company's)\\s+)?(?:[\\w.&'-]+\\s+){0,2}?(?:ordinary|common|equity|preferred)?\\s*shares?";
+// "each representing the right to receive 20 B Shares" (AMX).
+const REPRESENTS = '(?:represents?|representing|equals?|is equivalent to|corresponds to)(?:\\s+the right to receive)?';
+const DEPOSITARY = '(?:american depositary (?:shares?|receipts?)|ads|adr)s?';
 const ADS_RATIO_PATTERNS = [
-  `(?:each|one|every)\\s+(?:american depositary share|ads)s?\\s*(?:\\([^)]{0,20}\\))?,?\\s*(?:represents?|representing|equals?|is equivalent to|corresponds to)\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
-  `(?:american depositary shares|adss)\\s*(?:\\([^)]{0,30}\\))?,?\\s*each\\s+(?:representing|represents?)\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
-  `${RATIO_NUMBER}\\s+(?:class [a-z]\\s+)?(?:ordinary|common)\\s+shares?\\s+(?:per|for each|represented by one|=)\\s*(?:one\\s+)?(?:american depositary share|ads)`,
+  // "Each ADS represents", "Each B Share ADS represents" (AMX), "Each Diageo
+  // ADS represents", "one ADR is equivalent to" (DEO).
+  `(?:each|one|every)\\s+(?:[\\w.&'-]+\\s+){0,2}?${DEPOSITARY}\\s*(?:\\([^)]{0,20}\\))?,?\\s*${REPRESENTS}\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
+  // "ADSs, each representing two" -- after an aside as long as PBR's
+  // "American Depositary Shares, or ADSs (evidenced by American Depositary
+  // Receipts, or ADRs), each representing two Common Shares" -- and DEO's
+  // "ADSs, representing four Diageo ordinary shares each".
+  `(?:american depositary shares|adss)(?:\\s*,?\\s*or\\s+adss)?\\s*(?:\\([^)]{0,100}\\))?,?\\s*(?:each\\s+)?${REPRESENTS}\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
+  `${RATIO_NUMBER}\\s+(?:[\\w.&'-]+\\s+){0,2}?(?:ordinary|common)\\s+shares?\\s+(?:per|for each|represented by one|=)\\s*(?:one\\s+)?(?:american depositary share|ads)`,
 ];
 function parseRatioNumber(text) {
   const t = text.toLowerCase().trim();
@@ -1278,6 +1290,7 @@ async function main() {
 }
 
 module.exports = {
+  fetchAdsRatio,
   extractFactSeries,
   dedupeAndClassify,
   buildTrailingWindows,
