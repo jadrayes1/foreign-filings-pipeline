@@ -1431,7 +1431,15 @@ function parseTableColumns($, table, externalPeriodPhrases = [], preferredCurren
         if (parsed.length) periodPhrases = parsed;
         if (process.env.DEBUG_CUMULATIVE_IDX) console.error('DEBUG periodPhrases-resolved', JSON.stringify(periodPhrases));
       }
-      continue;
+      // The phrase can share its row with the years -- verified live: POET's
+      // cash-flow statement heads its columns "For the Three Months Ended
+      // March 31, | 2026 | 2025" in ONE row (its income statement splits the
+      // same header over two rows). Moving on to the next row looked for
+      // years that were never coming and dropped the whole statement, so
+      // quarterly OCF/capex never existed for it. Fall through and read this
+      // row's years as the date row instead.
+      const sameRowYears = cells.filter((c) => !PERIOD_PHRASE_INDICATOR.test(c.text) && isYearCell(c.text));
+      if (!(periodPhrases && sameRowYears.length >= 2)) continue;
     }
     if (!pendingMonthDays) {
       const monthDayCells = cells.map((c) => parseBareMonthDayCell(c.text)).filter(Boolean);
@@ -2056,7 +2064,14 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
       currentSection = advanceToSection;
       advanceToSection = null;
     }
-    if (/operating activities/i.test(rowText)) currentSection = 'operating';
+    // A "SUPPLEMENTAL DISCLOSURE OF NON-CASH INVESTING ACTIVITIES" heading
+    // names investing activities but its rows moved no cash -- verified
+    // live: POET's "Purchase of property and equipment financed through
+    // accounts payable" sits under one, was read as a second investing-
+    // section capex line and summed in (9-month capex 4.49M against a
+    // full-year 2.26M), failing reconciliation for every Q2/Q3.
+    if (/non-?cash/i.test(rowText) && /activities/i.test(rowText)) currentSection = 'noncash';
+    else if (/operating activities/i.test(rowText)) currentSection = 'operating';
     else if (/investing activities/i.test(rowText)) currentSection = 'investing';
     else if (/financing activities/i.test(rowText)) currentSection = 'financing';
     // A section subtotal closes its section -- see NEXT_CASH_FLOW_SECTION.
@@ -2769,7 +2784,9 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
     // section too (e.g. "...investing activities") but must NOT re-trigger
     // this branch -- it's concluding the section, not opening a new one.
     if (!isSubtotalRow) {
-      if (/operating activities/i.test(rowText)) currentSection = 'operating';
+      // Non-cash supplemental disclosure -- see extractFromTable.
+      if (/non-?cash/i.test(rowText) && /activities/i.test(rowText)) currentSection = 'noncash';
+      else if (/operating activities/i.test(rowText)) currentSection = 'operating';
       else if (/investing activities/i.test(rowText)) currentSection = 'investing';
       else if (/financing activities/i.test(rowText)) currentSection = 'financing';
     } else {
@@ -3615,12 +3632,16 @@ async function fetchFilingSummaryReports(cik, accessionNumber, userAgent) {
  * extractFactSeries, ready to merge into the caller's raw fact arrays
  * before dedupeAndClassify runs.
  */
-async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd, userAgent, cumulativeFallbackConcepts, symbol) {
+// `options.skipNativeConversion`: leave figures in the filer's own currency
+// even for a NATIVE_CURRENCY_OVERRIDES filer, for a caller that converts the
+// merged series itself (generateForeignPfcfCache.js) -- converting here too
+// would divide TSM's text-extracted points by the exchange rate twice.
+async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd, userAgent, cumulativeFallbackConcepts, symbol, options = {}) {
   const submissions = await fetchJsonSec(`${SEC_SUBMISSIONS_BASE}/CIK${cik}.json`, userAgent);
   if (!submissions?.filings?.recent) return {};
 
   const minSubstantiveBytes = MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES[symbol] ?? MIN_SUBSTANTIVE_FILING_BYTES;
-  const nativeCurrency = NATIVE_CURRENCY_OVERRIDES[symbol] || null;
+  const nativeCurrency = options.skipNativeConversion ? null : NATIVE_CURRENCY_OVERRIDES[symbol] || null;
   const r = submissions.filings.recent;
   const filings = [];
   for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN; i++) {

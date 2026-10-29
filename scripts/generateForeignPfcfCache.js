@@ -1058,7 +1058,9 @@ async function main() {
               shares: new Map(shares.annual.map((a) => [a.end, a])),
               netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
             };
-            const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, neededQuarterlyConcepts, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts, symbol);
+            const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, neededQuarterlyConcepts, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts, symbol, {
+              skipNativeConversion: reportingCurrency !== 'USD',
+            });
             capexFilingTextFacts = { capex: filingTextFacts.capex };
             ocfFilingTextFacts = { ocf: filingTextFacts.ocf };
             sharesFilingTextFacts = { shares: filingTextFacts.shares };
