@@ -448,7 +448,9 @@ const LABEL_ALIASES = {
     // filing. The same earnings-release template is shared by VIPS/ZTO/
     // likely other major Chinese ADRs (see the dual-currency table header
     // fix's own comment on this file for the same shared-template pattern).
-    exclude: /costs? of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on/i,
+    // "income before": CIG's "Income before financial revenue expenses and
+    // taxes, Total" is a profit line that only mentions revenue.
+    exclude: /costs? of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on|income before/i,
   },
   netIncome: {
     // "net profit" added -- verified live: Copa Holdings (CPA) labels its
@@ -2828,6 +2830,7 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
 
   const rows = $(table).find('tr').toArray();
   const candidatesByColumn = annualIdxs.map(() => ({})); // concept -> [{label, value}]
+  const renderedBySec = /\breport\b/.test($(table).attr('class') || '');
   const sectionDataByColumn = annualIdxs.map(() => ({})); // section -> {sum, subtotal}
   let currentSection = null;
   let advanceToSection = null; // see NEXT_CASH_FLOW_SECTION
@@ -2957,7 +2960,15 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
   const out = [];
   for (let ci = 0; ci < annualIdxs.length; ci++) {
     const results = {};
-    for (const [concept, list] of Object.entries(candidatesByColumn[ci])) {
+    for (const [concept, rawList] of Object.entries(candidatesByColumn[ci])) {
+      // SEC's rendering repeats a line once per segment after the company
+      // total, under the same label -- verified live: TME's 20-F income
+      // statement has "Total revenues" for the group (32,902) then for each
+      // segment (26,726, 6,176), and three values under one label read as
+      // ambiguous, so TME had no FY2025 revenue. On a rendered page the total
+      // comes first.
+      const sameLabel = rawList.length > 1 && rawList.every((c) => c.label === rawList[0].label);
+      const list = renderedBySec && sameLabel ? [rawList[0]] : rawList;
       const resolved = resolveConceptCandidates(list, concept, 'value');
       if (!resolved) continue;
       if (resolved.winner) { results[concept] = resolved.winner; continue; }
