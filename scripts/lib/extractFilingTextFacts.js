@@ -165,6 +165,21 @@ const FX_SERIES_BY_CURRENCY = {
   SGD: 'DEXSIUS',
   ZAR: 'DEXSFUS',
   THB: 'DEXTHUS',
+  // Beyond FRED's daily H.10 set (2026-10-30), each a published official or
+  // reference rate, units per US dollar; every one checked against the
+  // filers' own USD figures before use (see fxSourceCheck in scratchpad).
+  ILS: { source: 'ecb' },
+  TRY: { source: 'ecb' },
+  PHP: { source: 'ecb' },
+  IDR: { source: 'ecb' },
+  AED: { source: 'peg', rate: 3.6725 }, // fixed by the UAE central bank since 1997
+  COP: { source: 'trm' }, // Colombia's official TRM (datos.gov.co)
+  RUB: { source: 'cbr' }, // Bank of Russia official rate
+  CLP: { id: 'CCUSMA02CLM618N' }, // OECD monthly average, via FRED
+  PEN: { source: 'yahoo', symbol: 'PEN=X' }, // monthly; BCRP's own API refuses scripted requests
+  KZT: { source: 'yahoo', symbol: 'KZT=X' },
+  VND: { source: 'yahoo', symbol: 'VND=X' },
+  ARS: { source: 'bcra' }, // BCRA official; ARS reporting is hyperinflationary -- see HYPERINFLATION_FROM
   EUR: { id: 'DEXUSEU', inverted: true },
   GBP: { id: 'DEXUSUK', inverted: true },
   AUD: { id: 'DEXUSAL', inverted: true },
@@ -176,29 +191,15 @@ const fxRateSeriesCache = new Map(); // currency code -> sorted [{date, rate}] |
 async function fetchFxRateSeries(currency) {
   if (fxRateSeriesCache.has(currency)) return fxRateSeriesCache.get(currency);
   const seriesDef = FX_SERIES_BY_CURRENCY[currency];
-  const seriesId = typeof seriesDef === 'string' ? seriesDef : seriesDef?.id;
-  const inverted = typeof seriesDef === 'object' && seriesDef?.inverted;
-  if (!seriesId) {
+  const def = typeof seriesDef === 'string' ? { id: seriesDef } : seriesDef;
+  if (!def) {
     fxRateSeriesCache.set(currency, null);
     return null;
   }
   let series = null;
   try {
-    const res = await fetchWithTimeout(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${seriesId}`, {});
-    if (res.ok) {
-      const csv = await res.text();
-      series = csv
-        .trim()
-        .split('\n')
-        .slice(1) // header row
-        .map((line) => {
-          const [date, rawVal] = line.split(',');
-          const rate = Number(rawVal);
-          if (!date || !Number.isFinite(rate) || rate <= 0) return null;
-          return { date, rate: inverted ? 1 / rate : rate };
-        })
-        .filter(Boolean);
-    }
+    series = await FX_FETCHERS[def.source || 'fred'](def, currency);
+    if (series) series = series.filter((p) => p && p.date && Number.isFinite(p.rate) && p.rate > 0).sort((x, y) => x.date.localeCompare(y.date));
   } catch {
     series = null;
     // Non-fatal -- same graceful-degradation philosophy as every other
@@ -206,9 +207,72 @@ async function fetchFxRateSeries(currency) {
     // filer's points can't be converted (and so aren't recorded) this run,
     // not a thrown error that would take down every other concept/filing.
   }
-  fxRateSeriesCache.set(currency, series);
-  return series;
+  fxRateSeriesCache.set(currency, series && series.length ? series : null);
+  return fxRateSeriesCache.get(currency);
 }
+
+// Each returns [{date: 'YYYY-MM-DD', rate}] -- units of the currency per USD.
+const FX_FETCHERS = {
+  async fred(def) {
+    const res = await fetchWithTimeout(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${def.id}`, {});
+    if (!res.ok) return null;
+    return (await res.text())
+      .trim()
+      .split('\n')
+      .slice(1)
+      .map((line) => {
+        const [date, rawVal] = line.split(',');
+        const rate = Number(rawVal);
+        return { date, rate: def.inverted ? 1 / rate : rate };
+      });
+  },
+  async ecb(def, currency) {
+    const today = new Date().toISOString().slice(0, 10);
+    const res = await fetchWithTimeout(`https://api.frankfurter.app/1999-01-04..${today}?from=USD&to=${currency}`, { redirect: 'follow' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Object.entries(data.rates || {}).map(([date, r]) => ({ date, rate: r[currency] }));
+  },
+  async peg(def) {
+    return [{ date: '1997-01-01', rate: def.rate, peg: true }];
+  },
+  async trm() {
+    const res = await fetchWithTimeout('https://www.datos.gov.co/resource/32sa-8pi3.json?$limit=50000&$order=vigenciadesde', {});
+    if (!res.ok) return null;
+    return (await res.json()).map((r) => ({ date: String(r.vigenciadesde).slice(0, 10), rate: Number(r.valor) }));
+  },
+  async cbr() {
+    const to = new Date();
+    const fmt = (d) => `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${d.getUTCFullYear()}`;
+    const res = await fetchWithTimeout(`https://www.cbr.ru/scripts/XML_dynamic.asp?date_req1=01/01/2000&date_req2=${fmt(to)}&VAL_NM_RQ=R01235`, {});
+    if (!res.ok) return null;
+    const xml = await res.text();
+    return [...xml.matchAll(/<Record Date="(\d{2})\.(\d{2})\.(\d{4})"[^>]*>.*?<Nominal>(\d+)<\/Nominal><Value>([\d,]+)<\/Value>/g)].map((m) => ({
+      date: `${m[3]}-${m[2]}-${m[1]}`,
+      rate: Number(m[5].replace(',', '.')) / Number(m[4]),
+    }));
+  },
+  async bcra() {
+    const out = [];
+    for (let y = 2010; y <= new Date().getUTCFullYear(); y++) {
+      const to = y === new Date().getUTCFullYear() ? new Date().toISOString().slice(0, 10) : `${y}-12-31`; // a future end date is refused
+      const res = await fetchWithTimeout(`https://api.bcra.gob.ar/estadisticascambiarias/v1.0/Cotizaciones/USD?fechadesde=${y}-01-01&fechahasta=${to}&limit=1000`, {});
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const r of data.results || []) out.push({ date: r.fecha, rate: Number(r.detalle?.[0]?.tipoCotizacion) });
+    }
+    return out;
+  },
+  async yahoo(def) {
+    const res = await fetchWithTimeout(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(def.symbol)}?range=max&interval=1mo`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (!res.ok) return null;
+    const r = (await res.json())?.chart?.result?.[0];
+    const closes = r?.indicators?.quote?.[0]?.close || [];
+    return (r?.timestamp || []).map((t, i) => ({ date: new Date(t * 1000).toISOString().slice(0, 10), rate: closes[i] }));
+  },
+};
 
 // Mean of every daily rate within [startIso, endIso] inclusive -- the
 // convenience-translation convention for a flow figure, see this section's
@@ -240,10 +304,18 @@ function nearestFxRateOnOrBefore(series, endIso) {
 // null exactly like any other unextractable value, never publishing a
 // fabricated figure.
 async function convertNativeCurrencyToUsd(value, currency, period) {
+  const rate = await fxRateFor(currency, period);
+  return rate ? value / rate : null;
+}
+
+// Units of `currency` per USD for a period ({start, end}: average) or a date
+// ({end}: nearest on or before). A pegged currency is the peg throughout.
+async function fxRateFor(currency, period) {
+  if (currency === 'USD') return 1;
   const series = await fetchFxRateSeries(currency);
   if (!series || !series.length) return null;
-  const rate = period.start ? averageFxRate(series, period.start, period.end) : nearestFxRateOnOrBefore(series, period.end);
-  return rate ? value / rate : null;
+  if (series[0].peg) return series[0].rate;
+  return period.start ? averageFxRate(series, period.start, period.end) : nearestFxRateOnOrBefore(series, period.end);
 }
 const FILING_LOOKBACK_ENTRIES = 400; // how far into submissions.json's 'recent' list to look for size-qualifying candidates
 const MIN_EXHIBIT_BYTES = 20000; // cover-page heuristic — verified live: STNG's 6-K cover page was 11,450 bytes, its real earnings exhibit 733,171 bytes
@@ -370,8 +442,12 @@ const STATEMENT_HEADINGS = {
   // already documented above for BBUC/DOO. The real table gives ZTO's
   // standalone "Three Months Ended" figures directly, side by side with
   // the "Six Months Ended" cumulative column -- no decumulation needed.
+  // "Income Statement" alone as a heading cell, "Income Statement R$
+  // million" in running text -- CIG's quarterly release names no
+  // "consolidated"; prose merely mentioning an income statement matches
+  // neither form.
   income:
-    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+(?:COMPREHENSIVE\s+)?INCOME\s+DATA/i,
+    /^\s*INCOME\s+STATEMENT\s*$|INCOME\s+STATEMENT\s+(?:R\$|US\$|RMB|€|£)\s*(?:mn|million|thousand)|CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+(?:COMPREHENSIVE\s+)?INCOME\s+DATA/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
@@ -1416,6 +1492,9 @@ function parseTableColumns($, table, externalPeriodPhrases = [], preferredCurren
           const text = c.text.trim();
           const q = text.match(/^([1-4])Q(\d{2})$/);
           if (q) return { months: 3, endMonthDay: CALENDAR_QUARTER_END_BY_MONTHS[Number(q[1]) * 3], year: `20${q[2]}` };
+          // "Q1 2026" beside "2Q26" in the same header -- CIG's QoQ column.
+          const qLong = text.match(/^Q([1-4])\s+((?:19|20)\d{2})$/);
+          if (qLong) return { months: 3, endMonthDay: CALENDAR_QUARTER_END_BY_MONTHS[Number(qLong[1]) * 3], year: qLong[2] };
           const ytd = primaryQuarterNum ? text.match(/^YTD(\d{2})$/) : null;
           if (ytd) {
             return { months: primaryQuarterNum * 3, endMonthDay: CALENDAR_QUARTER_END_BY_MONTHS[primaryQuarterNum * 3], year: `20${ytd[1]}` };
@@ -1571,8 +1650,30 @@ function parseTableColumns($, table, externalPeriodPhrases = [], preferredCurren
       const nextRowCells = i + 1 < rows.length ? nonEmptyCells($, rows[i + 1]) : [];
       if (nextRowCells.length > columns.length && nextRowCells.every((c) => CURRENCY_CODE_CELL.test(c.text))) {
         const distinctCurrencies = new Set(nextRowCells.map((c) => c.text.toUpperCase()));
+        // Each date takes one currency cell, plus the next when that one is
+        // the USD convenience column and the date spans more than one grid
+        // column -- verified live: TME's "2025 | 2026 (colspan 3)" over
+        // "RMB | RMB | US$" gives 1, 2 per half. Splitting by colspan weight
+        // alone gave 0.75/2.25, so every row's six values failed to fit four
+        // dates and TME had no quarterly figure at all. The weighted split is
+        // kept for any header this can't account for exactly.
+        const sequentialCounts = (() => {
+          const counts = [];
+          let cursor = 0;
+          for (const d of dateCells) {
+            if (cursor >= nextRowCells.length) return null;
+            let n = 1;
+            cursor++;
+            if ((d.colspan || 1) > 1 && cursor < nextRowCells.length && CONVENIENCE_TRANSLATION_CURRENCY.test(nextRowCells[cursor].text)) {
+              n++;
+              cursor++;
+            }
+            counts.push(n);
+          }
+          return cursor === nextRowCells.length ? counts : null;
+        })();
         const expandCounts =
-          distinctCurrencies.size >= 2 ? proportionalCounts(nextRowCells.length, dateCells.map((d) => d.colspan || 1)) : null;
+          distinctCurrencies.size >= 2 ? sequentialCounts || proportionalCounts(nextRowCells.length, dateCells.map((d) => d.colspan || 1)) : null;
         if (expandCounts) {
           const expandedColumns = [];
           const keepIndices = [];
@@ -2108,7 +2209,13 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     if (header && header !== 'mislabelled') currentSection = header;
     // A section subtotal closes its section -- see NEXT_CASH_FLOW_SECTION.
     if (SECTION_SUBTOTAL_PATTERN.test(rowText)) advanceToSection = NEXT_CASH_FLOW_SECTION[cashFlowSectionNamedIn(rowText)] || null;
-    const row = parseDataRow(cells, parsedRowColumnCount);
+    // An unlabelled row of figures closing a "Revenues" heading is that
+    // heading's total -- verified live: TME's income statement lists
+    // "Revenues", its two service lines, then the total with no label at
+    // all, so no revenue was ever read from its releases. Revenue headings
+    // only: an unlabelled subtotal elsewhere has no such unambiguous name.
+    const unlabelledTotal = parseNumericCell(cells[0].text) !== null && /^(total\s+|net\s+)?revenues?:?$/i.test(String(pendingSectionLabel || '').trim());
+    const row = parseDataRow(unlabelledTotal ? [{ text: `Total ${pendingSectionLabel.replace(/:$/, '')}`, colspan: 1 }, ...cells] : cells, parsedRowColumnCount);
     if (!row) {
       if (rowText.trim()) pendingSectionLabel = rowText.trim();
       continue;
@@ -5394,5 +5501,7 @@ module.exports = {
   isAdjacentDate,
   computeCumulativeFallbackConcepts,
   convertNativeCurrencyToUsd,
+  fxRateFor,
+  fetchFxRateSeries,
   FX_SERIES_BY_CURRENCY,
 };

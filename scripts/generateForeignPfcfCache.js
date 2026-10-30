@@ -34,7 +34,7 @@ const path = require('path');
 // side effects (its own `if (require.main === module)` guard means main()
 // only runs when THIS file is the entry point, not when it's required).
 const { isGenuineForeignFiler, needsFilingTextBackfill, needsAnnual20FBackfill } = require('./generateForeignFilingsCache');
-const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, computeCumulativeFallbackConcepts, convertNativeCurrencyToUsd } = require('./lib/extractFilingTextFacts');
+const { extractQuarterlyFactsFromFilings, extractAnnualFactsFrom20F, computeCumulativeFallbackConcepts, convertNativeCurrencyToUsd, fxRateFor } = require('./lib/extractFilingTextFacts');
 const { fetchBusinessQuantFacts } = require('./lib/businessQuantFallback');
 
 const OUTPUT_FILE = path.join(__dirname, '../foreignPfcfCache.json');
@@ -488,24 +488,75 @@ function extractFactSeries(companyFacts, conceptCandidates, unit = null) {
   return merged;
 }
 
-// The one currency this filer's monetary series are read in: whichever unit
-// carries the most net income / OCF / capex facts. A convenience USD
-// translation covers a year or two, so it never outvotes the reporting
-// currency; a USD reporter's stray native-currency fact never outvotes USD.
+// The currency this filer reports in NOW: the unit of its most recent net
+// income / OCF / capex figures, preferring a non-USD unit when USD sits
+// beside it (a convenience translation). Not the most common unit --
+// verified live: Nebius (NBIS, formerly Yandex) has more ruble facts
+// (2009-2023) than dollar ones but has reported in dollars since 2024, and a
+// majority vote read it as RUB and dropped every current figure.
 function detectReportingCurrency(companyFacts) {
+  let latest = '';
+  const unitsAt = new Map(); // end -> Map(unit -> count)
   const counts = new Map();
   for (const taxonomy of ['ifrs-full', 'us-gaap']) {
     const facts = companyFacts?.facts?.[taxonomy];
     if (!facts) continue;
     for (const concept of [...NET_INCOME_CONCEPTS, ...OCF_CONCEPTS, ...CAPEX_CONCEPTS]) {
       for (const [unit, unitFacts] of Object.entries(facts[concept]?.units || {})) {
-        counts.set(unit, (counts.get(unit) || 0) + (Array.isArray(unitFacts) ? unitFacts.length : 0));
+        for (const f of unitFacts || []) {
+          if (!f.end) continue;
+          counts.set(unit, (counts.get(unit) || 0) + 1);
+          if (!unitsAt.has(f.end)) unitsAt.set(f.end, new Map());
+          unitsAt.get(f.end).set(unit, (unitsAt.get(f.end).get(unit) || 0) + 1);
+          if (f.end > latest) latest = f.end;
+        }
       }
     }
   }
-  if (!counts.size) return 'USD';
-  return [...counts.entries()].reduce((best, cur) => (cur[1] > best[1] || (cur[1] === best[1] && cur[0] === 'USD') ? cur : best))[0];
+  if (!latest) return 'USD';
+  const atLatest = [...unitsAt.get(latest).keys()];
+  const native = atLatest.filter((u) => u !== 'USD').sort((x, y) => (counts.get(y) || 0) - (counts.get(x) || 0));
+  return native[0] || 'USD';
 }
+
+// Facts in `currency`, plus any in another non-USD unit converted into it
+// (Yandex-era rubles for NBIS); USD facts beside a non-USD reporting
+// currency are convenience translations of the same figures and are left
+// out. A fact with no rate for its unit is dropped.
+async function extractFactSeriesIn(companyFacts, conceptCandidates, currency) {
+  const out = [];
+  for (const taxonomy of ['ifrs-full', 'us-gaap']) {
+    const facts = companyFacts?.facts?.[taxonomy];
+    if (!facts) continue;
+    for (const concept of conceptCandidates) {
+      for (const [unit, unitFacts] of Object.entries(facts[concept]?.units || {})) {
+        if (!Array.isArray(unitFacts)) continue;
+        if (unit === currency) {
+          out.push(...unitFacts);
+          continue;
+        }
+        if (unit === 'USD') continue;
+        for (const f of unitFacts) {
+          const period = { start: f.start, end: f.end };
+          const usd = await convertNativeCurrencyToUsd(f.val, unit, period);
+          if (usd == null) continue;
+          const back = currency === 'USD' ? 1 : await fxRateFor(currency, period);
+          if (back) out.push({ ...f, val: usd * back });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Hyperinflationary reporting (IAS 29): every figure in a filing, prior
+// periods included, is restated into the currency's purchasing power at
+// that filing's own balance-sheet date, and IAS 21 translates all of it at
+// the closing rate of that date -- not each period's average, which would
+// overstate older periods many times over. From the dates IAS 29 applied:
+// Argentina for periods ending on/after 2018-07-01, Turkey on/after
+// 2022-06-30. Earlier periods convert at their own averages as usual.
+const HYPERINFLATION_FROM = { ARS: '2018-07-01', TRY: '2022-06-30' };
 
 // Converts a classified {quarterly, annual} series to USD, each point at
 // the average rate over its own [start, end] -- the same convention
@@ -515,12 +566,22 @@ function detectReportingCurrency(companyFacts) {
 // (native figures against native annual anchors). A point with no rate is
 // dropped, never published unconverted; a currency with no verified FRED
 // series (PEN, ILS...) therefore produces no P/FCF or P/E at all.
-async function convertSeriesToUsd(series, currency) {
+async function convertSeriesToUsd(series, currency, filingEnds = new Map()) {
   if (currency === 'USD') return series;
+  const hyperFrom = HYPERINFLATION_FROM[currency];
   const convert = async (points) => {
     const out = [];
     for (const p of points) {
-      const value = await convertNativeCurrencyToUsd(p.value, currency, { start: p.start, end: p.end });
+      let value;
+      if (hyperFrom && p.end >= hyperFrom) {
+        // A derived quarter (H1 minus Q1) mixes two filings' purchasing
+        // power, so without its own filing it is not converted at all.
+        const at = p.accn && filingEnds.get(p.accn);
+        if (!at) continue;
+        value = await convertNativeCurrencyToUsd(p.value, currency, { end: at });
+      } else {
+        value = await convertNativeCurrencyToUsd(p.value, currency, { start: p.start, end: p.end });
+      }
       if (value != null && Number.isFinite(value)) out.push({ ...p, value });
     }
     return out;
@@ -598,7 +659,8 @@ function dedupeAndClassify(rawFacts, concept) {
   let annual = [];
   for (const fact of byPeriod.values()) {
     const days = daysBetween(fact.start, fact.end);
-    const point = { start: fact.start, end: fact.end, value: fact.val };
+    // accn: the filing the figure came from -- see convertSeriesToUsd.
+    const point = { start: fact.start, end: fact.end, value: fact.val, accn: fact.accn || fact.accessionNumber || null };
     if (days >= 80 && days <= 100) quarterly.push(point);
     else if (days >= 170 && days <= 200) h1.push(point);
     else if (days >= 260 && days <= 300) q3ytd.push(point);
@@ -1181,12 +1243,12 @@ async function main() {
 
       if (isForeignFiler) {
         const reportingCurrency = detectReportingCurrency(companyFacts);
-        const ocfRaw = extractFactSeries(companyFacts, OCF_CONCEPTS, reportingCurrency);
-        const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS, reportingCurrency);
+        const ocfRaw = await extractFactSeriesIn(companyFacts, OCF_CONCEPTS, reportingCurrency);
+        const capexRaw = await extractFactSeriesIn(companyFacts, CAPEX_CONCEPTS, reportingCurrency);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
         // For P/E -- same raw-XBRL-first, 20-F-recovery, 6-K-text-extraction
         // fallback chain as capex/ocf/shares below, just for net income.
-        const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS, reportingCurrency);
+        const netIncomeRaw = await extractFactSeriesIn(companyFacts, NET_INCOME_CONCEPTS, reportingCurrency);
         let ocf = dedupeAndClassify(ocfRaw);
         let capex = dedupeAndClassify(capexRaw);
         // Every share series below goes through splitAdjust -- see
@@ -1451,9 +1513,19 @@ async function main() {
           console.log(`  ${symbol}: ${adsRatio ? `each ADS = ${adsRatio} shares` : 'ADS ratio ambiguous, no per-share figures'}`);
         }
         if (reportingCurrency !== 'USD') {
-          ocf = await convertSeriesToUsd(ocf, reportingCurrency);
-          capex = await convertSeriesToUsd(capex, reportingCurrency);
-          netIncome = await convertSeriesToUsd(netIncome, reportingCurrency);
+          // Each filing's balance-sheet date, for HYPERINFLATION_FROM: the
+          // latest period end it reports anywhere in companyfacts.
+          const filingEnds = new Map();
+          for (const tax of Object.values(companyFacts?.facts || {})) {
+            for (const entry of Object.values(tax)) {
+              for (const list of Object.values(entry.units || {})) {
+                for (const f of list) if (f.accn && f.end && (!filingEnds.has(f.accn) || f.end > filingEnds.get(f.accn))) filingEnds.set(f.accn, f.end);
+              }
+            }
+          }
+          ocf = await convertSeriesToUsd(ocf, reportingCurrency, filingEnds);
+          capex = await convertSeriesToUsd(capex, reportingCurrency, filingEnds);
+          netIncome = await convertSeriesToUsd(netIncome, reportingCurrency, filingEnds);
           console.log(`  ${symbol}: reports in ${reportingCurrency}, converted to USD`);
         }
 
