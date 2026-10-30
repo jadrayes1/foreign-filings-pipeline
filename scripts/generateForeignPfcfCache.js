@@ -1146,6 +1146,7 @@ async function main() {
   let resolved = 0;
   let twelveDataCalls = 0;
   let quotaExhausted = false;
+  let stoppedOnTime = false;
 
   for (const { symbol, cik } of priority) {
     if (twelveDataCalls >= MAX_TWELVEDATA_CALLS_PER_RUN) {
@@ -1154,6 +1155,7 @@ async function main() {
     }
     if (Date.now() - startTime > TIME_BUDGET_MS) {
       console.log(`Time budget reached after ${processed} tickers — stopping for this run.`);
+      stoppedOnTime = true;
       break;
     }
     let fresh = { ttm: [], quarterly: [], yearly: [] };
@@ -1529,6 +1531,17 @@ async function main() {
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends: cache }));
   fs.writeFileSync(OUTPUT_PE_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends: peCache }));
+
+  // Tells the workflow whether to start the next sweep run straight away
+  // (see its "Continue the sweep" step): only when this run stopped on its
+  // time budget with tickers still unswept. Running out of Twelve Data
+  // credits, or finishing, ends the chain.
+  if (SWEEP_SINCE != null && process.env.GITHUB_OUTPUT) {
+    const unswept = withCik.filter((c) => !alreadySwept(cache[c.symbol])).length;
+    const more = stoppedOnTime && !quotaExhausted && unswept > 0;
+    console.log(`Sweep: ${unswept} foreign filers not yet recomputed${more ? ' -- continuing in a new run' : ''}.`);
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `sweep_more=${more}\n`);
+  }
   console.log(
     `Done. Processed ${processed} tickers (${resolved} resolved to at least one P/FCF trend, ${twelveDataCalls} Twelve Data calls used). ` +
       `Cache now covers ${Object.keys(cache).length} tickers total (P/E cache covers ${Object.keys(peCache).length} tickers total, shared with the domestic pipeline).`

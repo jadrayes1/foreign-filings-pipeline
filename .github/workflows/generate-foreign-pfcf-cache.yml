@@ -50,6 +50,10 @@ on:
         description: 'Optional: set to 1 for verbose extraction/reconciliation tracing (DEBUG_FILING_EXTRACT)'
         required: false
         type: string
+      sweep:
+        description: 'Internal: set by the previous sweep run to continue a scheduled recompute sweep (SWEEP_PLAN). Leave blank.'
+        required: false
+        type: string
       dryRun:
         description: 'Optional: set to 1 to skip publishing to the gist (debugging only)'
         required: false
@@ -58,6 +62,7 @@ on:
 permissions:
   contents: read
   issues: write
+  actions: write # the "Continue the sweep" step dispatches the next run
 
 # Deliberately NOT sharing the foreign-filings-gist-publish concurrency
 # group the other workflows in this repo use. Tried that first, but it
@@ -106,12 +111,13 @@ jobs:
       - name: Resolve recompute sweep
         env:
           INPUT_RECOMPUTE: ${{ inputs.recomputeMetrics }}
+          INPUT_SWEEP: ${{ inputs.sweep }}
           SWEEP_PLAN: ${{ vars.SWEEP_PLAN }}
         run: |
           node -e "
           const input = (process.env.INPUT_RECOMPUTE || '').trim();
           let out = input, why = 'manual input', since = '';
-          if (!out && process.env.GITHUB_EVENT_NAME === 'schedule') {
+          if (!out && (process.env.GITHUB_EVENT_NAME === 'schedule' || process.env.INPUT_SWEEP === '1')) {
             let plan = {};
             try { plan = JSON.parse(process.env.SWEEP_PLAN || '{}'); } catch (e) { console.log('::warning::SWEEP_PLAN is not valid JSON -- no sweep this run'); }
             const p = plan[process.env.GITHUB_WORKFLOW], now = Date.now();
@@ -122,6 +128,7 @@ jobs:
           "
 
       - name: Generate foreign P/FCF cache
+        id: generate
         env:
           TWELVEDATA_FOREIGN_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_FOREIGN_PIPELINE_API_KEY }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
@@ -225,6 +232,17 @@ jobs:
                 labels: [label],
               });
             }
+
+      # GitHub drops scheduled runs under load -- verified live: of the 18
+      # hourly runs due on 2026-10-30, two started. So a sweep run that ran
+      # out of time with tickers left starts the next one itself (a
+      # workflow_dispatch from GITHUB_TOKEN is allowed to start a run). The
+      # concurrency group queues it behind this one.
+      - name: Continue the sweep
+        if: ${{ success() && steps.generate.outputs.sweep_more == 'true' && !inputs.dryRun && !inputs.symbol }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run generate-foreign-pfcf-cache.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f sweep=1
 
       - name: Close failure issue on success
         if: success()
