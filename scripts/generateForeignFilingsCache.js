@@ -1624,9 +1624,24 @@ async function processTicker(symbol, cik, isBank) {
         if (filingTextFacts.capex?.length) {
           capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
         }
-        if (filingTextFacts.equity?.length) equityInstant = dedupeInstantFacts([...equityRaw, ...filingTextFacts.equity]);
-        if (filingTextFacts.debt?.length) debtInstant = dedupeInstantFacts([...debtRaw, ...filingTextFacts.debt]);
-        if (filingTextFacts.cash?.length) cashInstant = dedupeInstantFacts([...cashRaw, ...filingTextFacts.cash]);
+        // Balance-sheet text figures only fill a date XBRL doesn't have -- the
+        // same rule as the 20-F fallback below. Verified live: HTHT's XBRL is
+        // read in USD (its preferred unit) but its 6-K balance sheets were
+        // read in RMB, and being filed later they replaced XBRL's year-end
+        // USD equity/debt/cash (equity 1.68B -> 12.27B), so FY ROIC was USD
+        // EBIT over an RMB balance sheet: 3.2% instead of ~35%.
+        const notInXbrl = (textFacts, raw) => {
+          const ends = new Set(raw.map((f) => f.end));
+          return (textFacts || []).filter((f) => !ends.has(f.end));
+        };
+        const equityText = notInXbrl(filingTextFacts.equity, equityRaw);
+        const debtText = notInXbrl(filingTextFacts.debt, debtRaw);
+        const cashText = notInXbrl(filingTextFacts.cash, cashRaw);
+        // Kept filtered for the 20-F merge further down, which re-adds them.
+        filingTextFacts = { ...filingTextFacts, equity: equityText, debt: debtText, cash: cashText };
+        if (equityText.length) equityInstant = dedupeInstantFacts([...equityRaw, ...equityText]);
+        if (debtText.length) debtInstant = dedupeInstantFacts([...debtRaw, ...debtText]);
+        if (cashText.length) cashInstant = dedupeInstantFacts([...cashRaw, ...cashText]);
       }
     }
   }
