@@ -406,10 +406,20 @@ async function fetchTickerToCikMap() {
 // stayed published through every fix, since no run could produce it again.
 const PRICE_HISTORY_MONTHS = 120;
 
-async function fetchMonthlyPrices(symbol, apiKey) {
+async function fetchMonthlyPrices(symbol, apiKey, retried = false) {
   const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=${PRICE_HISTORY_MONTHS}&apikey=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching Twelve Data prices for ${symbol}`);
   const data = await res.json();
+  // Credits running out comes back as HTTP 200 with an error body (code
+  // 429), which used to read as "no prices" -- see lastSweptAt. A
+  // per-minute limit is waited out once; a daily one ends the run.
+  if (data?.code === 429) {
+    if (/minute/i.test(data.message || '') && !retried) {
+      await sleep(61000);
+      return fetchMonthlyPrices(symbol, apiKey, true);
+    }
+    throw Object.assign(new Error(`Twelve Data credits exhausted: ${data.message}`), { quotaExhausted: true });
+  }
   if (data?.status !== 'ok' || !Array.isArray(data.values)) return [];
   return data.values.map((v) => ({ date: v.datetime, close: parseFloat(v.close) })).filter((v) => !Number.isNaN(v.close));
 }
@@ -1004,8 +1014,20 @@ const RECOMPUTE_METRICS = new Set(
 // recompute sweep" step): the sweep's start. A ticker refreshed since then
 // has already been recomputed once and is merged normally from here on.
 const SWEEP_SINCE = process.env.SWEEP_SINCE ? Date.parse(process.env.SWEEP_SINCE) : null;
-function alreadySwept(fetchedAt) {
-  return SWEEP_SINCE != null && !!fetchedAt && Date.parse(fetchedAt) >= SWEEP_SINCE;
+// When this ticker was last actually recomputed. `sweptAt` once written
+// (null: never), else the older entries' `fetchedAt` -- which, before
+// sweptAt existed, was also stamped on a ticker that failed, so a failure
+// counted as swept. Verified risk: with the workflow hourly, a run that
+// outlived the day's Twelve Data credits would have marked every remaining
+// ticker it touched as recomputed without computing anything.
+function lastSweptAt(entry) {
+  if (!entry) return null;
+  return 'sweptAt' in entry ? entry.sweptAt : entry.fetchedAt || null;
+}
+
+function alreadySwept(entry) {
+  const at = lastSweptAt(entry);
+  return SWEEP_SINCE != null && !!at && Date.parse(at) >= SWEEP_SINCE;
 }
 
 function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
@@ -1123,6 +1145,7 @@ async function main() {
   let processed = 0;
   let resolved = 0;
   let twelveDataCalls = 0;
+  let quotaExhausted = false;
 
   for (const { symbol, cik } of priority) {
     if (twelveDataCalls >= MAX_TWELVEDATA_CALLS_PER_RUN) {
@@ -1460,7 +1483,10 @@ async function main() {
         computed = true;
       }
     } catch (err) {
-      console.log(`  skip ${symbol}: ${err.message}`);
+      if (err.quotaExhausted) {
+        quotaExhausted = true;
+        console.log(`Twelve Data daily credits used up at ${symbol} after ${processed} tickers -- stopping; the rest stay in the sweep for the next run.`);
+      } else console.log(`  skip ${symbol}: ${err.message}`);
       // pickCadenceTrendsToPublish below falls back to whatever was already
       // cached for this symbol rather than losing it over one failed request.
     }
@@ -1471,9 +1497,11 @@ async function main() {
     // the sweep began, so each is recomputed exactly once. The rotation is
     // already stalest-first across every foreign filer, so it reaches all
     // of them without reordering.
-    const mayRecompute = computed && !alreadySwept(cache[symbol]?.fetchedAt);
+    if (quotaExhausted) break; // nothing was computed for it -- leave its entry exactly as it was
+    const mayRecompute = computed && !alreadySwept(cache[symbol]);
     const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh, mayRecompute ? 'pfcfRatio' : null);
-    cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences };
+    const recomputedNow = mayRecompute && RECOMPUTE_METRICS.has('pfcfRatio');
+    cache[symbol] = { fetchedAt: new Date().toISOString(), sweptAt: recomputedNow ? new Date().toISOString() : lastSweptAt(cache[symbol]), ...cadences };
     if (cadences.ttm.length || cadences.quarterly.length || cadences.yearly.length) {
       resolved++;
     }
