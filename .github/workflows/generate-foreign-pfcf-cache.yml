@@ -30,7 +30,12 @@ name: Generate foreign P/FCF cache
 
 on:
   schedule:
-    - cron: '0 17 * * *'
+    # Hourly through 17:20 UTC: each run reaches ~35 tickers (stalest first)
+    # inside its 40-minute budget, and 18 runs use ~630 of the Twelve Data
+    # key's 800 daily calls. One run a day took a month to cover the 1,100
+    # foreign filers once, so a recompute sweep after a calculation fix
+    # (2026-10-29: currency, ADS ratio, share splits) was out of reach.
+    - cron: '20 0-17 * * *'
   workflow_dispatch:
     inputs:
       symbol:
@@ -69,6 +74,13 @@ permissions:
 # could never have covered anyway), so running ungated here costs nothing
 # in safety and avoids this job being starved by unrelated, much longer
 # jobs in the same repo.
+
+# Its own group, not foreign-filings-gist-publish (see above): two of these
+# runs overlapping would each publish a file built from the same starting
+# snapshot, the later one silently undoing the earlier one's tickers.
+concurrency:
+  group: foreign-pfcf-cache
+  cancel-in-progress: false
 
 jobs:
   generate:
