@@ -2228,8 +2228,11 @@ const NEXT_CASH_FLOW_SECTION = { operating: 'investing', investing: 'financing' 
 // financing header comes after "Net cash used in investment activities"),
 // so its capex sat in a "financing" section and was never read.
 function sectionHeaderAt(rowTexts, i) {
+  // A heading carries no figures -- POET's section totals ("Cash flows used
+  // in investing activities (64,861,433)") name the section too, and counted
+  // as a repeat they marked its real "INVESTING ACTIVITIES" heading wrong.
   const named = (t) => {
-    if (SECTION_SUBTOTAL_PATTERN.test(t)) return null;
+    if (SECTION_SUBTOTAL_PATTERN.test(t) || /\d[\d,]{2,}/.test(t)) return null;
     if (/non-?cash/i.test(t) && /activities/i.test(t)) return 'noncash';
     return cashFlowSectionNamedIn(t);
   };
