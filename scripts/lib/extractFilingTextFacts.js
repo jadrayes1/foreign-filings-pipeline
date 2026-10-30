@@ -730,6 +730,25 @@ const LABEL_ALIASES = {
   // generateForeignFilingsCache.js (the XBRL-sourced equivalents) so a
   // text-extracted instant fact means the same thing as an XBRL one when
   // the two get merged.
+  // Purchases of intangible assets, kept apart from capex -- only
+  // generateForeignFilingsCache.js's yearly FCF-margin fallback reads it,
+  // for a filer whose main investment is booked as intangibles and that has
+  // no FCF margin otherwise (verified live: Sabesp/SBS, a concession utility,
+  // invests R$3.7-7.9B a year in intangible concession assets against
+  // R$0.05-0.15B of property and equipment). Investing section only, like capex.
+  intangibleCapex: {
+    include: /(purchases?|acquisitions?|additions?|investments?|payments?)\s+(of|in|to|for)\s+(the\s+)?(?:[\w,]+\s+){0,3}?intangible/i,
+    exclude: /goodwill|proceeds|disposal|\bsale of\b|amortization|impairment|gain on|loss on|property|plant|equipment/i,
+  },
+  // The same line when it also covers property and equipment -- verified
+  // live: SBS's 20-F reads "Acquisition of contract assets, intangible
+  // assets and property, plant and equipment" (R$13.74B FY2025; FY2024's
+  // R$8.03B is exactly its XBRL intangibles 7.93B + PP&E 0.10B). Kept apart
+  // so the fallback never adds PP&E to a total that already includes it.
+  totalCapex: {
+    include: /(purchases?|acquisitions?|additions?|investments?|payments?)\s+(of|in|to|for)\s+(the\s+)?(?:[\w,]+\s+){0,3}?intangible.*(property|plant|equipment)|(property|plant|equipment).*\bintangible/i,
+    exclude: /goodwill|proceeds|disposal|\bsale of\b|amortization|impairment|gain on|loss on|depreciation|written|residual/i,
+  },
   equity: {
     // Verified live: STNG labels this "Total shareholders' equity" —
     // matches the existing totalMatches tiebreak automatically (starts
@@ -836,7 +855,9 @@ const LABEL_ALIASES = {
     // outstanding", hyphenated, which the space-only pattern never matched
     // -- same class of gap as parsePeriodPhrase's own "[\s-]months?" fix
     // (BRP/DOO's "Three-month periods ended"), just never applied here too.
-    include: /weighted[\s-]average (number of )?(common )?shares?( outstanding)?/i,
+    // "...of Class A and Class B ordinary shares" (VIPS) as well as "...of
+    // (common) shares": up to a few words of share class before "shares".
+    include: /weighted[\s-]average (number of )?(?:(?:class [a-z]|and|ordinary|common|equity)\s+){0,6}shares?( outstanding)?/i,
     exclude: /dilutive effect|per share/i,
   },
 };
@@ -1116,7 +1137,13 @@ function parsePeriodPhrase(text) {
 // native column from a convenience translation.
 function parseDateCellUnitTail(tail) {
   if (!tail || !tail.trim()) return { ok: true, currency: null };
-  let rest = tail.replace(/\bper\s+shares?\b/gi, ' ').replace(/\bshares?\b/gi, ' ');
+  // "RMB'000" / "US$'000" -- a currency plus a thousands marker, verified
+  // live: VIPS heads its free-cash-flow table "June 30, 2026 RMB'000 |
+  // June 30, 2026 US$'000", and the digits in "'000" failed the whole
+  // table, so its OCF and capex never had a quarterly figure. The scale is
+  // left to the usual caption/anchor checks.
+  let rest = tail.replace(/US\$/g, 'USD').replace(/['’]000\b/g, ' ');
+  rest = rest.replace(/\bper\s+shares?\b/gi, ' ').replace(/\bshares?\b/gi, ' ');
   const codes = rest.match(/\b[A-Z]{3}\b/g) || [];
   rest = rest.replace(/\b[A-Z]{3}\b/g, ' ');
   if (/[A-Za-z0-9]/.test(rest)) return { ok: false, currency: null };
@@ -1152,7 +1179,8 @@ function parseDateHeaderCell(text) {
       return { year: numeric[3], monthDay: `${MONTH_ABBREVIATIONS[month - 1]} ${day}`, currency: null };
     }
   }
-  const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})\b([\s\S]*)$/);
+  // No word boundary after the year: VIPS runs a unit straight on ("Sept 30, 2024RMB'000").
+  const compound = stripped.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*((?:19|20)\d{2})(?!\d)([\s\S]*)$/);
   if (compound) {
     const tail = parseDateCellUnitTail(compound[4]);
     if (tail.ok) return { year: compound[3], monthDay: `${compound[1]} ${compound[2]}`, currency: tail.currency };
@@ -1776,7 +1804,7 @@ function parseDataRow(cells, columnCount) {
 // statement section -- see extractFromTable's section-tracking comment for
 // why this exists. Concepts not listed here are unrestricted, matching
 // anywhere in the table exactly as before.
-const SECTION_RESTRICTED_CONCEPTS = { capex: 'investing' };
+const SECTION_RESTRICTED_CONCEPTS = { capex: 'investing', intangibleCapex: 'investing', totalCapex: 'investing' };
 
 // DEFAULT concepts for which a cumulative-only (H1/9mo) column is an
 // acceptable substitute for a missing 3-month one -- see the
@@ -1997,7 +2025,7 @@ function resolveConceptCandidates(list, concept, valueKey) {
   return null;
 }
 
-function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS, externalPeriodPhrases = []) {
+function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts = CUMULATIVE_FALLBACK_CONCEPTS, externalPeriodPhrases = [], options = {}) {
   const parsed = parseTableColumns($, table, externalPeriodPhrases);
   if (!parsed) return null;
   const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
@@ -2043,6 +2071,7 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
   // whose own "Basic"/"Diluted" subrows hold the $ EPS figures instead.
   // Neither subrow's bare label alone says which one it is.
   let pendingSectionLabel = null;
+  const rowTexts = rows.map((r) => nonEmptyCells($, r).map((c) => c.text).join(' '));
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
@@ -2070,10 +2099,8 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     // accounts payable" sits under one, was read as a second investing-
     // section capex line and summed in (9-month capex 4.49M against a
     // full-year 2.26M), failing reconciliation for every Q2/Q3.
-    if (/non-?cash/i.test(rowText) && /activities/i.test(rowText)) currentSection = 'noncash';
-    else if (/operating activities/i.test(rowText)) currentSection = 'operating';
-    else if (/investing activities/i.test(rowText)) currentSection = 'investing';
-    else if (/financing activities/i.test(rowText)) currentSection = 'financing';
+    const header = sectionHeaderAt(rowTexts, i);
+    if (header && header !== 'mislabelled') currentSection = header;
     // A section subtotal closes its section -- see NEXT_CASH_FLOW_SECTION.
     if (SECTION_SUBTOTAL_PATTERN.test(rowText)) advanceToSection = NEXT_CASH_FLOW_SECTION[cashFlowSectionNamedIn(rowText)] || null;
     const row = parseDataRow(cells, parsedRowColumnCount);
@@ -2100,10 +2127,13 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
     // That purpose clause is dropped before matching; "Earnings per share:"
     // + "Basic" still never matches (no "weighted" anywhere in it).
     const leadIn = pendingSectionLabel ? pendingSectionLabel.replace(/\s+used\s+(in|for)\s+(the\s+)?((computation|calculation)\s+of\s+)?(basic\s+and\s+diluted\s+)?(earnings|net\s+(income|loss)|loss)\s+per\s+(ordinary\s+|common\s+)?share(\s+(computation|calculation))?/i, '') : pendingSectionLabel;
-    const effectiveLabel = /^(basic|diluted)$/i.test(row.label.trim()) && leadIn ? `${leadIn} ${row.label}` : row.label;
+    // A leading dash or bullet still leaves it bare -- VIPS prints "—Basic".
+    const effectiveLabel = /^[-—–•\s]*(basic|diluted)$/i.test(row.label.trim()) && leadIn ? `${leadIn} ${row.label}` : row.label;
     for (const concept of Object.keys(aliasMap)) {
       if (!matchesConcept(effectiveLabel, concept)) continue;
-      const requiredSection = SECTION_RESTRICTED_CONCEPTS[concept];
+      // options.sectionFree: a table with no statement sections at all (see
+      // extractFreeCashFlowReconciliation), where the restriction can't apply.
+      const requiredSection = options.sectionFree ? null : SECTION_RESTRICTED_CONCEPTS[concept];
       if (requiredSection && currentSection !== requiredSection) continue;
       // value3mo actually means "the value for whatever period we ended up
       // targeting" -- normally a genuine 3-month figure, but the
@@ -2169,7 +2199,7 @@ function extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackC
 // for FY2025 (-111,125 + -198,511 + 143,521 + 0 + -306) sum to exactly
 // -166,421, matching that column's own disclosed "Net cash used in
 // investing activities" subtotal to the dollar.
-const SECTION_SUBTOTAL_PATTERN = /^net (cash|increase|decrease)\b.*(operating|investing|financing) activities/i;
+const SECTION_SUBTOTAL_PATTERN = /^net (cash|increase|decrease)\b.*(operating|investing|investment|financing) activities/i;
 
 // A cash-flow statement always runs operating -> investing -> financing, and
 // each section closes with its own "Net cash ... activities" subtotal. So the
@@ -2190,9 +2220,27 @@ const SECTION_SUBTOTAL_PATTERN = /^net (cash|increase|decrease)\b.*(operating|in
 // An explicit header still sets the section directly wherever one exists,
 // so a filer that prints all three headers behaves exactly as before.
 const NEXT_CASH_FLOW_SECTION = { operating: 'investing', investing: 'financing' };
+
+// The section a header row opens, or null for any other row. A heading that
+// is repeated later is a mislabel, and the earlier one yields to the order
+// the statement must follow -- verified live: Sabesp's (SBS) FY2025 20-F
+// heads its investing rows "Cash flows from financing activities" (its real
+// financing header comes after "Net cash used in investment activities"),
+// so its capex sat in a "financing" section and was never read.
+function sectionHeaderAt(rowTexts, i) {
+  const named = (t) => {
+    if (SECTION_SUBTOTAL_PATTERN.test(t)) return null;
+    if (/non-?cash/i.test(t) && /activities/i.test(t)) return 'noncash';
+    return cashFlowSectionNamedIn(t);
+  };
+  const section = named(rowTexts[i]);
+  if (!section || section === 'noncash') return section;
+  const repeated = rowTexts.slice(i + 1).some((t) => named(t) === section);
+  return repeated ? 'mislabelled' : section;
+}
 function cashFlowSectionNamedIn(rowText) {
   if (/operating activities/i.test(rowText)) return 'operating';
-  if (/investing activities/i.test(rowText)) return 'investing';
+  if (/invest(ing|ment) activities/i.test(rowText)) return 'investing';
   if (/financing activities/i.test(rowText)) return 'financing';
   return null;
 }
@@ -2793,6 +2841,7 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
   // bare "Basic"/"Diluted" rows. Cleared at any other header and at every
   // subtotal so it never leaks past its own block.
   let leadIn = null;
+  const rowTexts = rows.map((r) => nonEmptyCells($, r).map((c) => c.text).join(' '));
   for (let i = dataStartRowIdx; i < rows.length; i++) {
     const cells = nonEmptyCells($, rows[i]);
     if (!cells.length) continue;
@@ -2809,10 +2858,8 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
     // this branch -- it's concluding the section, not opening a new one.
     if (!isSubtotalRow) {
       // Non-cash supplemental disclosure -- see extractFromTable.
-      if (/non-?cash/i.test(rowText) && /activities/i.test(rowText)) currentSection = 'noncash';
-      else if (/operating activities/i.test(rowText)) currentSection = 'operating';
-      else if (/investing activities/i.test(rowText)) currentSection = 'investing';
-      else if (/financing activities/i.test(rowText)) currentSection = 'financing';
+      const header = sectionHeaderAt(rowTexts, i);
+      if (header && header !== 'mislabelled') currentSection = header;
     } else {
       // Applied on the NEXT row, so this subtotal is still credited to the
       // section it closes (sectionDataByColumn below reads currentSection).
@@ -3474,6 +3521,79 @@ function extractStatement($, headingRegex, targetEndYear, aliasMap, cumulativeFa
 // same period still has to independently pass reconcilePoints below like
 // any other candidate; this only ever ADDS a real, verifiable candidate
 // where none existed before.
+// An earnings release with no cash-flow statement can still state OCF and
+// capex in its free-cash-flow reconciliation -- verified live: VIPS's 6-Ks
+// carry only "Net cash generated from (used in) operating activities |
+// ... | Capital expenditures | ... | Free cash inflow (outflow)", so it had
+// no quarterly OCF or capex at all (no FCF margin, no P/FCF). Only a table
+// that names free cash flow AND has an operating-activities row AND a
+// capital-expenditure row is read; the values still have to pass the same
+// reconciliation against the annual report as any other extracted figure.
+const TRAILING_PERIOD = /\b(trailing|last)\s+(twelve|12)[\s-]months?\b|\bLTM\b|\bTTM\b/i;
+
+function extractFreeCashFlowReconciliation($, targetEndYear, aliasMap, cumulativeFallbackConcepts) {
+  let merged = null;
+  const allEls = $('body *').toArray();
+  let prevTableIdx = -1;
+  for (const table of $('table').toArray()) {
+    const tableIdx = allEls.indexOf(table);
+    const startIdx = prevTableIdx + 1;
+    prevTableIdx = tableIdx;
+    const text = $(table).text().replace(/\s+/g, ' ');
+    if (!/free cash\s*\(?\s*(?:flow|inflow|outflow)/i.test(text) || !/operating activities/i.test(text) || !/capital expenditure/i.test(text)) continue;
+    // The period can sit just above the table instead of in it (VIPS's Q1
+    // releases: "For the three months ended" / "For the trailing twelve
+    // months ended" over otherwise identical tables). A trailing-twelve-month
+    // table, in either place, is skipped outright: read as a plain twelve-
+    // month period it would become a fake fiscal year ending mid-year.
+    // Only the caption nearest the table counts -- VIPS's Q3 narrative
+    // mentions trailing twelve months well above its quarterly table.
+    let caption = '';
+    for (let i = tableIdx - 1; i >= startIdx; i--) {
+      const $el = $(allEls[i]);
+      const t = $el.text();
+      if (isHeadingLeaf($, $el) && t.length <= MAX_HEADING_TEXT_LENGTH && PERIOD_PHRASE_INDICATOR.test(t)) {
+        caption = t;
+        break;
+      }
+    }
+    if (TRAILING_PERIOD.test(text) || TRAILING_PERIOD.test(caption)) continue;
+    // Two period headings stacked in one table -- verified live: JD's reads
+    // "For the three months ended" over one block and "For the twelve months
+    // ended" over a second, and rows from both were mixed (twelve-month OCF
+    // 37,808 against three-month capex 5,063). Skipped rather than split.
+    const periodHeadingRows = $(table)
+      .find('tr')
+      .toArray()
+      .filter((tr) => {
+        const t = $(tr).text().replace(/\s+/g, ' ').trim();
+        return PERIOD_PHRASE_INDICATOR.test(t) && !/\d[\d,]{2,}/.test(t);
+      });
+    if (periodHeadingRows.length > 1) continue;
+    // The narrative sentence above can name the same period as the caption
+    // ("For the quarter ended March 31, 2026, ..." then "For the three months
+    // ended") -- one period, so phrases of the same length are merged.
+    const external = [];
+    for (const p of findExternalPeriodPhrases($, allEls, startIdx, tableIdx)) {
+      const same = external.find((e) => e.months === p.months);
+      if (!same) external.push({ ...p });
+      else if (!same.endMonthDay) same.endMonthDay = p.endMonthDay;
+    }
+    const result = extractFromTable($, table, targetEndYear, aliasMap, cumulativeFallbackConcepts, external, { sectionFree: true });
+    if (!result) continue;
+    // A full year is the annual report's job, and a twelve-month column in a
+    // release is usually trailing -- JD's second table, "For the twelve
+    // months ended March 31", was read as a cumulative period.
+    if (result.period.months >= 12) continue;
+    // Facts from two tables are combined only when they cover the same
+    // period -- JD's three-month capex was joined to its twelve-month OCF.
+    const samePeriod = (a, b) => a.months === b.months && a.endMonthDay === b.endMonthDay && a.year === b.year;
+    if (!merged) merged = result;
+    else if (samePeriod(merged.period, result.period)) merged = { period: merged.period, facts: { ...result.facts, ...merged.facts } };
+  }
+  return merged;
+}
+
 function extractMdaCashFlowSummary($, targetEndYear, aliasMap, cumulativeFallbackConcepts) {
   const allEls = $('body *').toArray();
   let merged = null;
@@ -3709,7 +3829,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // identically in the filing that reports it AND, a year later, in the
   // filing that shows it as the prior-year comparative column - literal
   // agreement between two independent real documents.
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), totalExpenses: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), totalExpenses: new Map(), ocf: new Map(), capex: new Map(), intangibleCapex: new Map(), totalCapex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -3807,7 +3927,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         // filer whose shares row really is separate (TNK) still finds
         // nothing extra here and is unaffected.
         const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, totalExpenses: aliasMap.totalExpenses, shares: aliasMap.shares }).filter(([, v]) => v));
-        const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+        const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex, intangibleCapex: aliasMap.intangibleCapex, totalCapex: aliasMap.totalCapex }).filter(([, v]) => v));
         // Balance-sheet (equity/debt/cash) R-files -- previously only ever
         // attempted via the slower exhibit-scan fallback below, even when
         // FilingSummary.xml already pointed straight at the right R-file
@@ -3898,7 +4018,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         // shares included in incomeAliases too -- see the identical addition
         // (and its own comment) in the FilingSummary/R-file branch above.
         const incomeAliases = { revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, totalExpenses: aliasMap.totalExpenses, shares: aliasMap.shares };
-        const cashflowAliases = { ocf: aliasMap.ocf, capex: aliasMap.capex };
+        const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex, intangibleCapex: aliasMap.intangibleCapex, totalCapex: aliasMap.totalCapex }).filter(([, v]) => v));
         const sharesAliases = { shares: aliasMap.shares };
         const relevantAliases =
           heading === STATEMENT_HEADINGS.income ? incomeAliases : heading === STATEMENT_HEADINGS.cashflow ? cashflowAliases : sharesAliases;
@@ -3968,7 +4088,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       // back false -- cheap, and harmless for a filer whose formal
       // statement already worked (any resulting duplicate still has to
       // independently pass reconcilePoints below).
-      const mdaCashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+      const mdaCashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex, intangibleCapex: aliasMap.intangibleCapex, totalCapex: aliasMap.totalCapex }).filter(([, v]) => v));
       if (Object.keys(mdaCashflowAliases).length) {
         for (const year of candidateYears) {
           let extracted;
@@ -3980,6 +4100,14 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           }
           if (debug) console.error('DEBUG extractMdaCashFlowSummary result', url, year, JSON.stringify(extracted));
           await recordExtracted(extracted, filing);
+          let fcf = null;
+          try {
+            fcf = extractFreeCashFlowReconciliation($, year, mdaCashflowAliases, cumulativeFallbackConcepts);
+          } catch (e) {
+            if (debug) console.error('DEBUG extractFreeCashFlowReconciliation threw', url, year, e.message);
+          }
+          if (debug) console.error('DEBUG extractFreeCashFlowReconciliation result', url, year, JSON.stringify(fcf));
+          await recordExtracted(fcf, filing);
         }
       }
 
@@ -4317,7 +4445,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
   }
   if (!filings.length) return {};
 
-  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), totalExpenses: new Map(), ocf: new Map(), capex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
+  const collected = { revenue: new Map(), netIncome: new Map(), ebit: new Map(), pretaxIncome: new Map(), totalExpenses: new Map(), ocf: new Map(), capex: new Map(), intangibleCapex: new Map(), totalCapex: new Map(), shares: new Map(), equity: new Map(), debt: new Map(), cash: new Map() };
   const aliasMap = {};
   for (const c of neededConcepts) if (LABEL_ALIASES[c]) aliasMap[c] = LABEL_ALIASES[c];
 
@@ -4368,7 +4496,7 @@ async function extractAnnualFactsFrom20F(cik, neededConcepts, annualByEnd, userA
   // shares included in incomeAliases too -- see the identical addition (and
   // its own comment) in extractQuarterlyFactsFromFilings' R-file branch.
   const incomeAliases = Object.fromEntries(Object.entries({ revenue: aliasMap.revenue, netIncome: aliasMap.netIncome, ebit: aliasMap.ebit, pretaxIncome: aliasMap.pretaxIncome, totalExpenses: aliasMap.totalExpenses, shares: aliasMap.shares }).filter(([, v]) => v));
-  const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex }).filter(([, v]) => v));
+  const cashflowAliases = Object.fromEntries(Object.entries({ ocf: aliasMap.ocf, capex: aliasMap.capex, intangibleCapex: aliasMap.intangibleCapex, totalCapex: aliasMap.totalCapex }).filter(([, v]) => v));
   const balanceSheetAliases = Object.fromEntries(Object.entries({ equity: aliasMap.equity, debt: aliasMap.debt, cash: aliasMap.cash }).filter(([, v]) => v));
   const sharesAliases = Object.fromEntries(Object.entries({ shares: aliasMap.shares }).filter(([, v]) => v));
 
@@ -5231,6 +5359,7 @@ module.exports = {
   parseDataRow,
   extractStatement,
   extractMdaCashFlowSummary,
+  extractFreeCashFlowReconciliation,
   subtractThreeMonths,
   monthDayYearToIso,
   reconcilePoints,

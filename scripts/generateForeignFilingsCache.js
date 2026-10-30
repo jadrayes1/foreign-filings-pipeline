@@ -152,6 +152,8 @@ const CAPEX_CONCEPTS = [
   'PaymentsToAcquireOtherPropertyPlantAndEquipment',
 ];
 const NET_INCOME_CONCEPTS = ['ProfitLoss', 'NetIncomeLoss'];
+// Read only by the yearly FCF-margin fallback -- see intangibleCapexFallback.
+const INTANGIBLE_CAPEX_CONCEPTS = ['PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities', 'PaymentsToAcquireIntangibleAssets'];
 const SHARES_CONCEPTS = ['WeightedAverageShares', 'WeightedAverageNumberOfSharesOutstandingBasic', 'WeightedAverageNumberOfDilutedSharesOutstanding'];
 
 // ROIC's inputs — verified live for two independent filers (BMO - Canadian
@@ -974,6 +976,14 @@ function buildRoicTTMTrend(ebitQuarterly, investedCapitalMap) {
 
 // Turns a published label ("Q1 '24", "FY '24") into a comparable ordinal
 // for sorting a merged trend back into chronological order.
+function sortByLabel(points) {
+  return [...points].sort((a, b) => {
+    const oa = parseLabelToOrdinal(a.label);
+    const ob = parseLabelToOrdinal(b.label);
+    return oa != null && ob != null ? oa - ob : 0;
+  });
+}
+
 function parseLabelToOrdinal(label) {
   const q = /^Q(\d) '(\d\d)$/.exec(label || '');
   if (q) return (2000 + Number(q[2])) * 4 + Number(q[1]);
@@ -1166,11 +1176,29 @@ function isRecentEnough(points, cutoffMonths = RECENCY_CUTOFF_MONTHS) {
 function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   const existing = migrateLegacyEntry(existingEntry);
   const out = {};
+  let usedFcfFallback = false;
   for (const cadence of ['quarterly', 'yearly', 'ttm']) {
     const merged = {};
     for (const key of ['revenueGrowth', 'profitMargin', 'fcfMargin', 'roic']) {
       const existingPoints = sanitizeCadencePoints(cadence, existing[cadence]?.[key]);
-      const picked = pickTrendToPublish(existingPoints, freshEntry?.[cadence]?.[key], key);
+      let picked = pickTrendToPublish(existingPoints, freshEntry?.[cadence]?.[key], key);
+      // A year already PUBLISHED is never touched. Any other year takes the
+      // fallback over the normal PP&E-only figure: for a filer like SBS the
+      // normal series was computed but never shown (it ended at FY '24, too
+      // old to publish), and mixing it in would put an overstated PP&E-only
+      // FCF (~20%) beside the real one (FY '25: -14%) in one chart.
+      // Only for a filer with no published yearly FCF margin at all -- or
+      // one already on this definition (fcfIntangibleCapex), so its later
+      // years keep the same capex definition as its earlier ones.
+      const publishedPoints = (existingPoints || []).filter((p) => p.value != null);
+      const onFallback = !publishedPoints.length || !!existingEntry?.fcfIntangibleCapex;
+      if (cadence === 'yearly' && key === 'fcfMargin' && onFallback && freshEntry?.yearlyFcfMarginFallback?.length) {
+        usedFcfFallback = true;
+        const published = new Set(publishedPoints.map((p) => p.label));
+        const fill = freshEntry.yearlyFcfMarginFallback.filter((p) => !published.has(p.label) && Number.isFinite(p.value));
+        const fillLabels = new Set(fill.map((p) => p.label));
+        if (fill.length) picked = sortByLabel([...picked.filter((p) => !fillLabels.has(p.label)), ...fill]);
+      }
       if (picked.length && isRecentEnough(picked)) merged[key] = picked;
     }
     if (Object.keys(merged).length) out[cadence] = merged;
@@ -1191,11 +1219,21 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   // same root fact about the ticker (no quarterly disclosure exists at
   // all), so the app applies this one ticker-level flag across every
   // metric rather than recomputing it per pipeline.
-  if (!out.quarterly && !out.ttm && out.yearly) {
+  // Only on evidence that the filer reports half-years -- verified live:
+  // Sabesp (SBS) files quarterly results, but no quarter was ever extracted
+  // from them, and "no quarterly data" alone flagged it, so the app told
+  // users it reports only half-yearly. A run that computed nothing keeps
+  // whatever the last one decided.
+  const hasFreshEntry = freshEntry && Object.keys(freshEntry).length;
+  const halfYearReporter = hasFreshEntry ? !!freshEntry.semiAnnualIncome : !!existingEntry?.annualOnlyFiler;
+  if (!out.quarterly && !out.ttm && out.yearly && halfYearReporter) {
     out.annualOnlyFiler = true;
   }
   // Fresh run's verdict wins when it produced anything; otherwise keep the
   // previous one rather than silently dropping a still-true disclosure fact.
+  // Published, so the next run stays on the same definition, and so the app
+  // can say its capex includes intangible investment.
+  if ((usedFcfFallback || existingEntry?.fcfIntangibleCapex) && out.yearly?.fcfMargin) out.fcfIntangibleCapex = true;
   for (const flag of ['semiAnnualCashFlow', 'semiAnnualBalanceSheet', 'noQuarterlyCapex']) {
     const hasFresh = freshEntry && Object.keys(freshEntry).length;
     if (hasFresh ? freshEntry[flag] : existingEntry?.[flag]) out[flag] = true;
@@ -1767,6 +1805,11 @@ async function processTicker(symbol, cik, isBank) {
 
   const investedCapitalMap = investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank);
 
+  // Yearly FCF margin for a filer whose main investment is intangible (a
+  // concession utility), used ONLY for a year with no FCF margin otherwise --
+  // see intangibleCapexFallback and pickCadenceTrendsToPublish.
+  const yearlyFcfMarginFallback = isBank ? [] : await intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue });
+
   const capexQByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
   const ocfWithCapexQuarterly = ocf.quarterly.filter((q) => capexQByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexQByEnd.get(q.end) }));
   const capexAByEnd = new Map(capex.annual.map((q) => [q.end, q.value]));
@@ -1847,7 +1890,10 @@ async function processTicker(symbol, cik, isBank) {
   // releases carry income-statement highlights only, so OCF/capex exist
   // solely as 6-month figures and the balance sheet solely at Jun 30 /
   // Dec 31. Neither will ever yield a standalone quarter.
+  if (yearlyFcfMarginFallback.length) result.yearlyFcfMarginFallback = yearlyFcfMarginFallback;
   if (isSemiAnnualFlow(ocf)) result.semiAnnualCashFlow = true;
+  // Read by pickCadenceTrendsToPublish's annualOnlyFiler, not published.
+  if (isSemiAnnualFlow(revenue) || isSemiAnnualFlow(netIncome)) result.semiAnnualIncome = true;
   if (isSemiAnnualInstant(equityInstant)) result.semiAnnualBalanceSheet = true;
   // Quarterly releases that carry operating cash flow but never break out
   // capex -- verified live: Sea Limited (SE)'s 6-K cash-flow table is a
@@ -1855,6 +1901,60 @@ async function processTicker(symbol, cik, isBank) {
   // only in prose, so quarterly FCF is impossible while the 20-F's is not.
   if (lacksQuarterlyCapex(ocf, capex)) result.noQuarterlyCapex = true;
   return Object.keys(result).length ? result : null;
+}
+
+// Capex for FCF is property and equipment, which understates a concession
+// utility by orders of magnitude -- verified live: Sabesp (SBS) invests
+// R$3.7-13.7B a year in intangible concession assets against R$0.05-0.15B of
+// PP&E, so it had no yearly FCF margin at all (and a PP&E-only one would read
+// ~95%). Only for a filer where intangible purchases outweigh PP&E in some
+// year, capex is taken as intangibles + PP&E -- or the annual report's own
+// combined line, which already includes both (SBS's FY2025 20-F: "Acquisition
+// of contract assets, intangible assets and property, plant and equipment",
+// R$13.74B; its FY2024 R$8.03B is exactly XBRL's 7.93B + 0.10B). Returns
+// yearly points that pickCadenceTrendsToPublish adds only where the normal
+// series has no point for that year.
+async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue }) {
+  const intangible = dedupeAndClassify(extractFactSeries(companyFacts, INTANGIBLE_CAPEX_CONCEPTS)).annual;
+  const ppeByEnd = new Map(capex.annual.map((a) => [a.end, Math.abs(a.value)]));
+  // Intangibles must clearly be the main investment: at least twice PP&E in
+  // most of (at least two) years where both are reported. Without both,
+  // nothing is inferred -- a filer whose PP&E sits under a concept this file
+  // doesn't read (BABA) would otherwise look intangible-led. Across all 1,109
+  // foreign filers this, plus having no published yearly FCF margin at all
+  // (see pickCadenceTrendsToPublish), leaves 39 -- concession utilities
+  // (SBS, CIG) and filers whose investment is capitalised software, content
+  // or development (DLO, PSFE, TME, PSNY); banks are excluded upstream.
+  const both = intangible.filter((a) => Math.abs(a.value) > 0 && (ppeByEnd.get(a.end) || 0) > 0);
+  const dominant = both.filter((a) => Math.abs(a.value) >= 2 * ppeByEnd.get(a.end));
+  if (both.length < 2 || dominant.length * 2 < both.length) return [];
+
+  const altByEnd = new Map();
+  for (const a of intangible) altByEnd.set(a.end, Math.abs(a.value) + (ppeByEnd.get(a.end) || 0));
+  // A year XBRL lacks, from the annual report: its combined line first,
+  // anchored on the XBRL years it overlaps; an intangibles-only line + PP&E
+  // otherwise.
+  if (process.env.ENABLE_20F_ANNUAL_FALLBACK) {
+    try {
+      const anchors = {
+        totalCapex: new Map([...altByEnd].map(([end, value]) => [end, { end, value }])),
+        intangibleCapex: new Map(intangible.map((a) => [a.end, { end: a.end, value: Math.abs(a.value) }])),
+      };
+      const facts = await extractAnnualFactsFrom20F(cik, ['totalCapex', 'intangibleCapex'], anchors, SEC_USER_AGENT, preferredUnit);
+      const annualOf = (list) => dedupeAndClassify(list || []).annual;
+      for (const a of annualOf(facts.intangibleCapex)) {
+        if (!altByEnd.has(a.end)) altByEnd.set(a.end, Math.abs(a.value) + (ppeByEnd.get(a.end) || 0));
+      }
+      for (const a of annualOf(facts.totalCapex)) {
+        if (!intangible.some((x) => x.end === a.end)) altByEnd.set(a.end, Math.abs(a.value));
+      }
+    } catch (err) {
+      console.warn(`  intangible capex 20-F read failed for ${symbol}: ${err.message}`);
+    }
+  }
+  const fcf = ocf.annual.filter((a) => altByEnd.has(a.end)).map((a) => ({ ...a, value: a.value - altByEnd.get(a.end) }));
+  if (!fcf.length || !revenue.annual.length) return [];
+  return buildAnnualRatioTrend(fcf, revenue.annual, (f, rev) => (rev ? f / rev : null));
 }
 
 const SEMI_ANNUAL_LOOKBACK_DAYS = 730;
