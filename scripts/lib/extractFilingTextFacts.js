@@ -944,7 +944,9 @@ const LABEL_ALIASES = {
     // (BRP/DOO's "Three-month periods ended"), just never applied here too.
     // "...of Class A and Class B ordinary shares" (VIPS) as well as "...of
     // (common) shares": up to a few words of share class before "shares".
-    include: /weighted[\s-]average (number of )?(?:(?:class [a-z]|and|ordinary|common|equity)\s+){0,6}shares?( outstanding)?/i,
+    // Or "Shares used in earnings per Class A and Class B ordinary share
+    // computation" over Basic/Diluted rows -- TME never says "weighted average".
+    include: /weighted[\s-]average (number of )?(?:(?:class [a-z]|and|ordinary|common|equity)\s+){0,6}shares?( outstanding)?|^shares used in (?:calculating |computing )?(?:basic and diluted )?(?:earnings|net (?:income|loss)|loss).*(?:computation|calculation)/i,
     exclude: /dilutive effect|per share/i,
   },
 };
@@ -3926,6 +3928,141 @@ async function fetchFilingSummaryReports(cik, accessionNumber, userAgent) {
   return reports;
 }
 
+// Statements typeset as running text rather than tables -- verified live:
+// Sabesp's (SBS) quarterly ITR 6-Ks flow every statement through <P> runs,
+// e.g. "Statements of Income for the Periods of three and six months ended
+// June 30, 2026 and 2025 In thousands of reais ... Consolidated Note April to
+// June 2026 January to June 2026 April to June 2025 January to June 2025 Net
+// operating revenue 31 10,208,902 20,173,744 8,964,530 17,390,730 ...". Read
+// only what this shape states unambiguously: the CONSOLIDATED income block
+// (revenue, operating profit, net income) and the consolidated columns of
+// the cash-flow statement (OCF). Every value then goes through the same
+// reconciliation against the annual report as any table-read figure.
+const PLAIN_TEXT_STATEMENT_HEADING = /Statements of (?:Income|Cash Flows) for the Periods/i;
+const PLAIN_TEXT_ROWS = {
+  revenue: /Net operating revenue/i,
+  ebit: /Profit from operations before financial income \(expenses\)/i,
+  netIncome: /Profit for the period(?! attributable)/i,
+  ocf: /Net cash (?:generated from|provided by|used in) operating activities/i,
+};
+const MONTH_INDEX = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
+
+// Brazil's standardised CVM statement form, also typeset as running text
+// (Sabesp's 2025 ITRs): "Consolidated Financial Statements / Statement of
+// Profit or Loss (in thousands of reais) Account code Account Description
+// Current Quarter 07/01/2025 to 09/30/2025 YTD Current Year 01/01/2025 to
+// 09/30/2025 ... 3.01 Revenue from Sales and/or Services 9,424,891 ...".
+// Lines are read by CVM's own account codes, the same for every filer.
+const CVM_CONSOLIDATED_HEADING = /Consolidated Financial Statements\s*\/\s*(?:Statement of Profit or Loss|Income Statement|Statement of Income|Statement of Cash Flows)/i;
+const CVM_CODES = { revenue: '3.01', ebit: '3.05', netIncome: '3.11', ocf: '6.01' };
+
+function extractCvmStatements(text, neededConcepts) {
+  const out = new Map();
+  const scaleOf = (s) => (/in thousands/i.test(s) ? 1000 : /in millions/i.test(s) ? 1000000 : 1);
+  const DATE_RANGE = /(\d{2})\/(\d{2})\/(\d{4}) to (\d{2})\/(\d{2})\/(\d{4})/g;
+  const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const blocks = [
+    { re: /Consolidated Financial Statements\s*\/\s*(?:Statement of Profit or Loss|Income Statement|Statement of Income)\s*(\([^)]*\))/gi, concepts: ['revenue', 'ebit', 'netIncome'] },
+    { re: /Consolidated Financial Statements\s*\/\s*Statement of Cash Flows[^(]{0,40}\([^)]*\)\s*(\([^)]*\))/gi, concepts: ['ocf'] },
+  ];
+  for (const { re, concepts } of blocks) {
+    let m;
+    while ((m = re.exec(text))) {
+      const scale = scaleOf(m[1]);
+      const head = text.slice(m.index + m[0].length, m.index + m[0].length + 600);
+      const firstCode = head.search(/\b[36]\.01 /);
+      if (firstCode < 0) continue;
+      const columns = [...head.slice(0, firstCode).matchAll(DATE_RANGE)].map((d) => {
+        const months = (Number(d[6]) - Number(d[3])) * 12 + (Number(d[4]) - Number(d[1])) + 1;
+        return { months, endMonthDay: `${MONTH_NAMES[Number(d[4]) - 1]} ${Number(d[5])}`, year: d[6] };
+      });
+      if (!columns.length || columns.some((c) => !(c.months >= 1 && c.months <= 12))) continue;
+      const body = text.slice(m.index + m[0].length, m.index + m[0].length + 8000);
+      for (const concept of concepts) {
+        if (!neededConcepts.includes(concept)) continue;
+        const code = CVM_CODES[concept].replace('.', '\\.');
+        const row = new RegExp(`(?:^|\\s)${code} [A-Za-z][^0-9]{0,120}?((?:\\s-?[\\d,]+){${columns.length}})(?=\\s|$)`).exec(body);
+        if (!row) continue;
+        const values = row[1].trim().split(/\s+/).map((v) => Number(v.replace(/,/g, '')));
+        columns.forEach((period, idx) => {
+          const key = `${period.months}|${period.endMonthDay}|${period.year}`;
+          if (!out.has(key)) out.set(key, { period, facts: {}, captionScale: scale });
+          out.get(key).facts[concept] = { label: `CVM ${CVM_CODES[concept]}`, value3mo: values[idx] * scale, valueCumulative: null };
+        });
+      }
+    }
+  }
+  return [...out.values()];
+}
+
+function extractPlainTextStatements(text, neededConcepts) {
+  const wanted = (concept) => neededConcepts.includes(concept);
+  const scaleOf = (block) => (/in thousands/i.test(block) ? 1000 : /in millions/i.test(block) ? 1000000 : 1);
+  const periodOf = (from, to, year) => {
+    const a = MONTH_INDEX[from.toLowerCase()];
+    const b = MONTH_INDEX[to.toLowerCase()];
+    if (a == null || b == null || b < a) return null;
+    const lastDay = new Date(Date.UTC(Number(year), b + 1, 0)).getUTCDate();
+    return { months: b - a + 1, endMonthDay: `${to[0].toUpperCase()}${to.slice(1).toLowerCase()} ${lastDay}`, year: String(year) };
+  };
+  const COLUMN = /(January|February|March|April|May|June|July|August|September|October|November|December) to (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4})/gi;
+  const VALUE = /^\(?-?\d[\d,]*(?:\.\d+)?\)?$/;
+  // The figures following a row label, up to the next word.
+  const valuesAfter = (block, labelRe, count) => {
+    const m = labelRe.exec(block);
+    if (!m) return null;
+    const tokens = block.slice(m.index + m[0].length).trim().split(' ');
+    const values = [];
+    for (const t of tokens) {
+      if (VALUE.test(t)) values.push(t);
+      else if (/^[-—–]$/.test(t)) values.push('0');
+      else if (/^\([a-z]\)$/i.test(t)) continue; // a note reference like "(c)"
+      else break;
+    }
+    if (values.length < count) return null;
+    return values.slice(values.length - count).map((v) => {
+      const n = Number(v.replace(/[(),]/g, ''));
+      return /^\(/.test(v) ? -n : n;
+    });
+  };
+  const out = new Map(); // "months|end|year" -> extracted
+  const record = (period, concept, value, scale) => {
+    const key = `${period.months}|${period.endMonthDay}|${period.year}`;
+    if (!out.has(key)) out.set(key, { period, facts: {}, captionScale: scale });
+    out.get(key).facts[concept] = { label: concept, value3mo: value * scale, valueCumulative: null };
+  };
+
+  // Income statement: the block headed "Consolidated", each column a period.
+  const incomeRe = /Statements of Income for the Periods.{0,200}?(In (?:thousands|millions) of [a-z]+).{0,80}?Consolidated (?:Note )?((?:(?:January|February|March|April|May|June|July|August|September|October|November|December) to (?:January|February|March|April|May|June|July|August|September|October|November|December) \d{4} ?){2,4})/gi;
+  let m;
+  while ((m = incomeRe.exec(text))) {
+    const columns = [...m[2].matchAll(COLUMN)].map((c) => periodOf(c[1], c[2], c[3]));
+    if (columns.some((c) => !c)) continue;
+    const block = text.slice(m.index + m[0].length, m.index + m[0].length + 4000);
+    const scale = scaleOf(m[1]);
+    for (const concept of ['revenue', 'ebit', 'netIncome']) {
+      if (!wanted(concept)) continue;
+      const values = valuesAfter(block, PLAIN_TEXT_ROWS[concept], columns.length);
+      if (values) columns.forEach((p, idx) => record(p, concept, values[idx], scale));
+    }
+  }
+
+  // Cash flows: "Individual Consolidated" groups side by side -- the
+  // consolidated columns are the second half of the header's periods.
+  if (wanted('ocf')) {
+    const cashRe = /Statements of Cash Flows for the Periods.{0,200}?(In (?:thousands|millions) of [a-z]+).{0,40}?Individual Consolidated ((?:(?:January|February|March|April|May|June|July|August|September|October|November|December) to (?:January|February|March|April|May|June|July|August|September|October|November|December) \d{4} ?){2,6})/gi;
+    while ((m = cashRe.exec(text))) {
+      const columns = [...m[2].matchAll(COLUMN)].map((c) => periodOf(c[1], c[2], c[3]));
+      if (!columns.length || columns.length % 2 || columns.some((c) => !c)) continue;
+      const half = columns.length / 2;
+      const block = text.slice(m.index + m[0].length, m.index + m[0].length + 12000);
+      const values = valuesAfter(block, PLAIN_TEXT_ROWS.ocf, columns.length);
+      if (values) columns.slice(half).forEach((p, idx) => record(p, 'ocf', values[half + idx], scaleOf(m[1])));
+    }
+  }
+  return [...out.values()];
+}
+
 /**
  * Extracts standalone-quarter facts for `neededConcepts` (subset of
  * ['revenue','netIncome','ocf','capex']) by scanning a ticker's recent 6-K
@@ -4166,9 +4303,29 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         // A data table, not a layout spacer: Sabesp's filings carry ~190
         // empty one-cell <TABLE>s as page breaks around plain-text statements.
         const isDataTable = (t) => $(t).find('tr').toArray().filter((tr) => /\d[\d,.]{2,}/.test($(tr).text())).length >= 3;
-        if ($('table').toArray().some(isDataTable)) {
+        const hasDataTable = $('table').toArray().some(isDataTable);
+        if (hasDataTable) {
           scan.withTables++;
           if (debug) console.error('DEBUG data-table document', url);
+        }
+        // Statements typeset as running text -- see extractPlainTextStatements.
+        // Its heading ("Statements of Income for the Periods of three and
+        // six months ended ...") is the Brazilian quarterly-statement (ITR)
+        // form; a document without it is never read this way. Sabesp's ITRs
+        // carry a few incidental tables, so this also runs beside the table
+        // reader; recordExtracted keeps one figure per filing and period.
+        if (PLAIN_TEXT_STATEMENT_HEADING.test(fullText) || CVM_CONSOLIDATED_HEADING.test(fullText)) {
+          const flat = fullText.replace(/\s+/g, ' ');
+          const plain = PLAIN_TEXT_STATEMENT_HEADING.test(flat) ? extractPlainTextStatements(flat, neededConcepts) : extractCvmStatements(flat, neededConcepts);
+          if (debug) console.error('DEBUG plain-text statements', url, JSON.stringify(plain));
+          for (const extracted of plain) {
+            if (extracted.period.months > 3) {
+              for (const concept of Object.keys(extracted.facts)) if (!cumulativeFallbackConcepts?.has?.(concept)) delete extracted.facts[concept];
+              if (!Object.keys(extracted.facts).length) continue;
+            }
+            await recordExtracted(extracted, filing);
+          }
+          if (!hasDataTable) continue;
         }
       }
       const hasIncome = STATEMENT_HEADINGS.income.test(fullText);
