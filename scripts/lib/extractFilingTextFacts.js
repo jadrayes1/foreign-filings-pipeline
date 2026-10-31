@@ -946,7 +946,7 @@ const LABEL_ALIASES = {
     // (common) shares": up to a few words of share class before "shares".
     // Or "Shares used in earnings per Class A and Class B ordinary share
     // computation" over Basic/Diluted rows -- TME never says "weighted average".
-    include: /weighted[\s-]average (number of )?(?:(?:class [a-z]|and|ordinary|common|equity)\s+){0,6}shares?( outstanding)?|^shares used in (?:calculating |computing )?(?:basic and diluted )?(?:earnings|net (?:income|loss)|loss).*(?:computation|calculation)/i,
+    include: /weighted[\s-]average (number of )?(?:(?:class [a-z]|and|ordinary|common|equity)\s+){0,6}shares?( outstanding)?|^shares used in (?:calculating |computing )?(?:basic and diluted )?(?:earnings|net (?:income|loss)|loss).*(?:computation|calculation)|^total shares outstanding$/i,
     exclude: /dilutive effect|per share/i,
   },
 };
@@ -2944,7 +2944,18 @@ function instantTextBlocks($) {
 }
 
 function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency = null) {
-  const parsed = parseTableColumns($, table, [], preferredCurrency);
+  let parsed = parseTableColumns($, table, [], preferredCurrency);
+  // A share-count page states counts AS OF dates, with no period heading
+  // (CIG: "... Earnings Per Share (Details) - shares | Dec. 31, 2025 | ...").
+  // Only there, and only for the share count, each date is read as the year
+  // ending on it -- a year-end count standing in for the year's average.
+  if (!parsed && aliasMap.shares && Object.keys(aliasMap).length === 1 && /\breport\b/.test($(table).attr('class') || '')) {
+    const headerCells = nonEmptyCells($, $(table).find('tr').first()[0]);
+    if (/earnings per share[^]*?-\s*shares\b/i.test(headerCells.map((c) => c.text).join(' '))) {
+      const dates = headerCells.map((c) => parseDateHeaderCell(c.text)).filter((d) => d && d.monthDay);
+      if (dates.length) parsed = { columns: dates.map((d) => ({ months: 12, endMonthDay: d.monthDay, year: d.year, currency: null })), dataStartRowIdx: 1 };
+    }
+  }
   if (!parsed) return [];
   const { columns, dataStartRowIdx, rawColumnCount, valueIndices } = parsed;
   // See extractFromTable's identical handling — only set by
@@ -2958,6 +2969,11 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
   const rows = $(table).find('tr').toArray();
   const candidatesByColumn = annualIdxs.map(() => ({})); // concept -> [{label, value}]
   const renderedBySec = /\breport\b/.test($(table).attr('class') || '');
+  // An SEC-rendered "Earnings Per Share (Details) - shares" page whose only
+  // share count is a bare "Total" row -- verified live: CIG lists common
+  // and preferred shares, then "Total 2,860,681,883", and has no share
+  // count anywhere else, so it had no P/E at any cadence.
+  const sharesTotalPage = renderedBySec && /earnings per share[^]*?-\s*shares\b/i.test($(table).find('tr').first().text());
   const sectionDataByColumn = annualIdxs.map(() => ({})); // section -> {sum, subtotal}
   let currentSection = null;
   let advanceToSection = null; // see NEXT_CASH_FLOW_SECTION
@@ -3003,6 +3019,7 @@ function extractAllAnnualColumnsFromTable($, table, aliasMap, preferredCurrency 
     }
     if (isSubtotalRow) leadIn = null;
     const row = parseDataRow(cells, parsedRowColumnCount);
+    if (row && sharesTotalPage && /^total$/i.test(row.label.trim())) row.label = 'Total shares outstanding';
     if (!row) {
       const headerText = rowText.trim();
       leadIn = headerText.endsWith(':') ? headerText : null;
