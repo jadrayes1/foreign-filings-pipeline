@@ -415,14 +415,75 @@ function fixTextScale(quarterly, annual, { perQuarter, fit }) {
   return out;
 }
 
+function fillSharesFromStableAnnual(quarterlyShares, annualShares, quarterlyIncome) {
+  const have = new Set(quarterlyShares.map((p) => p.end));
+  const annual = [...(annualShares || [])].filter((a) => a.value > 0).sort((a, b) => a.end.localeCompare(b.end));
+  if (!annual.length) return quarterlyShares;
+  const DAY = 86400000;
+  const added = [];
+  for (const q of quarterlyIncome || []) {
+    if (have.has(q.end)) continue;
+    const t = Date.parse(q.end);
+    const before = [...annual].reverse().find((a) => Date.parse(a.end) <= t);
+    const after = annual.find((a) => Date.parse(a.end) >= t);
+    const nearest = [before, after].filter(Boolean).sort((x, y) => Math.abs(Date.parse(x.end) - t) - Math.abs(Date.parse(y.end) - t))[0];
+    if (!nearest || Math.abs(Date.parse(nearest.end) - t) > 200 * DAY) continue;
+    const bracket = [before, after].filter(Boolean).map((a) => a.value);
+    if (Math.max(...bracket) / Math.min(...bracket) > 1.05) continue;
+    added.push({ start: q.start, end: q.end, value: nearest.value, fromAnnual: true });
+  }
+  if (!added.length) return quarterlyShares;
+  return [...quarterlyShares, ...added].sort((a, b) => a.end.localeCompare(b.end));
+}
+
 // Puts every share count on today's basis: multiplied by each later split's
 // factor. A count filed between the last old-basis filing and the first
 // new-basis one could be either, so it is dropped; a count with no filing
 // date is left as it is.
 function splitAdjust(facts, events) {
   if (!events.length) return facts;
+  // A listed split with share counts already filed after it: statements
+  // issued just before a split can already be restated for it -- verified
+  // live: Sabesp's FY2025 20-F (filed 2026-04-29) shows post-split counts
+  // (3,419.5M) for its 2026-05-07 5-for-1. Then a count filed earlier is
+  // on the old basis only if the split ratio brings it within 10% of the
+  // nearest new-basis count (683.5M x 5); the rest are left as they are.
+  const newBasis = new Map();
+  for (const e of events) {
+    if (!e.listed) continue;
+    let after = facts.filter((f) => f.filed && f.filed >= e.by && f.val > 0);
+    // None filed after it: counts that are the split ratio times others
+    // already filed are themselves restated (Sabesp: 3,419.5M = 5 x 683.5M,
+    // both filed before the split). With no such pair (ZBAO) the filing-date
+    // rule below applies to everything.
+    if (!after.length) {
+      const positive = facts.filter((f) => f.val > 0);
+      after = positive.filter((f) => positive.some((g) => Math.abs(f.val / (g.val * e.factor) - 1) <= 0.1));
+    }
+    if (after.length) newBasis.set(e, after);
+  }
   const out = [];
-  for (const f of facts) {
+  for (let f of facts) {
+    const listedChecks = [...newBasis.entries()].filter(([e]) => f.filed && f.filed <= e.after);
+    if (listedChecks.length) {
+      let val = f.val;
+      for (const [e, after] of listedChecks) {
+        if (after.includes(f)) continue;
+        const nearest = after.reduce((b, a) => (Math.abs(Date.parse(a.end) - Date.parse(f.end)) < Math.abs(Date.parse(b.end) - Date.parse(f.end)) ? a : b));
+        if (Math.abs((val * e.factor) / nearest.val - 1) <= 0.1) val *= e.factor;
+      }
+      // Any other (unlisted) splits still apply by filing date below.
+      f = { ...f, val };
+      const rest = events.filter((e) => !newBasis.has(e));
+      let factor = 1;
+      let ambiguous = false;
+      for (const e of rest) {
+        if (f.filed <= e.after) factor *= e.factor;
+        else if (f.filed < e.by) ambiguous = true;
+      }
+      if (!ambiguous) out.push(factor === 1 ? f : { ...f, val: f.val * factor });
+      continue;
+    }
     if (!f.filed) {
       out.push(f);
       continue;
@@ -1305,11 +1366,23 @@ async function main() {
         // detectSplitEvents.
         const yahooSplits = await fetchYahooSplits(symbol);
         const splitEvents = detectSplitEvents(sharesRaw, companyFacts?.facts?.dei?.EntityCommonStockSharesOutstanding?.units?.shares || [], yahooSplits);
-        const latestSharesFiled = sharesRaw.reduce((m, f) => (f.filed && f.filed > m ? f.filed : m), '');
+        // With no XBRL share facts at all (Sabesp/SBS: counts come only from
+        // its reports), the newest XBRL filing of any kind marks where the
+        // restated record ends -- otherwise its 5-for-1 split of 2026-05-07
+        // was never applied and pre-split counts (683.5M) sat beside
+        // post-split ones (3,419.5M).
+        let latestSharesFiled = sharesRaw.reduce((m, f) => (f.filed && f.filed > m ? f.filed : m), '');
+        if (!latestSharesFiled) {
+          for (const tax of Object.values(companyFacts?.facts || {})) {
+            for (const entry of Object.values(tax)) {
+              for (const list of Object.values(entry.units || {})) for (const f of list) if (f.filed && f.filed > latestSharesFiled) latestSharesFiled = f.filed;
+            }
+          }
+        }
         for (const y of yahooSplits) {
           // Dated exactly, so anything filed before it is on the old basis.
           const dayBefore = new Date(Date.parse(y.date) - 86400000).toISOString().slice(0, 10);
-          if (latestSharesFiled && y.date > latestSharesFiled) splitEvents.push({ after: dayBefore, by: y.date, factor: y.factor });
+          if (latestSharesFiled && y.date > latestSharesFiled) splitEvents.push({ after: dayBefore, by: y.date, factor: y.factor, listed: true });
         }
         if (splitEvents.length) {
           console.log(`  ${symbol}: share splits ${splitEvents.map((e) => `x${+e.factor.toPrecision(4)} between ${e.after} and ${e.by}`).join('; ')}`);
@@ -1553,6 +1626,14 @@ async function main() {
         // Prices are USD; bring every monetary series to USD to match. The
         // 20-F and 6-K text paths both keep the filer's own column and drop
         // a USD convenience one, so their facts are in reportingCurrency too.
+        // A quarter with net income but no share count borrows the nearest
+        // annual count -- verified live: Sabesp (SBS) states quarterly net
+        // income but no quarterly share count anywhere, so it had no
+        // quarterly P/E, while its share count has sat at ~683.5M for years.
+        // Only where the annual counts on either side agree within 5%: a
+        // filer issuing or buying back materially gets no estimate.
+        shares = { ...shares, quarterly: fillSharesFromStableAnnual(shares.quarterly, shares.annual, netIncome.quarterly) };
+
         // Text-extracted figures in the wrong unit -- see fixTextScale. Run
         // before any conversion, so figure and anchor share one currency.
         shares = { ...shares, quarterly: fixTextScale(shares.quarterly, shares.annual, { perQuarter: false, fit: 2 }) };
