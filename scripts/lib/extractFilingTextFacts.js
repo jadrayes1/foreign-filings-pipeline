@@ -39,6 +39,10 @@ const cheerio = require('cheerio');
 const SEC_SUBMISSIONS_BASE = 'https://data.sec.gov/submissions';
 const SEC_ARCHIVES_BASE = 'https://www.sec.gov/Archives/edgar/data';
 const MAX_FILINGS_TO_SCAN = 25; // ~2 years of quarters for a normal quarterly filer
+// See extractQuarterlyFactsFromFilings' scan loop: up to this many when few
+// of the first 25 carried an income statement.
+const MAX_FILINGS_TO_SCAN_EXTENDED = 100;
+const MIN_INCOME_FILINGS_BEFORE_STOP = 8;
 // 3, not 1 or 2 -- deliberately buys cross-filing corroboration (Check C),
 // not just raw coverage: a 20-F's own comparative table already carries
 // 2-3 fiscal years, so two CONSECUTIVE 20-Fs overlap in 2 of their 3 years,
@@ -442,12 +446,13 @@ const STATEMENT_HEADINGS = {
   // already documented above for BBUC/DOO. The real table gives ZTO's
   // standalone "Three Months Ended" figures directly, side by side with
   // the "Six Months Ended" cumulative column -- no decumulation needed.
-  // "Income Statement" alone as a heading cell, "Income Statement R$
+  // "REPORTED INCOME STATEMENT (CONSOLIDATED)" (Sabesp/SBS, never its
+  // "ADJUSTED ..." non-GAAP twin), "Income Statement" alone as a heading cell, "Income Statement R$
   // million" in running text -- CIG's quarterly release names no
   // "consolidated"; prose merely mentioning an income statement matches
   // neither form.
   income:
-    /^\s*INCOME\s+STATEMENT\s*$|INCOME\s+STATEMENT\s+(?:R\$|US\$|RMB|€|£)\s*(?:mn|million|thousand)|CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+(?:COMPREHENSIVE\s+)?INCOME\s+DATA/i,
+    /(?<!ADJUSTED\s)INCOME\s+STATEMENT\s*\(CONSOLIDATED\)|^\s*INCOME\s+STATEMENT\s*$|INCOME\s+STATEMENT\s+(?:R\$|US\$|RMB|€|£)\s*(?:mn|million|thousand)|CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(STATEMENTS?\s+OF\s+(COMPREHENSIVE\s+|NET\s+)?INCOME|STATEMENTS?\s+OF\s+OPERATIONS|STATEMENTS?\s+OF\s+OPERATING\s+RESULTS|STATEMENTS?\s+OF\s+EARNINGS|INCOME\s+STATEMENTS?|STATEMENTS?\s+OF\s+PROFIT\s+OR\s+LOSS|STATEMENTS?\s+OF\s+LOSS(?:\s+AND\s+COMPREHENSIVE\s+LOSS)?)|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+(?:COMPREHENSIVE\s+)?INCOME\s+DATA/i,
   // "FLOWS?" (trailing S optional) -- verified live: DHT's cash-flow
   // statement is headed "CONSOLIDATED\nSTATEMENT OF CASH FLOW (UNAUDITED)",
   // genuinely singular throughout ("Statement", not "Statements"; "Flow",
@@ -457,14 +462,15 @@ const STATEMENT_HEADINGS = {
   // of DHT's real documents as a result, so capex/ocf extraction never
   // even attempted to run for this filer.
   cashflow:
-    /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS?\s+OF\s+CASH\s*FLOWS?|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+CASH\s*FLOWS?\s+DATA/i,
+    /STATEMENTS?\s+OF\s+CASH\s*FLOWS?\s*\(CONSOLIDATED\)|CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*STATEMENTS?\s+OF\s+CASH\s*FLOWS?|SUMMARY\s+OF\s+(?:UNAUDITED\s+|CONDENSED\s+|INTERIM\s+)*CONSOLIDATED\s+CASH\s*FLOWS?\s+DATA/i,
   // Not anchored on "CONSOLIDATED" needing to be the very first word — same
   // reasoning as income/cashflow above (the regex isn't `^`-anchored, so
   // "Condensed Consolidated Balance Sheets" still matches via the
   // "Consolidated Balance Sheets" substring). Verified live: STNG uses
   // "Condensed Consolidated Balance Sheets", IAG uses plain "Consolidated
   // Balance Sheets" with no extra qualifiers.
-  balanceSheet: /CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(BALANCE\s+SHEETS?|STATEMENTS?\s+OF\s+FINANCIAL\s+POSITION)/i,
+  // "BALANCE SHEET (CONSOLIDATED)" -- Sabesp/SBS, same suffix form as above.
+  balanceSheet: /BALANCE\s+SHEETS?\s*\(CONSOLIDATED\)|CONSOLIDATED\s+(?:CONDENSED\s+|INTERIM\s+|UNAUDITED\s+)*(BALANCE\s+SHEETS?|STATEMENTS?\s+OF\s+FINANCIAL\s+POSITION)/i,
   // Weighted-average share count lives in its OWN note, not under the main
   // income-statement heading -- verified live: TNK's real income
   // statement table has no share-count row at all; the actual "Weighted
@@ -1503,6 +1509,18 @@ function parseTableColumns($, table, externalPeriodPhrases = [], preferredCurren
         })
         .filter(Boolean);
       if (compactQuarterCells.length >= 1) {
+        // "1Q26 | 1Q25 | Var. (R$) | %" -- Sabesp/SBS: a change column and a
+        // percent column whose values carry no "%" sign, so every row had
+        // four values for two quarters and none parsed. Their positions are
+        // skipped. "Change" headers (CPA) are not this: their values are
+        // marked "%" and parseDataRow already drops them.
+        const isQuarterCell = (t) => /^([1-4])Q(\d{2})$/.test(t) || /^Q([1-4])\s+((?:19|20)\d{2})$/.test(t) || (primaryQuarterNum && /^YTD(\d{2})$/.test(t));
+        const isChangeCell = (t) => /^var\.?(\s*\([^)]*\))?$/i.test(t) || t === '%';
+        const valueHeaders = cells.map((c) => c.text.trim()).filter((t) => isQuarterCell(t) || isChangeCell(t));
+        if (valueHeaders.some(isChangeCell)) {
+          const valueIndices = valueHeaders.map((t, idx) => (isQuarterCell(t) ? idx : -1)).filter((idx) => idx !== -1);
+          return { columns: compactQuarterCells, dataStartRowIdx: i + 1, rawColumnCount: valueHeaders.length, valueIndices };
+        }
         return { columns: compactQuarterCells, dataStartRowIdx: i + 1 };
       }
     }
@@ -3930,10 +3948,11 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   if (!submissions?.filings?.recent) return {};
 
   const minSubstantiveBytes = MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES[symbol] ?? MIN_SUBSTANTIVE_FILING_BYTES;
+  const scan = { documents: 0, withTables: 0 };
   const nativeCurrency = options.skipNativeConversion ? null : NATIVE_CURRENCY_OVERRIDES[symbol] || null;
   const r = submissions.filings.recent;
   const filings = [];
-  for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN; i++) {
+  for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN_EXTENDED; i++) {
     const size = r.size?.[i];
     if (r.form[i] === '6-K' && (size == null || size >= minSubstantiveBytes)) {
       filings.push({ accessionNumber: r.accessionNumber[i], filingDate: r.filingDate[i] });
@@ -4027,7 +4046,18 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     }
   }
 
+  // Filings that carried an income statement, for the extended scan below.
+  let incomeFilings = 0;
+  let scannedFilings = 0;
   for (const filing of filings) {
+    // Past the usual 25, keep going only while few of them were earnings
+    // releases -- verified live: Alibaba files ~110 large 6-Ks a year
+    // (buybacks, AGM, deals), so its 25 most recent held one results
+    // release and BABA had one quarter. A filer whose recent 6-Ks are its
+    // results stops at 25 as before.
+    if (scannedFilings >= MAX_FILINGS_TO_SCAN && incomeFilings >= MIN_INCOME_FILINGS_BEFORE_STOP) break;
+    scannedFilings++;
+    let sawIncome = false;
     // FilingSummary.xml path first — SEC's own manifest for Inline XBRL
     // filings, pointing directly at the exact page for each statement
     // (verified live: GreenFire Resources/GFR's R3.htm is authoritatively
@@ -4069,6 +4099,10 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           ...(Object.keys(sharesAliases).length ? reports.filter((rep) => STATEMENT_HEADINGS.earningsPerShare.test(rep.shortName) || STATEMENT_HEADINGS.earningsPerShare.test(rep.longName)).map((rep) => ({ rep, aliases: sharesAliases, instant: false })) : []),
         ];
         if (matches.length) usedFilingSummary = true;
+        if (reports.some((rep) => STATEMENT_HEADINGS.income.test(rep.shortName) || STATEMENT_HEADINGS.income.test(rep.longName)) && !sawIncome) {
+          sawIncome = true;
+          incomeFilings++;
+        }
         for (const { rep, aliases, instant } of matches) {
           const accessionNoDashes = filing.accessionNumber.replace(/-/g, '');
           const rUrl = `${SEC_ARCHIVES_BASE}/${Number(cik)}/${accessionNoDashes}/${rep.htmlFileName}`;
@@ -4126,7 +4160,22 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       if (!html) { if (debug) console.error('DEBUG empty html', url); continue; }
       const $ = cheerio.load(html);
       const fullText = $('body').text();
+      // How many documents had any table at all -- see `scan` on the result.
+      if (fullText.length >= MIN_EXHIBIT_BYTES / 4) {
+        scan.documents++;
+        // A data table, not a layout spacer: Sabesp's filings carry ~190
+        // empty one-cell <TABLE>s as page breaks around plain-text statements.
+        const isDataTable = (t) => $(t).find('tr').toArray().filter((tr) => /\d[\d,.]{2,}/.test($(tr).text())).length >= 3;
+        if ($('table').toArray().some(isDataTable)) {
+          scan.withTables++;
+          if (debug) console.error('DEBUG data-table document', url);
+        }
+      }
       const hasIncome = STATEMENT_HEADINGS.income.test(fullText);
+      if (hasIncome && !sawIncome) {
+        sawIncome = true;
+        incomeFilings++;
+      }
       const hasCashflow = STATEMENT_HEADINGS.cashflow.test(fullText);
       const hasBalanceSheet = STATEMENT_HEADINGS.balanceSheet.test(fullText);
       const hasEarningsPerShare = STATEMENT_HEADINGS.earningsPerShare.test(fullText);
@@ -4515,6 +4564,10 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       result[concept] = verified.map((p) => ({ start: p.start, end: p.end, val: p.val, filed: p.filed }));
     }
   }
+  // Not enumerable, so callers walking the facts never see it: lets a caller
+  // tell "its quarterly filings have no tables at all" (Sabesp/SBS files
+  // plain text) from an ordinary extraction gap.
+  Object.defineProperty(result, 'scan', { value: scan, enumerable: false });
   return result;
 }
 

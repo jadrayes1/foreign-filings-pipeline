@@ -1234,7 +1234,7 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
   // Published, so the next run stays on the same definition, and so the app
   // can say its capex includes intangible investment.
   if ((usedFcfFallback || existingEntry?.fcfIntangibleCapex) && out.yearly?.fcfMargin) out.fcfIntangibleCapex = true;
-  for (const flag of ['semiAnnualCashFlow', 'semiAnnualBalanceSheet', 'noQuarterlyCapex']) {
+  for (const flag of ['semiAnnualCashFlow', 'semiAnnualBalanceSheet', 'noQuarterlyCapex', 'quarterlyNoTables']) {
     const hasFresh = freshEntry && Object.keys(freshEntry).length;
     if (hasFresh ? freshEntry[flag] : existingEntry?.[flag]) out[flag] = true;
   }
@@ -1491,6 +1491,7 @@ async function processTicker(symbol, cik, isBank) {
   // .annual points, which dedupeAndClassify can't re-consume (different
   // shape: {value}, not {val,filed}) -- can see what this pass found.
   let filingTextFacts = {};
+  let quarterlyNoTables = false;
   if (process.env.ENABLE_FILING_TEXT_FALLBACK) {
     const allowlist = process.env.FILING_TEXT_FALLBACK_TICKERS
       ? new Set(process.env.FILING_TEXT_FALLBACK_TICKERS.split(',').map((s) => s.trim().toUpperCase()))
@@ -1582,6 +1583,11 @@ async function processTicker(symbol, cik, isBank) {
         });
         try {
           filingTextFacts = await extractQuarterlyFactsFromFilings(cik, needed, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts, symbol);
+          // Every quarterly document is table-less text (Sabesp/SBS): no
+          // quarter can ever be read from them, which the app should say
+          // rather than "not available yet".
+          const scan = filingTextFacts.scan;
+          if (scan && scan.documents >= 2 && scan.withTables === 0) quarterlyNoTables = true;
         } catch (err) {
           console.warn(`  filing-text fallback failed for ${symbol}: ${err.message}`);
         }
@@ -1906,6 +1912,7 @@ async function processTicker(symbol, cik, isBank) {
   // solely as 6-month figures and the balance sheet solely at Jun 30 /
   // Dec 31. Neither will ever yield a standalone quarter.
   if (yearlyFcfMarginFallback.length) result.yearlyFcfMarginFallback = yearlyFcfMarginFallback;
+  if (quarterlyNoTables && !Object.keys(quarterly).length) result.quarterlyNoTables = true;
   if (isSemiAnnualFlow(ocf)) result.semiAnnualCashFlow = true;
   // Read by pickCadenceTrendsToPublish's annualOnlyFiler, not published.
   if (isSemiAnnualFlow(revenue) || isSemiAnnualFlow(netIncome)) result.semiAnnualIncome = true;

@@ -137,7 +137,8 @@ const NUMBER_WORDS = {
   one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
   eleven: 11, twelve: 12, fifteen: 15, sixteen: 16, twenty: 20, thirty: 30, forty: 40, fifty: 50, hundred: 100,
 };
-const RATIO_NUMBER = `(\\d+(?:\\.\\d+)?|${Object.keys(NUMBER_WORDS).join('|')})(?:\\s*\\(\\d+\\))?`;
+// "4,000" too -- SCNI's cover reads "each representing 4,000 ordinary share".
+const RATIO_NUMBER = `(\\d{1,3}(?:,\\d{3})+|\\d+(?:\\.\\d+)?|${Object.keys(NUMBER_WORDS).join('|')})(?:\\s*\\(\\d+\\))?`;
 // Up to two words between the number and "shares": a class ("Class A",
 // "20 B Shares" -- AMX) or the company's own name ("four Diageo ordinary
 // shares" -- DEO).
@@ -156,6 +157,8 @@ const ADS_RATIO_PATTERNS = [
   `(?:american depositary shares|adss)(?:\\s*,?\\s*or\\s+adss)?\\s*(?:\\([^)]{0,100}\\))?,?\\s*(?:each\\s+)?${REPRESENTS}\\s+${RATIO_NUMBER}\\s+${ORDINARY_SHARES}`,
   `${RATIO_NUMBER}\\s+(?:[\\w.&'-]+\\s+){0,2}?(?:ordinary|common)\\s+shares?\\s+(?:per|for each|represented by one|=)\\s*(?:one\\s+)?(?:american depositary share|ads)`,
 ];
+const ADS_COVER_PAGE_CHARS = 4000; // the registration table, read from its own heading
+
 function parseRatioNumber(text) {
   const t = text.toLowerCase().trim();
   if (NUMBER_WORDS[t] != null) return NUMBER_WORDS[t];
@@ -185,6 +188,20 @@ async function fetchAdsRatio(cik) {
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;|&#160;|&#xa0;/gi, ' ')
     .replace(/\s+/g, ' ');
+  // The cover page's registration table states the CURRENT ratio; later
+  // prose can quote old ones -- verified live: CCU's cover says "each
+  // representing two shares" while its history section says "five" (1992),
+  // and TKC's cover says 2.5 while a later line reads "two ADSs represent
+  // five". A ratio on the cover wins outright.
+  // Located by its own heading -- an inline-XBRL document's hidden data
+  // block can push the cover well past the first characters (CCU, TKC).
+  const coverAt = text.search(/registered\s+pursuant\s+to\s+section\s+12\s*\(\s*b\s*\)/i);
+  const cover = coverAt >= 0 ? text.slice(coverAt, coverAt + ADS_COVER_PAGE_CHARS) : text.slice(0, ADS_COVER_PAGE_CHARS);
+  for (const source of ADS_RATIO_PATTERNS) {
+    const m = new RegExp(source, 'i').exec(cover);
+    const v = m && parseRatioNumber(m[1]);
+    if (v) return v;
+  }
   const counts = new Map();
   for (const source of ADS_RATIO_PATTERNS) {
     const re = new RegExp(source, 'gi');
@@ -362,6 +379,39 @@ function dropShareOutliers(points, facts = []) {
       .sort((a, b) => String(b.filed).localeCompare(String(a.filed)))[0];
     if (alternative) out.push({ ...p, value: alternative.val });
   });
+  return out;
+}
+
+// A figure read from release text (no XBRL accession) checked against the
+// filer's own annual XBRL figure. Verified live: PDD's 6-K share counts came
+// through in thousands (5,509,682 for 5.5 billion) and its Q1/Q2 2026 net
+// income in the wrong unit, giving quarterly P/E 0.01 -- quarters with no
+// annual report yet to reconcile against. 300x or more off its anchor (the
+// nearest annual share count; a quarter of the nearest annual flow) is a
+// unit error: rescaled by 1,000 or 1,000,000 when that lands it within
+// `fit` of the anchor, dropped otherwise. XBRL figures are left alone.
+function fixTextScale(quarterly, annual, { perQuarter, fit }) {
+  const anchors = (annual || []).filter((a) => a.accn && Number.isFinite(a.value) && a.value !== 0);
+  if (!anchors.length) return quarterly;
+  const nearest = (end) => anchors.reduce((best, a) => (Math.abs(new Date(a.end) - new Date(end)) < Math.abs(new Date(best.end) - new Date(end)) ? a : best));
+  const out = [];
+  for (const p of quarterly) {
+    if (p.accn || !Number.isFinite(p.value) || p.value === 0) {
+      out.push(p);
+      continue;
+    }
+    const ref = Math.abs(nearest(p.end).value) / (perQuarter ? 4 : 1);
+    const ratio = Math.abs(p.value) / ref;
+    if (ratio < 300 && ratio > 1 / 300) {
+      out.push(p);
+      continue;
+    }
+    const scale = [1000, 1000000, 0.001, 0.000001].find((k) => {
+      const r = (Math.abs(p.value) * k) / ref;
+      return r <= fit && r >= 1 / fit;
+    });
+    if (scale) out.push({ ...p, value: p.value * scale });
+  }
   return out;
 }
 
@@ -1503,6 +1553,13 @@ async function main() {
         // Prices are USD; bring every monetary series to USD to match. The
         // 20-F and 6-K text paths both keep the filer's own column and drop
         // a USD convenience one, so their facts are in reportingCurrency too.
+        // Text-extracted figures in the wrong unit -- see fixTextScale. Run
+        // before any conversion, so figure and anchor share one currency.
+        shares = { ...shares, quarterly: fixTextScale(shares.quarterly, shares.annual, { perQuarter: false, fit: 2 }) };
+        netIncome = { ...netIncome, quarterly: fixTextScale(netIncome.quarterly, netIncome.annual, { perQuarter: true, fit: 30 }) };
+        ocf = { ...ocf, quarterly: fixTextScale(ocf.quarterly, ocf.annual, { perQuarter: true, fit: 30 }) };
+        capex = { ...capex, quarterly: fixTextScale(capex.quarterly, capex.annual, { perQuarter: true, fit: 30 }) };
+
         // Shares per US-listed share -- see fetchAdsRatio. An unreadable
         // ratio leaves no share count, so nothing per-share is published.
         const adsRatio = await fetchAdsRatio(cik);
@@ -1522,6 +1579,14 @@ async function main() {
                 for (const f of list) if (f.accn && f.end && (!filingEnds.has(f.accn) || f.end > filingEnds.get(f.accn))) filingEnds.set(f.accn, f.end);
               }
             }
+          }
+          // Quarterly/TTM are left out once IAS 29 applies: each quarter
+          // is in its own quarter's purchasing power, and a TTM sum of four
+          // mixes them -- verified live: GGAL/TEO TTM P/E 0.1-0.3 beside
+          // yearly 4-6. Yearly figures are stated consistently per report.
+          const hyperFrom = HYPERINFLATION_FROM[reportingCurrency];
+          if (hyperFrom) {
+            for (const series of [ocf, capex, netIncome]) series.quarterly = series.quarterly.filter((p) => p.end < hyperFrom);
           }
           ocf = await convertSeriesToUsd(ocf, reportingCurrency, filingEnds);
           capex = await convertSeriesToUsd(capex, reportingCurrency, filingEnds);
