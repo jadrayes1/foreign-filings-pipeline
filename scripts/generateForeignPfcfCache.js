@@ -519,6 +519,15 @@ const PRICE_HISTORY_MONTHS = 120;
 
 async function fetchMonthlyPrices(symbol, apiKey, retried = false) {
   const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=${PRICE_HISTORY_MONTHS}&apikey=${apiKey}`);
+  // Out of credits can also come back as a real HTTP 429 (verified live,
+  // 2026-10-31) -- waited out once, then the run ends like the in-body case.
+  if (res.status === 429) {
+    if (!retried) {
+      await sleep(61000);
+      return fetchMonthlyPrices(symbol, apiKey, true);
+    }
+    throw Object.assign(new Error(`Twelve Data credits exhausted (HTTP 429) at ${symbol}`), { quotaExhausted: true });
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching Twelve Data prices for ${symbol}`);
   const data = await res.json();
   // Credits running out comes back as HTTP 200 with an error body (code
