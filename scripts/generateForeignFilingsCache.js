@@ -309,7 +309,21 @@ function matchingFactEntries(companyFacts, conceptCandidates) {
 // Colombian pesos -- FY '23 ROIC published as 0.024 beside 0.186 for
 // FY '24. Scanned all 1,114 foreign filers' concept lists: ASR's debt is
 // the only one this changes.
+//
+// Both rules above chose a unit per concept group, so one filer's groups
+// could land in different currencies -- verified live: CIG tags a single
+// USD Borrowings fact (R$1,857M-equivalent dollar debt, end-2023) beside
+// its BRL statements, so its whole debt series was that one USD figure
+// (zero for every other year) while equity stayed in reais, and its ROIC
+// was computed across two currencies. 59 of 1,119 foreign filers had some
+// group in another currency than the rest (CNI's debt in USD against CAD,
+// KB's balance sheet in USD against KRW). Every group is now read in the
+// filer's reporting currency whenever it has figures in it -- see
+// detectReportingUnit -- and the rules above only decide for a group that
+// has none.
 function detectPreferredUnit(companyFacts, conceptCandidates) {
+  const reportingUnit = detectReportingUnit(companyFacts);
+  if (reportingUnit && matchingFactEntries(companyFacts, conceptCandidates).some((e) => e.units?.[reportingUnit]?.length)) return reportingUnit;
   const factCountByUnit = new Map();
   for (const entry of matchingFactEntries(companyFacts, conceptCandidates)) {
     for (const [unit, facts] of Object.entries(entry.units)) {
@@ -319,6 +333,39 @@ function detectPreferredUnit(companyFacts, conceptCandidates) {
   if (!factCountByUnit.size) return null;
   if (factCountByUnit.has('USD')) return 'USD';
   return [...factCountByUnit.entries()].reduce((best, cur) => (cur[1] > best[1] ? cur : best))[0];
+}
+
+// The currency the filer's own statements are in: the unit of its most
+// recent net income, operating cash flow or capex figures, a local one
+// preferred over USD beside it (convenience translations). The same rule
+// as generateForeignPfcfCache.js's detectReportingCurrency, so both
+// pipelines read a filer in one currency.
+const reportingUnitCache = new WeakMap();
+function detectReportingUnit(companyFacts) {
+  if (!companyFacts || typeof companyFacts !== 'object') return null;
+  if (reportingUnitCache.has(companyFacts)) return reportingUnitCache.get(companyFacts);
+  let latest = '';
+  const unitsAt = new Map();
+  const counts = new Map();
+  for (const entry of matchingFactEntries(companyFacts, [...NET_INCOME_CONCEPTS, ...OCF_CONCEPTS, ...CAPEX_CONCEPTS])) {
+    for (const [unit, unitFacts] of Object.entries(entry.units || {})) {
+      for (const f of unitFacts || []) {
+        if (!f.end) continue;
+        counts.set(unit, (counts.get(unit) || 0) + 1);
+        if (!unitsAt.has(f.end)) unitsAt.set(f.end, new Set());
+        unitsAt.get(f.end).add(unit);
+        if (f.end > latest) latest = f.end;
+      }
+    }
+  }
+  let unit = null;
+  if (latest) {
+    const atLatest = [...unitsAt.get(latest)];
+    const native = atLatest.filter((u) => u !== 'USD').sort((x, y) => (counts.get(y) || 0) - (counts.get(x) || 0));
+    unit = native[0] || (atLatest.includes('USD') ? 'USD' : null);
+  }
+  reportingUnitCache.set(companyFacts, unit);
+  return unit;
 }
 
 function extractFactSeries(companyFacts, conceptCandidates) {
