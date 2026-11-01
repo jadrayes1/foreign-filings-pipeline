@@ -1434,7 +1434,7 @@ async function processTicker(symbol, cik, isBank) {
 
   const revenueRaw = extractFactSeries(companyFacts, REVENUE_CONCEPTS);
   const ocfRaw = withContinuingOperationsOcf(companyFacts, extractFactSeries(companyFacts, OCF_CONCEPTS));
-  const capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
+  let capexRaw = extractFactSeries(companyFacts, CAPEX_CONCEPTS);
   const netIncomeRaw = extractFactSeries(companyFacts, NET_INCOME_CONCEPTS);
   const ebitRaw = extractFactSeries(companyFacts, EBIT_CONCEPTS);
   const equityRaw = extractFactSeries(companyFacts, EQUITY_CONCEPTS);
@@ -1443,6 +1443,14 @@ async function processTicker(symbol, cik, isBank) {
 
   let revenue = dedupeAndClassify(revenueRaw);
   let ocf = dedupeAndClassify(ocfRaw);
+  // A concession filer's capex is PP&E + intangibles + contract assets --
+  // see LABEL_ALIASES.contractAssetCapex. Its annual series is rebuilt on
+  // that definition before anything reads it, and its quarters come from
+  // the releases' combined line (totalCapex), so quarterly, TTM and yearly
+  // FCF margin all share one definition.
+  const contractAssets = !isBank && reportsConstructionRevenue(companyFacts) ? await readContractAssetCapex(cik, symbol) : noContractAssets();
+  const concessionCapex = contractAssets.size > 0;
+  if (concessionCapex) capexRaw = concessionCapexFacts(capexRaw, extractFactSeries(companyFacts, INTANGIBLE_CAPEX_CONCEPTS), contractAssets);
   let capex = dedupeAndClassify(capexRaw);
   let netIncome = dedupeAndClassify(netIncomeRaw);
   let ebit = dedupeAndClassify(ebitRaw);
@@ -1528,7 +1536,7 @@ async function processTicker(symbol, cik, isBank) {
       const deriveEbitFromExpenses = ebitNeeded && DERIVE_EBIT_FROM_EXPENSES_TICKERS.has(symbol.toUpperCase());
       if (deriveEbitFromExpenses) needed.push('totalExpenses');
       if (needsFilingTextBackfill(ocf.quarterly, ocf.annual)) needed.push('ocf');
-      if (needsFilingTextBackfill(capex.quarterly, capex.annual)) needed.push('capex');
+      if (needsFilingTextBackfill(capex.quarterly, capex.annual)) needed.push(concessionCapex ? 'totalCapex' : 'capex');
 
       // Balance-sheet (equity/debt/cash) concepts don't have their own
       // quarterly/annual split to run needsFilingTextBackfill against (an
@@ -1562,6 +1570,7 @@ async function processTicker(symbol, cik, isBank) {
           pretaxIncome: new Map(ebit.annual.map((a) => [a.end, a])),
           ocf: new Map(ocf.annual.map((a) => [a.end, a])),
           capex: new Map(capex.annual.map((a) => [a.end, a])),
+          totalCapex: new Map(capex.annual.map((a) => [a.end, a])),
           // Not actually "annual" for these three — reconcileInstantPoints
           // treats this as a direct same-date-match anchor (any real XBRL
           // instant fact, not specifically a fiscal year-end one), reusing
@@ -1629,6 +1638,9 @@ async function processTicker(symbol, cik, isBank) {
         // reports it parenthesized/negative (a cash outflow) — negated
         // here to match XBRL's sign convention before merging, since
         // downstream fcfMargin math (ocf.value - capex.value) assumes it.
+        // A concession filer's quarters are the combined line, read as
+        // totalCapex -- the same definition as its rebuilt annual series.
+        if (concessionCapex) filingTextFacts.capex = filingTextFacts.totalCapex;
         if (filingTextFacts.capex?.length) {
           capex = dedupeAndClassify([...capexRaw, ...filingTextFacts.capex.map((f) => ({ ...f, val: -f.val }))]);
         }
@@ -1741,7 +1753,7 @@ async function processTicker(symbol, cik, isBank) {
         // the 6-K exhibit's, but XBRL's capex concept is a positive
         // magnitude; downstream fcfMargin math (ocf.value - capex.value)
         // assumes XBRL's convention.
-        if (annual20FFacts.capex?.length) {
+        if (annual20FFacts.capex?.length && !concessionCapex) {
           // The 6-K text capex is negated HERE TOO, exactly as in the normal
           // merge above (`filingTextFacts.capex.map(... -f.val)`). It was
           // passed through un-negated, so whenever the 20-F path returned any
@@ -1804,7 +1816,7 @@ async function processTicker(symbol, cik, isBank) {
         // BusinessQuant's own capex sign already matches XBRL's convention
         // (negative = cash outflow) — verified live against EGO — no
         // negation needed here, unlike the 6-K text fallback above.
-        if (bqFacts.capex?.length) capex = dedupeAndClassify([...capexRaw, ...bqFacts.capex]);
+        if (bqFacts.capex?.length && !concessionCapex) capex = dedupeAndClassify([...capexRaw, ...bqFacts.capex]);
       }
     }
   }
@@ -1848,7 +1860,7 @@ async function processTicker(symbol, cik, isBank) {
   // Yearly FCF margin for a filer whose main investment is intangible (a
   // concession utility), used ONLY for a year with no FCF margin otherwise --
   // see intangibleCapexFallback and pickCadenceTrendsToPublish.
-  const yearlyFcfMarginFallback = isBank ? [] : await intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue });
+  const yearlyFcfMarginFallback = isBank ? [] : await intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue, contractAssets });
 
   const capexQByEnd = new Map(capex.quarterly.map((q) => [q.end, q.value]));
   const ocfWithCapexQuarterly = ocf.quarterly.filter((q) => capexQByEnd.has(q.end)).map((q) => ({ ...q, value: q.value - capexQByEnd.get(q.end) }));
@@ -1960,6 +1972,37 @@ function reportsConstructionRevenue(companyFacts) {
   return Object.values(units).some((list) => list.some((f) => f.form === '20-F' && Math.abs(f.val) > 0));
 }
 
+function noContractAssets() {
+  return Object.assign(new Map(), { ppeByEnd: new Map(), intangibleByEnd: new Map() });
+}
+
+// Annual capex facts on the concession definition: PP&E + intangibles +
+// contract assets, for each year the 20-F states contract assets -- XBRL's
+// PP&E and intangibles where it has them, else the same 20-F's own lines
+// (CIG's FY2025 is in no companyfacts concept at all). Any other capex
+// fact (an older PP&E-only year, a quarter) is left out: the releases'
+// combined line supplies the quarters.
+function concessionCapexFacts(ppeFacts, intangibleFacts, contractAssets) {
+  const ppe = dedupeAndClassify(ppeFacts).annual;
+  const intangible = new Map(dedupeAndClassify(intangibleFacts).annual.map((a) => [a.end, Math.abs(a.value)]));
+  const out = [];
+  for (const [end, contract] of contractAssets) {
+    const xbrl = ppe.find((a) => a.end === end);
+    const ppeValue = xbrl ? Math.abs(xbrl.value) : contractAssets.ppeByEnd.get(end);
+    const intangibleValue = xbrl ? intangible.get(end) : contractAssets.intangibleByEnd.get(end);
+    if (ppeValue == null || intangibleValue == null) continue;
+    out.push({ start: xbrl?.start || subtractOneYear(end), end, val: ppeValue + intangibleValue + contract, filed: null, form: '20-F' });
+  }
+  return out;
+}
+
+function subtractOneYear(endIso) {
+  const d = new Date(`${endIso}T00:00:00Z`);
+  d.setUTCFullYear(d.getUTCFullYear() - 1);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 // Year end -> contract-asset capex (positive), from the 20-F, with the same
 // report's PP&E and intangible purchases alongside.
 async function readContractAssetCapex(cik, symbol) {
@@ -1969,11 +2012,11 @@ async function readContractAssetCapex(cik, symbol) {
     return Object.assign(byEnd(facts.contractAssetCapex), { ppeByEnd: byEnd(facts.capex), intangibleByEnd: byEnd(facts.intangibleCapex) });
   } catch (err) {
     console.warn(`  contract-asset capex read failed for ${symbol}: ${err.message}`);
-    return Object.assign(new Map(), { ppeByEnd: new Map(), intangibleByEnd: new Map() });
+    return noContractAssets();
   }
 }
 
-async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue }) {
+async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue, contractAssets }) {
   const intangible = dedupeAndClassify(extractFactSeries(companyFacts, INTANGIBLE_CAPEX_CONCEPTS)).annual;
   const ppeByEnd = new Map(capex.annual.map((a) => [a.end, Math.abs(a.value)]));
   // Intangibles must clearly be the main investment: at least twice PP&E in
@@ -1986,34 +2029,22 @@ async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUni
   // or development (DLO, PSFE, TME, PSNY); banks are excluded upstream.
   const both = intangible.filter((a) => Math.abs(a.value) > 0 && (ppeByEnd.get(a.end) || 0) > 0);
   const dominant = both.filter((a) => Math.abs(a.value) >= 2 * ppeByEnd.get(a.end));
-  // Concession infrastructure booked as contract assets is capex on its own
-  // line -- see LABEL_ALIASES.contractAssetCapex. Verified live: Cemig (CIG)
-  // invested R$4.4B in it in 2024 against R$0.9B of PP&E and intangibles; a
-  // filer with this line takes this definition whatever its PP&E share.
-  const contractAssets = reportsConstructionRevenue(companyFacts) ? await readContractAssetCapex(cik, symbol) : Object.assign(new Map(), { ppeByEnd: new Map(), intangibleByEnd: new Map() });
-  if (!contractAssets.size && (both.length < 2 || dominant.length * 2 < both.length)) return [];
+  // A concession filer's capex series is already on the full definition --
+  // see concessionCapexFacts.
+  if (contractAssets?.size) {
+    const altByEnd = new Map(capex.annual.map((a) => [a.end, Math.abs(a.value)]));
+    const fcf = ocf.annual.filter((a) => altByEnd.has(a.end)).map((a) => ({ ...a, value: a.value - altByEnd.get(a.end) }));
+    if (!fcf.length || !revenue.annual.length) return [];
+    return buildAnnualRatioTrend(fcf, revenue.annual, (f, rev) => (rev ? f / rev : null));
+  }
+  if (both.length < 2 || dominant.length * 2 < both.length) return [];
 
   const altByEnd = new Map();
   for (const a of intangible) altByEnd.set(a.end, Math.abs(a.value) + (ppeByEnd.get(a.end) || 0));
-  if (contractAssets.size) {
-    // Only years with PP&E and intangible figures to add it to: XBRL's, or
-    // for a year XBRL lacks, the same 20-F's own two lines (CIG's FY2025
-    // is in no companyfacts concept at all).
-    for (const end of [...altByEnd.keys()]) {
-      if (contractAssets.has(end)) altByEnd.set(end, altByEnd.get(end) + contractAssets.get(end));
-      else altByEnd.delete(end);
-    }
-    for (const [end, value] of contractAssets) {
-      if (altByEnd.has(end)) continue;
-      const ppe = ppeByEnd.get(end) ?? contractAssets.ppeByEnd.get(end);
-      const intangibleValue = contractAssets.intangibleByEnd.get(end);
-      if (ppe != null && intangibleValue != null) altByEnd.set(end, ppe + intangibleValue + value);
-    }
-  }
   // A year XBRL lacks, from the annual report: its combined line first,
   // anchored on the XBRL years it overlaps; an intangibles-only line + PP&E
   // otherwise.
-  if (process.env.ENABLE_20F_ANNUAL_FALLBACK && !contractAssets.size) {
+  if (process.env.ENABLE_20F_ANNUAL_FALLBACK) {
     try {
       const anchors = {
         totalCapex: new Map([...altByEnd].map(([end, value]) => [end, { end, value }])),

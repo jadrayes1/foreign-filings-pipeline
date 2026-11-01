@@ -4163,7 +4163,7 @@ function extractReleaseCashFlowSummaries(text, neededConcepts) {
       const values = tokens.map((t) => {
         const v = t.replace(/[–—−]/g, '-');
         if (v === '-') return 0;
-        if (!/^\(?-?\d[\d,]*\)?$/.test(v)) return null;
+        if (!/^\(?-?(?:\d{1,3}(?:,\d{3})+|\d+)\)?$/.test(v)) return null; // see twoValuesAt
         const n = Number(v.replace(/[(),]/g, ''));
         return /^\(/.test(v) ? -n : n;
       });
@@ -4174,6 +4174,185 @@ function extractReleaseCashFlowSummaries(text, neededConcepts) {
     }
     columns.forEach((period, idx) => {
       if (Object.keys(facts[idx]).length) out.push({ period, facts: facts[idx], captionScale: 1000000 });
+    });
+  }
+  return out;
+}
+
+// Earnings-release consolidated income statements -- verified live: every
+// Cemig (CIG) release from 1Q23 to 1Q26 states its quarter beside the
+// prior-year quarter, under varying titles ("INCOME STATEMENT (R$ million)
+// 1Q26 1Q25 % Change NET REVENUE 10,463 9,844", "P&L 4Q25 4Q24 Change, %
+// PROFIT AND LOSS ACCOUNTS (R$ '000) NET REVENUE 11,501,016 ...", "Profit and
+// loss accounts 3Q24 3Q23 Change, % R$ '000 NET REVENUE ..."), so the shape
+// is anchored on the two quarter columns, the change column and the
+// revenue line, never the title. A third quarter column marks a business
+// segment's table, never read (a title's "3Q25 and 3Q24" is not one).
+// Brazilian companies' fiscal year is the calendar year by law, so "4Q24"
+// ends December 31, 2024.
+const RELEASE_INCOME_HEADING = /(?<!(?<!and )[1-4]Q\d\d )\b([1-4])Q(\d\d) ([1-4])Q(\d\d) (?:%\s*)?Change,?\s*%?(.{0,80}?)\bNET REVENUES?\b/gi;
+const RELEASE_INCOME_ROWS = {
+  ebit: /\b(?:Profit before Finance income \(expenses\) and taxes on profit|Income before financial results and income taxes|OPERATIONAL PRE-TAX PROFIT)\b/i,
+  netIncome: /\bNET (?:PROFIT|INCOME) FOR THE PERIOD\b/i,
+};
+const QUARTER_END = { 1: 'March 31', 2: 'June 30', 3: 'September 30', 4: 'December 31' };
+
+// A figure as printed, or null when malformed -- verified live: Cemig's
+// 3Q25 release prints the 3Q24 comparative revenue as "10,148,88", which
+// read whole is ten times too small.
+function releaseFigure(token) {
+  const v = token.replace(/[–—−]/g, '-');
+  if (!/^\(?-?(?:\d{1,3}(?:,\d{3})+|\d+)\)?$/.test(v)) return null;
+  const n = Number(v.replace(/[(),]/g, ''));
+  return /^\(/.test(v) ? -n : n;
+}
+
+// The two figures after a row label, each null if malformed; null when the
+// row doesn't start with two figure-like tokens.
+function releaseFigurePair(str) {
+  const tokens = str.trim().split(' ').slice(0, 2);
+  if (tokens.length < 2 || !tokens.every((t) => /^\(?[-–—−]?\d/.test(t))) return null;
+  return tokens.map(releaseFigure);
+}
+
+function extractReleaseIncomeStatements(text, neededConcepts) {
+  const out = [];
+  let m;
+  RELEASE_INCOME_HEADING.lastIndex = 0;
+  while ((m = RELEASE_INCOME_HEADING.exec(text))) {
+    const columns = [
+      { months: 3, endMonthDay: QUARTER_END[m[1]], year: String(2000 + Number(m[2])) },
+      { months: 3, endMonthDay: QUARTER_END[m[3]], year: String(2000 + Number(m[4])) },
+    ];
+    const block = text.slice(m.index + m[0].length, m.index + m[0].length + 5000);
+    // The consolidated statement always closes on its net-income line, read
+    // whole and within the statement's length -- verified live: a 2019
+    // release's subsidiary table (Cemig D, "Net Income 189 420") otherwise
+    // borrowed a net-income line pages later and read as the group's.
+    const netIncomeRow = RELEASE_INCOME_ROWS.netIncome.exec(block.slice(0, 2500));
+    const netIncome = netIncomeRow && releaseFigurePair(block.slice(netIncomeRow.index + netIncomeRow[0].length));
+    if (!netIncome || netIncome.every((v) => v == null)) continue;
+    const statement = block.slice(0, netIncomeRow.index + netIncomeRow[0].length + 200);
+    const revenue = releaseFigurePair(statement);
+    if (!revenue || revenue[0] == null) continue;
+    // The unit caption can't be trusted -- Cemig's 4Q24 table is headed
+    // "IN (R$ '000)" over figures in millions (NET REVENUE 11,177) -- so the
+    // revenue figure's own size decides: no company publishing this shape
+    // has quarterly revenue under R$1 billion, which in thousands reads at
+    // least 1,000,000 and in millions at most a few tens of thousands.
+    const scale = Math.abs(revenue[0]) >= 1000000 ? 1000 : 1000000;
+    const facts = [{}, {}];
+    const record = (concept, values) =>
+      values.forEach((v, idx) => {
+        if (v != null) facts[idx][concept] = { label: concept, value3mo: v * scale, valueCumulative: null };
+      });
+    if (neededConcepts.includes('revenue')) record('revenue', revenue);
+    if (neededConcepts.includes('netIncome')) record('netIncome', netIncome);
+    if (neededConcepts.includes('ebit')) {
+      const row = RELEASE_INCOME_ROWS.ebit.exec(statement);
+      const values = row && releaseFigurePair(statement.slice(row.index + row[0].length));
+      if (values) record('ebit', values);
+    }
+    columns.forEach((period, idx) => {
+      if (Object.keys(facts[idx]).length) out.push({ period, facts: facts[idx], captionScale: scale });
+    });
+  }
+  return out;
+}
+
+// Earnings-release balance sheets -- verified live: Cemig's (CIG) releases
+// close with the consolidated balance sheet against the prior year-end
+// ("Balance Sheets (Liabilities and Shareholders' Equity) set/25 2024 (R$
+// million)", "Statement of financial position – LIABILITIES Sep. 2024 Dec.
+// 2023 (R$ mn)", "Balance sheet – Liabilities 1Q24 2023 (R$ mn)"). Read from
+// the liabilities side: total equity is the line just before the grand
+// total in every one of them ("TOTAL EQUITY" or "STOCKHOLDERS' EQUITY"),
+// debt is its two "Loans and debentures" (or "... financings") lines,
+// current and non-current, and cash is the first line of the assets table
+// just before it -- whose own header sometimes carries no dates. Checked
+// against XBRL at December 31, 2023: equity 24,656, debt 2,630 + 7,201 =
+// 9,831, cash 1,537 -- all exact. Months may be Portuguese ("set/25").
+const RELEASE_INSTANT_PERIOD = '(?:[A-Za-z]{3}\\.?\\/\\d{2}|[A-Za-z]{3}\\.?\\s(?:\\d{1,2},\\s)?\\d{4}|[1-4]Q\\d\\d|\\d{4})';
+const RELEASE_LIABILITIES_HEADING = new RegExp(
+  `(?:balance sheets?|statement of financial position)\\s*[-–]?\\s*\\(?\\s*liabilities[^)0-9]{0,50}?\\)?\\s+(${RELEASE_INSTANT_PERIOD})\\s+(${RELEASE_INSTANT_PERIOD})\\s+\\(?R\\$\\s*(?:mn|million)\\)?`,
+  'gi'
+);
+const RELEASE_ASSETS_HEADING = /(?:balance sheets?|statement of financial position)\s*[-–]?\s*\(?\s*assets/gi;
+const PORTUGUESE_MONTHS = { fev: 'Feb', abr: 'Apr', mai: 'May', ago: 'Aug', set: 'Sep', out: 'Oct', dez: 'Dec' };
+
+function releaseInstantOf(token) {
+  const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  let monthIdx;
+  let year;
+  const monthForm = /^([A-Za-z]{3})\.?(?:\/|\s)(?:\d{1,2},\s)?(\d{2}|\d{4})$/.exec(token);
+  const quarterForm = /^([1-4])Q(\d\d)$/i.exec(token);
+  if (monthForm) {
+    const name = PORTUGUESE_MONTHS[monthForm[1].toLowerCase()] || monthForm[1];
+    monthIdx = MONTH_ABBREVIATIONS.findIndex((mo) => mo.toLowerCase() === name.toLowerCase());
+    year = monthForm[2].length === 2 ? 2000 + Number(monthForm[2]) : Number(monthForm[2]);
+  } else if (quarterForm) {
+    monthIdx = Number(quarterForm[1]) * 3 - 1;
+    year = 2000 + Number(quarterForm[2]);
+  } else if (/^\d{4}$/.test(token)) {
+    monthIdx = 11;
+    year = Number(token);
+  }
+  if (monthIdx == null || monthIdx < 0) return null;
+  const lastDay = new Date(Date.UTC(year, monthIdx + 1, 0)).getUTCDate();
+  return { endMonthDay: `${MONTH_NAMES[monthIdx]} ${lastDay}`, year: String(year) };
+}
+
+function extractReleaseBalanceSheets(text, neededConcepts) {
+  const out = [];
+  const pairAfter = (str) => {
+    const values = releaseFigurePair(str);
+    return values && values.every((v) => v != null) ? values : null;
+  };
+  const scale = 1000000; // every heading this reads says R$ million / mn
+  let m;
+  RELEASE_LIABILITIES_HEADING.lastIndex = 0;
+  while ((m = RELEASE_LIABILITIES_HEADING.exec(text))) {
+    const columns = [releaseInstantOf(m[1]), releaseInstantOf(m[2])];
+    if (columns.some((c) => !c)) continue;
+    const rest = text.slice(m.index + m[0].length, m.index + m[0].length + 5000);
+    const totalAt = rest.search(/TOTAL LIABILITIES AND (?:SHAREHOLDERS[’']? |STOCKHOLDERS[’']? )?EQUITY/i);
+    if (totalAt < 0) continue;
+    const block = rest.slice(0, totalAt);
+    const before = text.slice(Math.max(0, m.index - 8000), m.index);
+    const assets = [...before.matchAll(RELEASE_ASSETS_HEADING)].pop();
+    const assetsTable = assets ? before.slice(assets.index) : '';
+    const facts = [{}, {}];
+    if (neededConcepts.includes('equity')) {
+      const eq = /EQUITY\s+(\S+)\s+(\S+)\s*$/i.exec(block);
+      const values = eq && [releaseFigure(eq[1]), releaseFigure(eq[2])];
+      // Equity must equal total assets less total liabilities where both are
+      // stated -- verified live: Cemig's 1Q25 release prints the December
+      // 2024 comparative as TOTAL EQUITY 54,761 against total assets of
+      // 59,727 and liabilities of 32,344 (its later releases: 27,383).
+      const totalAssets = /TOTAL ASSETS\s+/i.exec(assetsTable);
+      const totalLiabilities = /TOTAL LIABILITIES\s+(?=[-–(\d])/i.exec(block);
+      const assetPair = totalAssets && pairAfter(assetsTable.slice(totalAssets.index + totalAssets[0].length));
+      const liabilityPair = totalLiabilities && pairAfter(block.slice(totalLiabilities.index + totalLiabilities[0].length));
+      if (values) {
+        values.forEach((v, i) => {
+          if (v == null) return;
+          if (assetPair && liabilityPair && Math.abs(assetPair[i] - liabilityPair[i] - v) > Math.abs(v) * 0.01) return;
+          facts[i].equity = { value: v * scale };
+        });
+      }
+    }
+    if (neededConcepts.includes('debt')) {
+      const rows = [...block.matchAll(/\bLoans(?:,? and)? (?:debentures|financings?)(?: and debentures)? (?=[-–(\d])/gi)];
+      const pairs = rows.map((r) => pairAfter(block.slice(r.index + r[0].length)));
+      if (rows.length === 2 && pairs.every(Boolean)) [0, 1].forEach((i) => (facts[i].debt = { value: (pairs[0][i] + pairs[1][i]) * scale }));
+    }
+    if (neededConcepts.includes('cash') && assetsTable) {
+      const row = /Cash and cash equivalents\s+/i.exec(assetsTable);
+      const values = row && pairAfter(assetsTable.slice(row.index + row[0].length));
+      if (values) values.forEach((v, i) => (facts[i].cash = { value: v * scale }));
+    }
+    columns.forEach((period, i) => {
+      if (Object.keys(facts[i]).length) out.push({ period, facts: facts[i] });
     });
   }
   return out;
@@ -4270,7 +4449,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       }
       const list = collected[concept].get(endIso) || [];
       if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
-        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber, captionScale: extracted.captionScale ?? null, restatable: !!extracted.restatable });
+        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber, captionScale: extracted.captionScale ?? null, restatable: !!extracted.restatable, prescaled: !!extracted.prescaled });
       }
       collected[concept].set(endIso, list);
     }
@@ -4292,7 +4471,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         }
         const list = collected[concept].get(endIso) || [];
         if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
-          list.push({ end: endIso, val, filed: filing.filingDate, accessionNumber: filing.accessionNumber });
+          list.push({ end: endIso, val, filed: filing.filingDate, accessionNumber: filing.accessionNumber, restatable: !!extracted.restatable, prescaled: !!extracted.prescaled });
         }
         collected[concept].set(endIso, list);
       }
@@ -4449,7 +4628,23 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           const flat = fullText.replace(/\s+/g, ' ');
           const summaries = /Cash flow statements?\s/i.test(flat) ? extractReleaseCashFlowSummaries(flat, neededConcepts) : [];
           if (debug && summaries.length) console.error('DEBUG release cash-flow summaries', url, JSON.stringify(summaries));
-          for (const extracted of summaries) await recordExtracted({ ...extracted, restatable: true }, filing);
+          for (const extracted of summaries) await recordExtracted({ ...extracted, restatable: true, prescaled: true }, filing);
+        }
+        // A release's consolidated quarter-vs-quarter income statement -- see
+        // extractReleaseIncomeStatements. Restatable: a later release's
+        // prior-year column supersedes the original.
+        if (['revenue', 'ebit', 'netIncome'].some((c) => neededConcepts.includes(c))) {
+          const flat = fullText.replace(/\s+/g, ' ');
+          const statements = /NET REVENUES?\b/i.test(flat) ? extractReleaseIncomeStatements(flat, neededConcepts) : [];
+          if (debug && statements.length) console.error('DEBUG release income statements', url, JSON.stringify(statements));
+          for (const extracted of statements) await recordExtracted({ ...extracted, restatable: true, prescaled: true }, filing);
+        }
+        // A release's balance sheet -- see extractReleaseBalanceSheets.
+        if (['equity', 'debt', 'cash'].some((c) => neededConcepts.includes(c))) {
+          const flat = fullText.replace(/\s+/g, ' ');
+          const sheets = /liabilities/i.test(flat) ? extractReleaseBalanceSheets(flat, neededConcepts) : [];
+          if (debug && sheets.length) console.error('DEBUG release balance sheets', url, JSON.stringify(sheets));
+          await recordExtractedInstant(sheets.map((x) => ({ ...x, restatable: true, prescaled: true })), filing);
         }
       }
       const hasIncome = STATEMENT_HEADINGS.income.test(fullText);
@@ -4633,6 +4828,11 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
     for (const [end, list] of grouped) {
       if (!list.length) continue;
       if (process.env.DEBUG_CUMULATIVE_IDX && concept === 'revenue' && end.startsWith('2025-03')) console.error('DEBUG revenue-list-2025Q1', JSON.stringify(list));
+      // Figures a release reader already put in currency units (see
+      // extractReleaseIncomeStatements) are the period's figures; a generic
+      // table read of the same release, in whatever unit its caption names
+      // or omits, would only read as a conflict beside them.
+      const scoped = list.some((l) => l.prescaled) ? list.filter((l) => l.prescaled) : list;
       for (const l of list) {
         if (!accessionToDates.has(l.accessionNumber)) accessionToDates.set(l.accessionNumber, new Set());
         accessionToDates.get(l.accessionNumber).add(end);
@@ -4642,7 +4842,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       // corroborations (ties broken by most-recently-filed) as the
       // representative point — feeds Check C below.
       const byValue = new Map();
-      for (const l of list) {
+      for (const l of scoped) {
         if (!byValue.has(l.val)) byValue.set(l.val, []);
         byValue.get(l.val).push(l);
       }
@@ -4654,10 +4854,10 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       // Every candidate read from the company's own statements (see
       // extractPlainTextStatements/extractCvmStatements): a disagreement is a
       // restatement, so the latest-filed statement stands, uncontested.
-      const allRestatable = list.every((l) => l.restatable);
+      const allRestatable = scoped.every((l) => l.restatable);
       if (allRestatable && byValue.size > 1) {
-        rep = list.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
-        best = list.filter((l) => l.val === rep.val);
+        rep = scoped.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+        best = scoped.filter((l) => l.val === rep.val);
       }
       // hasConflict -- true when independent filings disagree on this
       // period's value (byValue has more than one distinct value, not just
@@ -4717,6 +4917,17 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   // concept with no strong disagreeing evidence of its own; `perConcept`
   // (from a concept whose OWN evidence actually disagrees) overrides it
   // for just that concept, resolved per concept below via `scaleFor`.
+  // Pre-scaled figures (see `scoped` above) take no part in scale detection
+  // or correction, and rejoin their concept afterwards.
+  const prescaledByConcept = new Map();
+  for (const [concept, points] of pointsByConcept) {
+    const prescaled = points.filter((p) => p.prescaled);
+    if (!prescaled.length) continue;
+    prescaledByConcept.set(concept, prescaled);
+    const rest = points.filter((p) => !p.prescaled);
+    if (rest.length) pointsByConcept.set(concept, rest);
+    else pointsByConcept.delete(concept);
+  }
   const detected = detectScaleMultiplier(pointsByConcept, annualByEnd);
   const conceptScaleOverrides = detected.perConcept;
   // When the detector made NO comparisons at all, its x1 is not a finding --
@@ -4822,6 +5033,11 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         if (p.valueCumulative != null) p.valueCumulative *= scale;
       }
     }
+  }
+
+  for (const [concept, prescaled] of prescaledByConcept) {
+    const merged = [...(pointsByConcept.get(concept) || []), ...prescaled].sort((a, b) => new Date(a.end) - new Date(b.end));
+    pointsByConcept.set(concept, merged);
   }
 
   // trustSingleSource now also passed here (previously 20-F-annual-path
