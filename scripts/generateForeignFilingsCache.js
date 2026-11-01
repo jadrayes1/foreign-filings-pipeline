@@ -1825,7 +1825,15 @@ async function processTicker(symbol, cik, isBank) {
   // generateForeignPfcfCache.js's fixTextScale. Revenue only: profit and
   // cash flow can genuinely sit near zero for a quarter, and a real R$1M
   // quarter must never be "rescaled" into R$1B.
-  revenue.quarterly = fixQuarterScaleAgainstAnnual(revenue.quarterly, revenue.annual);
+  // The factor found for a quarter's revenue applies to that quarter's other
+  // figures too: they come from the same statement in the same unit --
+  // verified live: CIG's release reads in R$ millions with the unit unread;
+  // rescaling revenue alone turned its 8.5% margin into 0.0%.
+  const scaleByEnd = new Map();
+  revenue.quarterly = fixQuarterScaleAgainstAnnual(revenue.quarterly, revenue.annual, scaleByEnd);
+  for (const flow of [netIncome, ebit, ocf, capex]) {
+    flow.quarterly = flow.quarterly.map((p) => (scaleByEnd.get(p.end) ? { ...p, value: p.value * scaleByEnd.get(p.end) } : p));
+  }
   for (const flow of [revenue, netIncome, ebit, ocf, capex]) {
     const derivedQuarters = deriveMissingQuarterFromAnnual(flow.quarterly, flow.annual);
     if (derivedQuarters.length) {
@@ -1988,7 +1996,7 @@ async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUni
   return buildAnnualRatioTrend(fcf, revenue.annual, (f, rev) => (rev ? f / rev : null));
 }
 
-function fixQuarterScaleAgainstAnnual(quarterly, annual) {
+function fixQuarterScaleAgainstAnnual(quarterly, annual, scaleByEnd = new Map()) {
   const anchors = (annual || []).filter((a) => Number.isFinite(a.value) && a.value !== 0);
   if (!anchors.length) return quarterly;
   const nearest = (end) => anchors.reduce((b, a) => (Math.abs(Date.parse(a.end) - Date.parse(end)) < Math.abs(Date.parse(b.end) - Date.parse(end)) ? a : b));
@@ -2008,7 +2016,12 @@ function fixQuarterScaleAgainstAnnual(quarterly, annual) {
       const r = (Math.abs(p.value) * k) / ref;
       return r <= 30 && r >= 1 / 30;
     });
-    if (scale) out.push({ ...p, value: p.value * scale });
+    if (scale) {
+      out.push({ ...p, value: p.value * scale });
+      scaleByEnd.set(p.end, scale);
+    } else {
+      scaleByEnd.set(p.end, null); // dropped -- see below
+    }
   }
   return out;
 }
