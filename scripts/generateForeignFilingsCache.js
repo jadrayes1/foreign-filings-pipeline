@@ -1817,6 +1817,15 @@ async function processTicker(symbol, cik, isBank) {
   // below are point-in-time balance-sheet snapshots, not additive across
   // quarters, same scope boundary the main pipeline's ROIC derivation
   // draws in generateSectorMetrics.js.
+  // A quarter 300x or more off its own annual level is a unit error (an
+  // unscaled "in thousands" figure) -- verified live: SBS's Q3 '23 revenue
+  // read as 6,453,246 against R$6.45B, giving TTM revenue growth of +396%.
+  // Rescaled by 1,000/1,000,000 when that lands it within 30x of a quarter
+  // of the nearest annual figure, dropped otherwise. Same rule as
+  // generateForeignPfcfCache.js's fixTextScale. Revenue only: profit and
+  // cash flow can genuinely sit near zero for a quarter, and a real R$1M
+  // quarter must never be "rescaled" into R$1B.
+  revenue.quarterly = fixQuarterScaleAgainstAnnual(revenue.quarterly, revenue.annual);
   for (const flow of [revenue, netIncome, ebit, ocf, capex]) {
     const derivedQuarters = deriveMissingQuarterFromAnnual(flow.quarterly, flow.annual);
     if (derivedQuarters.length) {
@@ -1977,6 +1986,31 @@ async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUni
   const fcf = ocf.annual.filter((a) => altByEnd.has(a.end)).map((a) => ({ ...a, value: a.value - altByEnd.get(a.end) }));
   if (!fcf.length || !revenue.annual.length) return [];
   return buildAnnualRatioTrend(fcf, revenue.annual, (f, rev) => (rev ? f / rev : null));
+}
+
+function fixQuarterScaleAgainstAnnual(quarterly, annual) {
+  const anchors = (annual || []).filter((a) => Number.isFinite(a.value) && a.value !== 0);
+  if (!anchors.length) return quarterly;
+  const nearest = (end) => anchors.reduce((b, a) => (Math.abs(Date.parse(a.end) - Date.parse(end)) < Math.abs(Date.parse(b.end) - Date.parse(end)) ? a : b));
+  const out = [];
+  for (const p of quarterly || []) {
+    if (!Number.isFinite(p.value) || p.value === 0) {
+      out.push(p);
+      continue;
+    }
+    const ref = Math.abs(nearest(p.end).value) / 4;
+    const ratio = Math.abs(p.value) / ref;
+    if (ratio < 300 && ratio > 1 / 300) {
+      out.push(p);
+      continue;
+    }
+    const scale = [1000, 1000000, 0.001, 0.000001].find((k) => {
+      const r = (Math.abs(p.value) * k) / ref;
+      return r <= 30 && r >= 1 / 30;
+    });
+    if (scale) out.push({ ...p, value: p.value * scale });
+  }
+  return out;
 }
 
 const SEMI_ANNUAL_LOOKBACK_DAYS = 730;
