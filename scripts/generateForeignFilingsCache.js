@@ -1194,7 +1194,9 @@ function pickCadenceTrendsToPublish(existingEntry, freshEntry) {
       const onFallback = !publishedPoints.length || !!existingEntry?.fcfIntangibleCapex;
       if (cadence === 'yearly' && key === 'fcfMargin' && onFallback && freshEntry?.yearlyFcfMarginFallback?.length) {
         usedFcfFallback = true;
-        const published = new Set(publishedPoints.map((p) => p.label));
+        // A recompute replaces published years too: Cemig's (CIG) were
+        // published before its contract-asset capex was counted.
+        const published = new Set(RECOMPUTE_METRICS.has('fcfMargin') ? [] : publishedPoints.map((p) => p.label));
         const fill = freshEntry.yearlyFcfMarginFallback.filter((p) => !published.has(p.label) && Number.isFinite(p.value));
         const fillLabels = new Set(fill.map((p) => p.label));
         if (fill.length) picked = sortByLabel([...picked.filter((p) => !fillLabels.has(p.label)), ...fill]);
@@ -1953,6 +1955,24 @@ async function processTicker(symbol, cik, isBank) {
 // R$13.74B; its FY2024 R$8.03B is exactly XBRL's 7.93B + 0.10B). Returns
 // yearly points that pickCadenceTrendsToPublish adds only where the normal
 // series has no point for that year.
+function reportsConstructionRevenue(companyFacts) {
+  const units = companyFacts?.facts?.['ifrs-full']?.RevenueFromConstructionContracts?.units || {};
+  return Object.values(units).some((list) => list.some((f) => f.form === '20-F' && Math.abs(f.val) > 0));
+}
+
+// Year end -> contract-asset capex (positive), from the 20-F, with the same
+// report's PP&E and intangible purchases alongside.
+async function readContractAssetCapex(cik, symbol) {
+  try {
+    const facts = await extractAnnualFactsFrom20F(cik, ['contractAssetCapex', 'capex', 'intangibleCapex'], {}, SEC_USER_AGENT);
+    const byEnd = (list) => new Map((list || []).map((f) => [f.end, Math.abs(f.val)]));
+    return Object.assign(byEnd(facts.contractAssetCapex), { ppeByEnd: byEnd(facts.capex), intangibleByEnd: byEnd(facts.intangibleCapex) });
+  } catch (err) {
+    console.warn(`  contract-asset capex read failed for ${symbol}: ${err.message}`);
+    return Object.assign(new Map(), { ppeByEnd: new Map(), intangibleByEnd: new Map() });
+  }
+}
+
 async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUnit, ocf, capex, revenue }) {
   const intangible = dedupeAndClassify(extractFactSeries(companyFacts, INTANGIBLE_CAPEX_CONCEPTS)).annual;
   const ppeByEnd = new Map(capex.annual.map((a) => [a.end, Math.abs(a.value)]));
@@ -1966,14 +1986,34 @@ async function intangibleCapexFallback({ symbol, cik, companyFacts, preferredUni
   // or development (DLO, PSFE, TME, PSNY); banks are excluded upstream.
   const both = intangible.filter((a) => Math.abs(a.value) > 0 && (ppeByEnd.get(a.end) || 0) > 0);
   const dominant = both.filter((a) => Math.abs(a.value) >= 2 * ppeByEnd.get(a.end));
-  if (both.length < 2 || dominant.length * 2 < both.length) return [];
+  // Concession infrastructure booked as contract assets is capex on its own
+  // line -- see LABEL_ALIASES.contractAssetCapex. Verified live: Cemig (CIG)
+  // invested R$4.4B in it in 2024 against R$0.9B of PP&E and intangibles; a
+  // filer with this line takes this definition whatever its PP&E share.
+  const contractAssets = reportsConstructionRevenue(companyFacts) ? await readContractAssetCapex(cik, symbol) : Object.assign(new Map(), { ppeByEnd: new Map(), intangibleByEnd: new Map() });
+  if (!contractAssets.size && (both.length < 2 || dominant.length * 2 < both.length)) return [];
 
   const altByEnd = new Map();
   for (const a of intangible) altByEnd.set(a.end, Math.abs(a.value) + (ppeByEnd.get(a.end) || 0));
+  if (contractAssets.size) {
+    // Only years with PP&E and intangible figures to add it to: XBRL's, or
+    // for a year XBRL lacks, the same 20-F's own two lines (CIG's FY2025
+    // is in no companyfacts concept at all).
+    for (const end of [...altByEnd.keys()]) {
+      if (contractAssets.has(end)) altByEnd.set(end, altByEnd.get(end) + contractAssets.get(end));
+      else altByEnd.delete(end);
+    }
+    for (const [end, value] of contractAssets) {
+      if (altByEnd.has(end)) continue;
+      const ppe = ppeByEnd.get(end) ?? contractAssets.ppeByEnd.get(end);
+      const intangibleValue = contractAssets.intangibleByEnd.get(end);
+      if (ppe != null && intangibleValue != null) altByEnd.set(end, ppe + intangibleValue + value);
+    }
+  }
   // A year XBRL lacks, from the annual report: its combined line first,
   // anchored on the XBRL years it overlaps; an intangibles-only line + PP&E
   // otherwise.
-  if (process.env.ENABLE_20F_ANNUAL_FALLBACK) {
+  if (process.env.ENABLE_20F_ANNUAL_FALLBACK && !contractAssets.size) {
     try {
       const anchors = {
         totalCapex: new Map([...altByEnd].map(([end, value]) => [end, { end, value }])),

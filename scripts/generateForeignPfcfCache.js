@@ -462,6 +462,31 @@ function isIntangibleLed(ppeFacts, intangibleFacts) {
   return both.length >= 2 && dominant.length * 2 >= both.length;
 }
 
+function reportsConstructionRevenue(companyFacts) {
+  const units = companyFacts?.facts?.['ifrs-full']?.RevenueFromConstructionContracts?.units || {};
+  return Object.values(units).some((list) => list.some((f) => f.form === '20-F' && Math.abs(f.val) > 0));
+}
+
+async function fetchContractAssetCapex(cik, symbol) {
+  try {
+    const facts = await extractAnnualFactsFrom20F(cik, ['contractAssetCapex'], {}, SEC_USER_AGENT);
+    return (facts.contractAssetCapex || []).map((f) => ({ ...f, val: Math.abs(f.val), form: '20-F' }));
+  } catch (err) {
+    console.log(`  contract-asset capex read failed for ${symbol}: ${err.message}`);
+    return [];
+  }
+}
+
+// Adds each year's contract-asset capex to that year's XBRL capex. Matched
+// on the year's end date: the 20-F reader dates a year by its end alone, so
+// its start can differ by a day from XBRL's. A year XBRL has no capex for
+// is left out rather than built from this line alone.
+function addAnnualCapex(capexFacts, extraAnnualFacts) {
+  const extraByEnd = new Map(extraAnnualFacts.map((f) => [f.end, f.val]));
+  const isAnnual = (f) => f.start && f.end && Date.parse(f.end) - Date.parse(f.start) > 300 * 86400000;
+  return capexFacts.map((f) => (isAnnual(f) && extraByEnd.has(f.end) ? { ...f, val: Math.abs(f.val) + extraByEnd.get(f.end) } : f));
+}
+
 // PP&E + intangible purchases for each period either reports.
 function sumCapexByPeriod(ppeFacts, intangibleFacts) {
   const latest = (facts) => {
@@ -1421,9 +1446,23 @@ async function main() {
         // P/FCF counted only ~R$0.1B/yr of PP&E against R$4-14B of real
         // capex, while its FCF margin already used the total.
         const intangibleCapexRaw = await extractFactSeriesIn(companyFacts, INTANGIBLE_CAPEX_CONCEPTS, reportingCurrency);
-        const intangibleLed = isIntangibleLed(ppeCapexRaw, intangibleCapexRaw);
-        const capexRaw = intangibleLed ? sumCapexByPeriod(ppeCapexRaw, intangibleCapexRaw) : ppeCapexRaw;
-        if (intangibleLed) console.log(`  ${symbol}: capex includes intangible assets (concession-style investment)`);
+        // Spending on concession infrastructure booked as contract assets is
+        // capex too, on its own line under a company extension tag -- see
+        // LABEL_ALIASES.contractAssetCapex. Read from the 20-F only for a
+        // filer reporting IFRIC 12 construction revenue (the accounting
+        // that creates such contract assets). Verified live: Cemig (CIG)
+        // invested R$5.4B in them in 2025 against R$1.1B of PP&E and
+        // intangibles, and its P/FCF had counted only the latter.
+        const contractAssetCapexRaw = reportsConstructionRevenue(companyFacts) ? await fetchContractAssetCapex(cik, symbol) : [];
+        const concessionCapex = contractAssetCapexRaw.length > 0;
+        const intangibleLed = concessionCapex || isIntangibleLed(ppeCapexRaw, intangibleCapexRaw);
+        const capexRaw = concessionCapex
+          ? addAnnualCapex(sumCapexByPeriod(ppeCapexRaw, intangibleCapexRaw), contractAssetCapexRaw)
+          : intangibleLed
+            ? sumCapexByPeriod(ppeCapexRaw, intangibleCapexRaw)
+            : ppeCapexRaw;
+        if (concessionCapex) console.log(`  ${symbol}: capex includes concession contract assets (${contractAssetCapexRaw.length} years)`);
+        else if (intangibleLed) console.log(`  ${symbol}: capex includes intangible assets (concession-style investment)`);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
         // For P/E -- same raw-XBRL-first, 20-F-recovery, 6-K-text-extraction
         // fallback chain as capex/ocf/shares below, just for net income.
