@@ -897,6 +897,15 @@ function investedCapitalByEnd(equityInstant, cashInstant, debtInstant, isBank) {
     // is untouched (already effectively 0 for banks — see DEBT_CONCEPTS'
     // deliberate exclusion of deposits above).
     const cash = isBank ? 0 : cashByEnd.get(e.end) || 0;
+    // No debt figure for a date is a gap, not a payoff, when the filer
+    // carried material debt (a tenth of equity or more) within the year
+    // before -- verified live: CIG's December 2025 balance sheet is in no
+    // source this reads, and counting its debt as zero took Q4 '25 ROIC to
+    // 28% between quarters of 8-12%. That date gets no invested capital.
+    if (!isBank && !debtByEnd.has(e.end)) {
+      const recent = debtInstant.filter((d) => d.end < e.end && daysBetween(d.end, e.end) <= 366);
+      if (recent.some((d) => Math.abs(d.value) >= Math.abs(e.value) * 0.1)) continue;
+    }
     const debt = debtByEnd.get(e.end) || 0;
     // EXCESS_CASH_NETTING_FRACTION mirrors generateSectorMetrics.js's
     // identically-named constant -- see its full rationale there. 0 = treat
@@ -1769,9 +1778,17 @@ async function processTicker(symbol, cik, isBank) {
             ...annual20FFacts.capex.map((f) => ({ ...f, val: -f.val })),
           ]);
         }
-        if (annual20FFacts.equity?.length) equityInstant = dedupeInstantFacts([...equityRaw, ...(filingTextFacts.equity || []), ...annual20FFacts.equity]);
-        if (annual20FFacts.debt?.length) debtInstant = dedupeInstantFacts([...debtRaw, ...(filingTextFacts.debt || []), ...annual20FFacts.debt]);
-        if (annual20FFacts.cash?.length) cashInstant = dedupeInstantFacts([...cashRaw, ...(filingTextFacts.cash || []), ...annual20FFacts.cash]);
+        // The 20-F's text figures fill only dates neither XBRL nor the 6-K
+        // pass has -- same rule as the 6-K merge above. Verified live: CIG's
+        // 20-F read a R$1,857M sub-line as its December 2023 debt and, filed
+        // later, replaced XBRL's Borrowings of R$9,831M for that date.
+        const fillFrom20F = (raw, sixK, twentyF) => {
+          const ends = new Set([...raw, ...(sixK || [])].map((f) => f.end));
+          return dedupeInstantFacts([...raw, ...(sixK || []), ...twentyF.filter((f) => !ends.has(f.end))]);
+        };
+        if (annual20FFacts.equity?.length) equityInstant = fillFrom20F(equityRaw, filingTextFacts.equity, annual20FFacts.equity);
+        if (annual20FFacts.debt?.length) debtInstant = fillFrom20F(debtRaw, filingTextFacts.debt, annual20FFacts.debt);
+        if (annual20FFacts.cash?.length) cashInstant = fillFrom20F(cashRaw, filingTextFacts.cash, annual20FFacts.cash);
       }
     }
   }
