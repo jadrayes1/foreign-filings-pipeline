@@ -3961,6 +3961,9 @@ const PLAIN_TEXT_ROWS = {
   ebit: /Profit from operations before financial income \(expenses\)/i,
   netIncome: /Profit for the period(?! attributable)/i,
   ocf: /Net cash (?:generated from|provided by|used in) operating activities/i,
+  // Sabesp's single capex line, contract and intangible assets included --
+  // read as totalCapex (see LABEL_ALIASES.totalCapex), never as capex.
+  totalCapex: /(?:Acquisition|Purchase|Additions?) of (?:[\w,]+ ){0,4}(?:intangible|property)[^0-9(]*?(?=\s\(?-?\d)/i,
 };
 const MONTH_INDEX = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
 
@@ -3980,7 +3983,7 @@ function extractCvmStatements(text, neededConcepts) {
   const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   const blocks = [
     { re: /Consolidated Financial Statements\s*\/\s*(?:Statement of Profit or Loss|Income Statement|Statement of Income)\s*(\([^)]*\))/gi, concepts: ['revenue', 'ebit', 'netIncome'] },
-    { re: /Consolidated Financial Statements\s*\/\s*Statement of Cash Flows[^(]{0,40}\([^)]*\)\s*(\([^)]*\))/gi, concepts: ['ocf'] },
+    { re: /Consolidated Financial Statements\s*\/\s*Statement of Cash Flows[^(]{0,40}\([^)]*\)\s*(\([^)]*\))/gi, concepts: ['ocf', 'totalCapex'] },
   ];
   for (const { re, concepts } of blocks) {
     let m;
@@ -3997,14 +4000,21 @@ function extractCvmStatements(text, neededConcepts) {
       const body = text.slice(m.index + m[0].length, m.index + m[0].length + 8000);
       for (const concept of concepts) {
         if (!neededConcepts.includes(concept)) continue;
-        const code = CVM_CODES[concept].replace('.', '\\.');
-        const row = new RegExp(`(?:^|\\s)${code} [A-Za-z][^0-9]{0,120}?((?:\\s-?[\\d,]+){${columns.length}})(?=\\s|$)`).exec(body);
+        // totalCapex has no fixed code below 6.02 -- the investing line that
+        // names intangible assets or property (Sabesp: 6.02.01 "Acquisition
+        // of contract assets, intangible assets and property, plant and
+        // equipment").
+        const rowRe =
+          concept === 'totalCapex'
+            ? new RegExp(`(?:^|\\s)6\\.02\\.\\d\\d (?:Acquisition|Purchase|Additions?)[^0-9]{0,120}?(?:intangible|property)[^0-9]{0,120}?((?:\\s-?[\\d,]+){${columns.length}})(?=\\s|$)`, 'i')
+            : new RegExp(`(?:^|\\s)${CVM_CODES[concept].replace('.', '\\.')} [A-Za-z][^0-9]{0,120}?((?:\\s-?[\\d,]+){${columns.length}})(?=\\s|$)`);
+        const row = rowRe.exec(body);
         if (!row) continue;
         const values = row[1].trim().split(/\s+/).map((v) => Number(v.replace(/,/g, '')));
         columns.forEach((period, idx) => {
           const key = `${period.months}|${period.endMonthDay}|${period.year}`;
           if (!out.has(key)) out.set(key, { period, facts: {}, captionScale: scale });
-          out.get(key).facts[concept] = { label: `CVM ${CVM_CODES[concept]}`, value3mo: values[idx] * scale, valueCumulative: null };
+          out.get(key).facts[concept] = { label: `CVM ${CVM_CODES[concept] || '6.02'}`, value3mo: values[idx] * scale, valueCumulative: null };
         });
       }
     }
@@ -4066,15 +4076,18 @@ function extractPlainTextStatements(text, neededConcepts) {
 
   // Cash flows: "Individual Consolidated" groups side by side -- the
   // consolidated columns are the second half of the header's periods.
-  if (wanted('ocf')) {
+  if (wanted('ocf') || wanted('totalCapex')) {
     const cashRe = /Statements of Cash Flows for the Periods.{0,200}?(In (?:thousands|millions) of [a-z]+).{0,40}?Individual Consolidated ((?:(?:January|February|March|April|May|June|July|August|September|October|November|December) to (?:January|February|March|April|May|June|July|August|September|October|November|December) \d{4} ?){2,6})/gi;
     while ((m = cashRe.exec(text))) {
       const columns = [...m[2].matchAll(COLUMN)].map((c) => periodOf(c[1], c[2], c[3]));
       if (!columns.length || columns.length % 2 || columns.some((c) => !c)) continue;
       const half = columns.length / 2;
       const block = text.slice(m.index + m[0].length, m.index + m[0].length + 12000);
-      const values = valuesAfter(block, PLAIN_TEXT_ROWS.ocf, columns.length);
-      if (values) columns.slice(half).forEach((p, idx) => record(p, 'ocf', values[half + idx], scaleOf(m[1])));
+      for (const concept of ['ocf', 'totalCapex']) {
+        if (!wanted(concept)) continue;
+        const values = valuesAfter(block, PLAIN_TEXT_ROWS[concept], columns.length);
+        if (values) columns.slice(half).forEach((p, idx) => record(p, concept, values[half + idx], scaleOf(m[1])));
+      }
     }
   }
   return [...out.values()];
@@ -4171,7 +4184,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       }
       const list = collected[concept].get(endIso) || [];
       if (!list.some((l) => l.accessionNumber === filing.accessionNumber)) {
-        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber, captionScale: extracted.captionScale ?? null });
+        list.push({ start: startIso, end: endIso, val, valueCumulative, filed: filing.filingDate, accessionNumber: filing.accessionNumber, captionScale: extracted.captionScale ?? null, restatable: !!extracted.restatable });
       }
       collected[concept].set(endIso, list);
     }
@@ -4335,13 +4348,12 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           const flat = fullText.replace(/\s+/g, ' ');
           const plain = PLAIN_TEXT_STATEMENT_HEADING.test(flat) ? extractPlainTextStatements(flat, neededConcepts) : extractCvmStatements(flat, neededConcepts);
           if (debug) console.error('DEBUG plain-text statements', url, JSON.stringify(plain));
-          for (const extracted of plain) {
-            if (extracted.period.months > 3) {
-              for (const concept of Object.keys(extracted.facts)) if (!cumulativeFallbackConcepts?.has?.(concept)) delete extracted.facts[concept];
-              if (!Object.keys(extracted.facts).length) continue;
-            }
-            await recordExtracted(extracted, filing);
-          }
+          // Six/nine-month figures from these statements are kept for every
+          // concept (only Brazilian ITR documents reach here), and marked
+          // restatable: the company's own later statement of a period
+          // supersedes an earlier one -- Sabesp restated its 2024 quarters,
+          // and the two versions read as a conflict that dropped both.
+          for (const extracted of plain) await recordExtracted({ ...extracted, restatable: true }, filing);
           if (!hasDataTable) continue;
         }
       }
@@ -4543,7 +4555,15 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       for (const occurrences of byValue.values()) {
         if (!best || occurrences.length > best.length) best = occurrences;
       }
-      const rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+      let rep = best.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+      // Every candidate read from the company's own statements (see
+      // extractPlainTextStatements/extractCvmStatements): a disagreement is a
+      // restatement, so the latest-filed statement stands, uncontested.
+      const allRestatable = list.every((l) => l.restatable);
+      if (allRestatable && byValue.size > 1) {
+        rep = list.slice().sort((a, b) => new Date(b.filed) - new Date(a.filed))[0];
+        best = list.filter((l) => l.val === rep.val);
+      }
       // hasConflict -- true when independent filings disagree on this
       // period's value (byValue has more than one distinct value, not just
       // one value with multiple corroborating copies). Verified live: DEFi
@@ -4564,7 +4584,7 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
         ...rep,
         corroborations: new Set(best.map((o) => o.accessionNumber)).size,
         accessionNumbers: new Set(best.map((o) => o.accessionNumber)),
-        hasConflict: byValue.size > 1,
+        hasConflict: byValue.size > 1 && !allRestatable,
       });
     }
     points.sort((a, b) => new Date(a.end) - new Date(b.end));

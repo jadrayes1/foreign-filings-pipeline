@@ -436,6 +436,55 @@ function fillSharesFromStableAnnual(quarterlyShares, annualShares, quarterlyInco
   return [...quarterlyShares, ...added].sort((a, b) => a.end.localeCompare(b.end));
 }
 
+const INTANGIBLE_CAPEX_CONCEPTS = ['PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities', 'PaymentsToAcquireIntangibleAssets'];
+
+// Latest-filed annual figure per year end, in absolute terms.
+function annualByYearEnd(facts) {
+  const out = new Map();
+  for (const f of facts || []) {
+    if (!f.start || !f.end) continue;
+    const days = (Date.parse(f.end) - Date.parse(f.start)) / 86400000;
+    if (days < 350 || days > 380) continue;
+    const prev = out.get(f.end);
+    if (!prev || String(f.filed) > String(prev.filed)) out.set(f.end, f);
+  }
+  return out;
+}
+
+// Same test as generateForeignFilingsCache.js's intangibleCapexFallback:
+// intangible purchases at least twice PP&E in most of (at least two) years
+// where both are reported.
+function isIntangibleLed(ppeFacts, intangibleFacts) {
+  const ppe = annualByYearEnd(ppeFacts);
+  const intangible = annualByYearEnd(intangibleFacts);
+  const both = [...intangible].filter(([end, f]) => Math.abs(f.val) > 0 && Math.abs(ppe.get(end)?.val || 0) > 0);
+  const dominant = both.filter(([end, f]) => Math.abs(f.val) >= 2 * Math.abs(ppe.get(end).val));
+  return both.length >= 2 && dominant.length * 2 >= both.length;
+}
+
+// PP&E + intangible purchases for each period either reports.
+function sumCapexByPeriod(ppeFacts, intangibleFacts) {
+  const latest = (facts) => {
+    const m = new Map();
+    for (const f of facts) {
+      if (!f.start || !f.end) continue;
+      const key = `${f.start}|${f.end}`;
+      if (!m.has(key) || String(f.filed) > String(m.get(key).filed)) m.set(key, f);
+    }
+    return m;
+  };
+  const ppe = latest(ppeFacts);
+  const intangible = latest(intangibleFacts);
+  const out = [];
+  for (const key of new Set([...ppe.keys(), ...intangible.keys()])) {
+    const a = ppe.get(key);
+    const b = intangible.get(key);
+    const base = b || a;
+    out.push({ ...base, val: Math.abs(a?.val || 0) + Math.abs(b?.val || 0), filed: [a?.filed, b?.filed].filter(Boolean).sort().pop() });
+  }
+  return out;
+}
+
 // Puts every share count on today's basis: multiplied by each later split's
 // factor. A count filed between the last old-basis filing and the first
 // new-basis one could be either, so it is dropped; a count with no filing
@@ -1364,7 +1413,17 @@ async function main() {
       if (isForeignFiler) {
         const reportingCurrency = detectReportingCurrency(companyFacts);
         const ocfRaw = await extractFactSeriesIn(companyFacts, OCF_CONCEPTS, reportingCurrency);
-        const capexRaw = await extractFactSeriesIn(companyFacts, CAPEX_CONCEPTS, reportingCurrency);
+        const ppeCapexRaw = await extractFactSeriesIn(companyFacts, CAPEX_CONCEPTS, reportingCurrency);
+        // A filer whose investment is mainly intangible (a concession
+        // utility) counts intangible purchases as capex too -- the same rule
+        // and definition as generateForeignFilingsCache.js's FCF-margin
+        // fallback, so its P/FCF and FCF margin agree. Verified live: SBS's
+        // P/FCF counted only ~R$0.1B/yr of PP&E against R$4-14B of real
+        // capex, while its FCF margin already used the total.
+        const intangibleCapexRaw = await extractFactSeriesIn(companyFacts, INTANGIBLE_CAPEX_CONCEPTS, reportingCurrency);
+        const intangibleLed = isIntangibleLed(ppeCapexRaw, intangibleCapexRaw);
+        const capexRaw = intangibleLed ? sumCapexByPeriod(ppeCapexRaw, intangibleCapexRaw) : ppeCapexRaw;
+        if (intangibleLed) console.log(`  ${symbol}: capex includes intangible assets (concession-style investment)`);
         const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
         // For P/E -- same raw-XBRL-first, 20-F-recovery, 6-K-text-extraction
         // fallback chain as capex/ocf/shares below, just for net income.
@@ -1458,10 +1517,14 @@ async function main() {
         let annual20FCapexFacts = [];
         if (needsAnnual20FBackfill(capex.annual)) {
           try {
-            const annualByEnd = { capex: new Map(capex.annual.map((a) => [a.end, a])) };
-            const annual20FFacts = await extractAnnualFactsFrom20F(cik, ['capex'], annualByEnd, SEC_USER_AGENT);
-            if (annual20FFacts.capex?.length) {
-              annual20FCapexFacts = annual20FFacts.capex.map((f) => ({ ...f, val: -f.val }));
+            // An intangible-led filer's annual report states the combined
+            // line (Sabesp: "Acquisition of contract assets, intangible
+            // assets and property, plant and equipment") -- read as totalCapex.
+            const capexConcept = intangibleLed ? 'totalCapex' : 'capex';
+            const annualByEnd = { [capexConcept]: new Map(capex.annual.map((a) => [a.end, a])) };
+            const annual20FFacts = await extractAnnualFactsFrom20F(cik, [capexConcept], annualByEnd, SEC_USER_AGENT);
+            if (annual20FFacts[capexConcept]?.length) {
+              annual20FCapexFacts = annual20FFacts[capexConcept].map((f) => ({ ...f, val: -f.val }));
               capex = dedupeAndClassify([...capexRaw, ...annual20FCapexFacts]);
             }
           } catch (err) {
@@ -1555,7 +1618,7 @@ async function main() {
         // distinct income-statement concept, but one more concept scored
         // in the SAME call only strengthens (never weakens)
         // detectScaleMultiplier's shared verdict for this filer.
-        const neededQuarterlyConcepts = trulyNeededQuarterlyConcepts.length ? ['capex', 'ocf', 'shares', 'netIncome'] : [];
+        const neededQuarterlyConcepts = trulyNeededQuarterlyConcepts.length ? ['capex', 'ocf', 'shares', 'netIncome', ...(intangibleLed ? ['totalCapex'] : [])] : [];
 
         let capexFilingTextFacts = {};
         let ocfFilingTextFacts = {};
@@ -1565,6 +1628,7 @@ async function main() {
           try {
             const annualByEnd = {
               capex: new Map(capex.annual.map((a) => [a.end, a])),
+              totalCapex: new Map(capex.annual.map((a) => [a.end, a])),
               ocf: new Map(ocf.annual.map((a) => [a.end, a])),
               shares: new Map(shares.annual.map((a) => [a.end, a])),
               netIncome: new Map(netIncome.annual.map((a) => [a.end, a])),
@@ -1572,7 +1636,8 @@ async function main() {
             const filingTextFacts = await extractQuarterlyFactsFromFilings(cik, neededQuarterlyConcepts, annualByEnd, SEC_USER_AGENT, cumulativeFallbackConcepts, symbol, {
               skipNativeConversion: reportingCurrency !== 'USD',
             });
-            capexFilingTextFacts = { capex: filingTextFacts.capex };
+            // An intangible-led filer's quarterly capex is its combined line.
+            capexFilingTextFacts = { capex: intangibleLed ? filingTextFacts.totalCapex : filingTextFacts.capex };
             ocfFilingTextFacts = { ocf: filingTextFacts.ocf };
             sharesFilingTextFacts = { shares: filingTextFacts.shares };
             netIncomeFilingTextFacts = { netIncome: filingTextFacts.netIncome };
@@ -1642,6 +1707,11 @@ async function main() {
         // Only where the annual counts on either side agree within 5%: a
         // filer issuing or buying back materially gets no estimate.
         shares = { ...shares, quarterly: fillSharesFromStableAnnual(shares.quarterly, shares.annual, netIncome.quarterly) };
+
+        // A negative quarterly capex for an intangible-led filer is a derived
+        // quarter (six months minus Q1) whose parts came from inconsistent
+        // sources -- verified live: SBS Q2 '23 at -R$0.6B. Dropped.
+        if (intangibleLed) capex = { ...capex, quarterly: capex.quarterly.filter((p) => p.value >= 0) };
 
         // Text-extracted figures in the wrong unit -- see fixTextScale. Run
         // before any conversion, so figure and anchor share one currency.
