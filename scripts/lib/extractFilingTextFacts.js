@@ -808,7 +808,11 @@ const LABEL_ALIASES = {
     // "Acquisitions of: | Land use rights, property and equipment" -- BABA's
     // 20-F; its capex has no standard XBRL tag since FY2021 (only a baba:
     // extension, absent from companyfacts), so this row is its only source.
-    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|(purchase|acquisition)s? of (?:land use rights|[\w]+ use rights),? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|concession.*(improvements?|furniture|equipment)|improvements?.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|(cash )?paid for( \w+)? vessels?|payments? for( \w+)? vessels?|vessels? improvements?|^(mineral )?propert(y|ies),? plant and equipment$/i,
+    // "additions to fixed assets" -- verified live: Toyota's (TM) capex line
+    // is "Additions to fixed assets excluding equipment leased to others";
+    // its separate "Additions to equipment leased to others" (the finance
+    // arm's lease fleet, which Toyota leaves out of capex) doesn't match.
+    include: /capital expenditures?|purchase(s)? of( \w+)? property|acquisition(s)? of( \w+)? property|(purchase|acquisition)s? of (?:land use rights|[\w]+ use rights),? property|investments? in( \w+)? (vessels?|property)|investments? in.*concession|concession.*(improvements?|furniture|equipment)|improvements?.*concession|expenditures? for( \w+)? (vessels?|property)|additions to (property|oil and gas|exploration)|(?:additions?|purchases?|acquisitions?) (?:to|of) fixed assets|propert(y|ies) additions|acquisition(s)?( and \w+)? of vessels|vessels? acquisitions?|deposits? for( \w+)? (vessel|property) purchase|drydock|(cash )?paid for( \w+)? vessels?|payments? for( \w+)? vessels?|vessels? improvements?|^(mineral )?propert(y|ies),? plant and equipment$/i,
     exclude: /proceeds|disposal|\bsale of\b|depreciation|amortization|gain on|loss on/i,
   },
   // Balance-sheet (instant, not duration) concepts — see
@@ -1463,10 +1467,17 @@ function parseTableColumns($, table, externalPeriodPhrases = [], preferredCurren
     if (!periodPhrases) {
       const fullDateCells = cells
         .map((c) => {
-          const m = c.text.match(/^(three|six|nine)\s+months?\s+ended\s+([A-Za-z]+\s+\d{1,2}),?\s*((?:19|20)\d{2})$/i);
+          // Also Toyota's (TM) form, phrase and date stacked in one cell with
+          // no space after "ended": "For the first quarter endedJune 30,
+          // 2026", "For the first nine months endedDecember 31, 2025". Only
+          // the unambiguous spans: "first quarter" (3 months) and "first
+          // half" (6) -- a bare "second quarter ended" could be either.
+          const m = c.text
+            .trim()
+            .match(/^(?:for\s+the\s+)?(?:(first\s+quarter)|(first\s+half)|(?:first\s+)?(three|six|nine)[\s-]months?)\s+ended\s*([A-Za-z]+\s+\d{1,2}),?\s*((?:19|20)\d{2})$/i);
           if (!m) return null;
-          const months = { three: 3, six: 6, nine: 9 }[m[1].toLowerCase()];
-          return { months, endMonthDay: m[2], year: m[3] };
+          const months = m[1] ? 3 : m[2] ? 6 : { three: 3, six: 6, nine: 9 }[m[3].toLowerCase()];
+          return { months, endMonthDay: m[4], year: m[5] };
         })
         .filter(Boolean);
       if (fullDateCells.length >= 1) {
