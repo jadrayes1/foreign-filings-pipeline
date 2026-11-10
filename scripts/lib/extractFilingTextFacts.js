@@ -4190,6 +4190,201 @@ function extractReleaseCashFlowSummaries(text, neededConcepts) {
   return out;
 }
 
+// Compact-header statement tables -- verified live: Grupo Aeroportuario del
+// Pacifico (PAC) heads its quarterly release statements "1Q25 | 1Q26 |
+// Change" (Q1) and "3Q25 | 3Q26 | Change | 9M25 | 9M26 | Change" (Q2-Q4),
+// with no "Three months ended" phrase or date row anywhere, so every
+// statement after Q1 parsed as nothing and its quarterly FCF margin, P/FCF
+// and ROIC were empty beside full TTM series. Its balance sheet is headed
+// "2025 | 2026 | Change | %" under a caption "... as of September 30".
+//
+// Read ONLY by the caller's last-resort branch (a document whose tables
+// yielded nothing to the usual reader) and ONLY for a filer whose annual
+// reports all end on December 31: "3Q26" is then the quarter ended
+// September 30, 2026 -- for any other year-end the same label is a
+// fiscal quarter this can't place. Every figure still has to pass the same
+// reconciliation against the annual report as any other extracted point.
+const COMPACT_PERIOD_CELL = /^(?:([1-4])Q(\d{2})|(3|6|9|12)M(\d{2}))$/i;
+const COMPACT_SKIP_CELL = /^(?:%|change|chg\.?|var\.?|variation|% ?change|change ?%|% ?var\.?)$/i;
+const CALENDAR_QUARTER_END = { 1: 'March 31', 2: 'June 30', 3: 'September 30', 4: 'December 31' };
+
+// A data row's figure cells with a lone "%", "%)" or ")" folded into the
+// cell before it -- PAC's Q1 table prints "3.9" | "%" where later quarters
+// print "3.9%", and its Q2 cash-flow statement splits "(678,121" | ")" --
+// so the cells line up with the header one-for-one.
+function compactRowCells(cells) {
+  const out = [];
+  for (const c of cells) {
+    if (/^(?:%\)?|\))$/.test(c) && out.length) out[out.length - 1] += c;
+    else out.push(c);
+  }
+  return out;
+}
+
+function tableRowsText($, table) {
+  return $(table)
+    .find('tr')
+    .toArray()
+    .map((r) =>
+      $(r)
+        .find('td,th')
+        .toArray()
+        .map((c) => $(c).text().replace(/\s+/g, ' ').trim())
+        .filter((x) => x)
+    )
+    .filter((r) => r.length);
+}
+
+// Concepts each kind of table may supply: a cash-flow table only cash-flow
+// figures, anything else only income-statement ones. PAC's income statement
+// carries "Improvements to concession assets (IFRIC-12)" -- construction
+// REVENUE -- which the capex rule also matches.
+const COMPACT_CASH_FLOW_CONCEPTS = new Set(['ocf', 'capex', 'intangibleCapex', 'totalCapex']);
+const COMPACT_INCOME_CONCEPTS = new Set(['revenue', 'netIncome', 'ebit', 'pretaxIncome', 'totalExpenses']);
+// Debt lines the general debt rule doesn't name -- PAC's "Long-term local
+// bonds payable" (Ps.42.8B) beside its bank loans. Used by this reader
+// only, so no other filer's balance-sheet reading changes.
+const COMPACT_EXTRA_DEBT = /\bbonds? payable\b|\bdebt securities\b|\bsenior notes\b|\bcertificados bursátiles\b/i;
+const COMPACT_SCALE = [
+  [/\bin (?:thousands|000s)\b|\(thousands\)|['’]000\b/i, 1000],
+  [/\bin millions\b|\(millions\)/i, 1000000],
+];
+
+function compactMatchesConcept(label, concept) {
+  if (matchesConcept(label, concept)) return true;
+  return concept === 'debt' && COMPACT_EXTRA_DEBT.test(label) && !LABEL_ALIASES.debt.exclude.test(label) && !/interest/i.test(label);
+}
+
+// The table's own scale caption, else the nearest caption just above it --
+// PAC's "(in thousands of pesos)" sits in the heading before the table, so
+// its balance sheet read in pesos and ROIC came out 1,000x too high.
+function compactTableScale($, table, allEls) {
+  const own = detectTableScale($, table);
+  if (own && own !== 1) return own;
+  const tableIdx = allEls.indexOf(table);
+  for (let k = tableIdx - 1; k >= Math.max(0, tableIdx - 60); k--) {
+    if (allEls[k].tagName === 'table') break;
+    const text = $(allEls[k]).text();
+    for (const [re, scale] of COMPACT_SCALE) if (re.test(text)) return scale;
+  }
+  return 1;
+}
+
+function compactTableIsConsolidated($, table, rows, allEls) {
+  if (rows.slice(0, 3).some((r) => /\bconsolidated\b/i.test(r.join(' ')))) return true;
+  const tableIdx = allEls.indexOf(table);
+  for (let k = tableIdx - 1; k >= Math.max(0, tableIdx - 60); k--) {
+    if (allEls[k].tagName === 'table') return false;
+    if ($(allEls[k]).children().length) continue;
+    const text = $(allEls[k]).text().replace(/\s+/g, ' ').trim();
+    if (text && text.length <= 200) return /\bconsolidated\b/i.test(text);
+  }
+  return false;
+}
+
+function extractCompactPeriodTables($, aliasMap) {
+  const durations = [];
+  const instants = [];
+  const durationConcepts = Object.keys(aliasMap).filter((c) => !INSTANT_CONCEPTS.has(c) && c !== 'shares');
+  const instantConcepts = Object.keys(aliasMap).filter((c) => INSTANT_CONCEPTS.has(c));
+  const allEls = $('body *').toArray();
+  for (const table of $('table').toArray()) {
+    const rows = tableRowsText($, table);
+    const headerIdx = rows.findIndex((r) => r.length >= 2 && r.every((c) => COMPACT_PERIOD_CELL.test(c) || COMPACT_SKIP_CELL.test(c)) && r.some((c) => /^[1-4]Q\d{2}$/i.test(c)));
+    const yearHeaderIdx = headerIdx >= 0 ? -1 : rows.findIndex((r) => r.length >= 2 && r.every((c) => /^(?:19|20)\d{2}$/.test(c) || COMPACT_SKIP_CELL.test(c)) && r.filter((c) => /^(?:19|20)\d{2}$/.test(c)).length >= 2);
+    if (headerIdx < 0 && yearHeaderIdx < 0) continue;
+    // Consolidated statements only, named in the table's own title rows or
+    // the caption just above it -- verified live: FEMSA (FMX) releases carry
+    // compact-header tables per business unit, and one read as the group's
+    // Q1 2023 (revenue growth 1,371%, profit margin 31% against a real 5-8%).
+    // Every PAC statement says "Consolidated ..." in one of the two places.
+    if (!compactTableIsConsolidated($, table, rows, allEls)) continue;
+    const scale = compactTableScale($, table, allEls);
+    const isCashFlowTable = rows.some((r) => /operating activities/i.test(r[0]));
+    const tableConcepts = durationConcepts.filter((c) => (isCashFlowTable ? COMPACT_CASH_FLOW_CONCEPTS : COMPACT_INCOME_CONCEPTS).has(c));
+
+    if (headerIdx >= 0 && tableConcepts.length) {
+      const header = rows[headerIdx];
+      const columns = header.map((c) => {
+        const m = c.match(COMPACT_PERIOD_CELL);
+        if (!m) return null;
+        return m[1] ? { quarter: Number(m[1]), year: 2000 + Number(m[2]) } : { cumulativeMonths: Number(m[3]), year: 2000 + Number(m[4]) };
+      });
+      const candidates = {}; // `${year}-${q}` -> concept -> [{label, value3mo, valueCumulative}]
+      for (const row of rows.slice(headerIdx + 1)) {
+        const [label, ...rest] = row;
+        const cells = compactRowCells(rest);
+        if (cells.length !== header.length) continue;
+        const concepts = tableConcepts.filter((c) => compactMatchesConcept(label, c));
+        if (!concepts.length) continue;
+        columns.forEach((col, i) => {
+          if (!col?.quarter) return;
+          const value = parseNumericCell(cells[i]);
+          if (value == null) return;
+          const cumIdx = columns.findIndex((x) => x?.cumulativeMonths === col.quarter * 3 && x.year === col.year);
+          const cumulative = cumIdx >= 0 ? parseNumericCell(cells[cumIdx]) : null;
+          const key = `${col.year}-${col.quarter}`;
+          candidates[key] = candidates[key] || {};
+          for (const concept of concepts) {
+            (candidates[key][concept] = candidates[key][concept] || []).push({ label, value3mo: value * scale, valueCumulative: cumulative != null ? cumulative * scale : null });
+          }
+        });
+      }
+      for (const [key, byConcept] of Object.entries(candidates)) {
+        const [year, quarter] = key.split('-').map(Number);
+        const facts = {};
+        for (const [concept, list] of Object.entries(byConcept)) {
+          const resolved = resolveConceptCandidates(list, concept, 'value3mo');
+          if (resolved?.winner) facts[concept] = resolved.winner;
+          else if (resolved?.sum && concept === 'capex') {
+            facts[concept] = { label: resolved.sum.map((d) => d.label).join(' + '), value3mo: resolved.sum.reduce((t, d) => t + d.value3mo, 0), valueCumulative: null };
+          }
+        }
+        if (Object.keys(facts).length) durations.push({ period: { months: 3, endMonthDay: CALENDAR_QUARTER_END[quarter], year: String(year) }, facts, captionScale: scale !== 1 ? scale : null });
+      }
+    }
+
+    if (yearHeaderIdx >= 0 && instantConcepts.length) {
+      // The month-day comes from the caption just before the table ("...
+      // as of September 30"); without one the columns can't be dated.
+      const tableIdx = allEls.indexOf(table);
+      let monthDay = null;
+      for (let k = tableIdx - 1; k >= Math.max(0, tableIdx - 60) && !monthDay; k--) {
+        const m = $(allEls[k]).text().replace(/\s+/g, ' ').match(/\bas (?:of|at) ([A-Z][a-z]+ \d{1,2})\b(?!,? (?:19|20)\d{2})/);
+        if (m) monthDay = m[1];
+      }
+      if (!monthDay) continue;
+      const header = rows[yearHeaderIdx];
+      const columns = header.map((c) => (/^(?:19|20)\d{2}$/.test(c) ? c : null));
+      const candidates = columns.map(() => ({}));
+      for (const row of rows.slice(yearHeaderIdx + 1)) {
+        const [label, ...rest] = row;
+        const cells = compactRowCells(rest);
+        if (cells.length !== header.length) continue;
+        for (const concept of instantConcepts) {
+          if (!compactMatchesConcept(label, concept)) continue;
+          columns.forEach((year, i) => {
+            if (!year) return;
+            const value = parseNumericCell(cells[i]);
+            if (value != null) (candidates[i][concept] = candidates[i][concept] || []).push({ label, value: value * scale });
+          });
+        }
+      }
+      columns.forEach((year, i) => {
+        if (!year) return;
+        const facts = {};
+        for (const [concept, list] of Object.entries(candidates[i])) {
+          const resolved = resolveConceptCandidates(list, concept, 'value');
+          if (resolved?.winner) facts[concept] = resolved.winner;
+          else if (resolved?.sum && concept === 'debt') facts[concept] = { label: resolved.sum.map((d) => d.label).join(' + '), value: resolved.sum.reduce((t, d) => t + d.value, 0) };
+        }
+        if (Object.keys(facts).length) instants.push({ period: { endMonthDay: monthDay, year }, facts });
+      });
+    }
+  }
+  return { durations, instants };
+}
+
 // Earnings-release consolidated income statements -- verified live: every
 // Cemig (CIG) release from 1Q23 to 1Q26 states its quarter beside the
 // prior-year quarter, under varying titles ("INCOME STATEMENT (R$ million)
@@ -4393,6 +4588,15 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
   const minSubstantiveBytes = MIN_SUBSTANTIVE_FILING_BYTES_OVERRIDES[symbol] ?? MIN_SUBSTANTIVE_FILING_BYTES;
   const scan = { documents: 0, withTables: 0 };
   const nativeCurrency = options.skipNativeConversion ? null : NATIVE_CURRENCY_OVERRIDES[symbol] || null;
+  // Every annual period on record ends December 31 -- the only case where a
+  // compact "3Q26" header names a calendar quarter (see
+  // extractCompactPeriodTables).
+  // Duration concepts only -- equity/debt/cash share annualByEnd but carry
+  // any balance-sheet date (June 30 included), not fiscal year-ends.
+  const annualEnds = ['revenue', 'netIncome', 'ebit', 'ocf']
+    .map((c) => annualByEnd?.[c])
+    .flatMap((m) => (m instanceof Map ? [...m.keys()] : Object.keys(m || {})));
+  const calendarYearFiler = annualEnds.length > 0 && annualEnds.every((end) => String(end).slice(5, 10) === '12-31');
   const r = submissions.filings.recent;
   const filings = [];
   for (let i = 0; i < r.form.length && i < FILING_LOOKBACK_ENTRIES && filings.length < MAX_FILINGS_TO_SCAN_EXTENDED; i++) {
@@ -4740,6 +4944,21 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
           if (debug) console.error('DEBUG text-block results', url, extractedList.length, JSON.stringify(extractedList).slice(0, 300));
           for (const extracted of extractedList) await recordExtracted(extracted, filing);
         }
+      }
+
+      // Compact-header tables ("3Q25 | 3Q26 | Change | 9M25 | 9M26") -- see
+      // extractCompactPeriodTables. Only where the reader above found nothing
+      // in this document, and only for a December year-end filer.
+      if (!anyTableResult && calendarYearFiler) {
+        let compact = { durations: [], instants: [] };
+        try {
+          compact = extractCompactPeriodTables($, aliasMap);
+        } catch (e) {
+          if (debug) console.error('DEBUG extractCompactPeriodTables threw', url, e.message);
+        }
+        if (debug && (compact.durations.length || compact.instants.length)) console.error('DEBUG compact-period tables', url, JSON.stringify(compact).slice(0, 400));
+        for (const extracted of compact.durations) await recordExtracted(extracted, filing);
+        await recordExtractedInstant(compact.instants, filing);
       }
 
       // MD&A "Cash Flows" summary fallback -- see extractMdaCashFlowSummary's
