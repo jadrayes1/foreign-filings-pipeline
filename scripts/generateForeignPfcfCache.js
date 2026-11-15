@@ -382,6 +382,144 @@ function dropShareOutliers(points, facts = []) {
   return out;
 }
 
+// A filer whose own filings disagree by exactly 1,000x (or 1,000,000x) on
+// the same period's share count tagged one side in the wrong unit. Filings
+// are linked by the periods they share -- equal counts put two in the same
+// unit, an exact 1,000x puts them a unit apart -- and the side to rescale is
+// the one the filer's own figures contradict: net income / basic EPS (same
+// filing, same currency) is the count it actually divided by, and the cover
+// page's shares outstanding is the fallback. Every vote must agree, and
+// with no break or no vote nothing changes. Verified live: Pacific Airport
+// Group (PAC) tagged 525,575,547 shares for 2017-2018, then from its 2020
+// 20-F on 525,575,547,000 for those years and every year after -- its
+// 2023-2024 net income over EPS says ~505M -- so all its P/FCF and P/E came
+// out ~0.001 and were dropped. NICE is the opposite case (its early filings
+// are the thousands ones), which a ratio between filings alone can't tell.
+const EPS_CONCEPTS = ['BasicEarningsLossPerShare', 'EarningsPerShareBasic'];
+const PARENT_NET_INCOME_CONCEPTS = ['ProfitLossAttributableToOwnersOfParent', 'NetIncomeLoss', 'ProfitLoss'];
+function fixShareScaleBreaks(facts, companyFacts) {
+  const powerOf = (ratio, tolerance) => {
+    for (const e of [-2, -1, 0, 1, 2]) if (Math.abs(Math.log(ratio / 1000 ** e)) < Math.log(tolerance)) return e;
+    return null;
+  };
+  const byPeriod = new Map();
+  for (const f of facts) {
+    if (!f.accn || !(f.val > 0)) continue;
+    const key = `${f.start}|${f.end}`;
+    if (!byPeriod.has(key)) byPeriod.set(key, []);
+    byPeriod.get(key).push(f);
+  }
+  // exponent[accn] relative to its component's first filing.
+  const edges = new Map();
+  const link = (a, b, e) => {
+    if (!edges.has(a)) edges.set(a, []);
+    edges.get(a).push([b, e]);
+  };
+  for (const list of byPeriod.values()) {
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        if (list[i].accn === list[j].accn) continue;
+        const e = powerOf(list[i].val / list[j].val, 1.001);
+        if (e == null) continue;
+        link(list[i].accn, list[j].accn, e);
+        link(list[j].accn, list[i].accn, -e);
+      }
+    }
+  }
+  const exponent = new Map();
+  const component = new Map();
+  for (const root of edges.keys()) {
+    if (exponent.has(root)) continue;
+    exponent.set(root, 0);
+    component.set(root, root);
+    const queue = [root];
+    while (queue.length) {
+      const a = queue.shift();
+      for (const [b, e] of edges.get(a)) {
+        const want = exponent.get(a) - e; // val_a = val_b * 1000^e
+        if (!exponent.has(b)) {
+          exponent.set(b, want);
+          component.set(b, root);
+          queue.push(b);
+        } else if (exponent.get(b) !== want) return facts; // inconsistent -- leave everything
+      }
+    }
+  }
+  const members = new Map();
+  for (const [accn, root] of component) {
+    if (!members.has(root)) members.set(root, []);
+    members.get(root).push(accn);
+  }
+  const unitFacts = (concepts, test) => {
+    const out = new Map();
+    for (const taxonomy of ['ifrs-full', 'us-gaap']) {
+      for (const concept of concepts) {
+        for (const [unit, list] of Object.entries(companyFacts?.facts?.[taxonomy]?.[concept]?.units || {})) {
+          if (!test(unit)) continue;
+          for (const f of list) {
+            const key = `${f.accn}|${f.start}|${f.end}|${unit.split('/')[0]}`;
+            if (!out.has(key) && Number.isFinite(f.val) && f.val !== 0) out.set(key, f.val);
+          }
+        }
+      }
+    }
+    return out;
+  };
+  const eps = unitFacts(EPS_CONCEPTS, (u) => /^[A-Z]{3}\/shares$/.test(u));
+  const netIncome = unitFacts(PARENT_NET_INCOME_CONCEPTS, (u) => /^[A-Z]{3}$/.test(u));
+  const cover = Object.values(companyFacts?.facts?.dei?.EntityCommonStockSharesOutstanding?.units || {}).flat().filter((f) => f.val > 0);
+  const offsetOf = new Map(); // component root -> absolute exponent of its first filing
+  for (const [root, accns] of members) {
+    const exps = new Set(accns.map((a) => exponent.get(a)));
+    if (exps.size < 2) continue; // no break
+    const inComponent = new Set(accns);
+    const votes = new Set();
+    for (const f of facts) {
+      if (!inComponent.has(f.accn) || !(f.val > 0)) continue;
+      for (const [key, e] of eps) {
+        if (!key.startsWith(`${f.accn}|${f.start}|${f.end}|`)) continue;
+        const n = netIncome.get(key);
+        if (n == null || !(n / e > 0)) continue;
+        const v = powerOf(f.val / (n / e), 1.5);
+        if (v != null) votes.add(v - exponent.get(f.accn));
+        else votes.add(NaN);
+      }
+    }
+    if (!votes.size) {
+      for (const f of facts) {
+        if (!inComponent.has(f.accn) || !(f.val > 0)) continue;
+        const near = cover.filter((c) => c.accn === f.accn)[0];
+        if (!near) continue;
+        const v = powerOf(f.val / near.val, 2);
+        votes.add(v != null ? v - exponent.get(f.accn) : NaN);
+      }
+    }
+    if (votes.size !== 1 || Number.isNaN([...votes][0])) continue;
+    // Vetoed when it leaves the counts farther from the cover page's than
+    // they were -- verified live: ReTo (RETO), whose reverse splits made two
+    // filings' counts sit an exact 1,000x apart by coincidence.
+    const offset = [...votes][0];
+    let before = 0;
+    let after = 0;
+    for (const f of facts) {
+      if (!inComponent.has(f.accn) || !(f.val > 0) || !cover.length) continue;
+      const near = cover.reduce((best, c) => (Math.abs(Date.parse(c.end) - Date.parse(f.end)) < Math.abs(Date.parse(best.end) - Date.parse(f.end)) ? c : best));
+      if (Math.abs(Date.parse(near.end) - Date.parse(f.end)) > 400 * 86400000) continue;
+      before += Math.abs(Math.log(f.val / near.val));
+      after += Math.abs(Math.log(f.val / 1000 ** (exponent.get(f.accn) + offset) / near.val));
+    }
+    if (after > before) continue;
+    offsetOf.set(root, offset);
+  }
+  if (!offsetOf.size) return facts;
+  return facts.map((f) => {
+    const root = component.get(f.accn);
+    if (!offsetOf.has(root)) return f;
+    const e = exponent.get(f.accn) + offsetOf.get(root);
+    return e ? { ...f, val: f.val / 1000 ** e } : f;
+  });
+}
+
 // A figure read from release text (no XBRL accession) checked against the
 // filer's own annual XBRL figure. Verified live: PDD's 6-K share counts came
 // through in thousands (5,509,682 for 5.5 billion) and its Q1/Q2 2026 net
@@ -415,22 +553,41 @@ function fixTextScale(quarterly, annual, { perQuarter, fit }) {
   return out;
 }
 
-function fillSharesFromStableAnnual(quarterlyShares, annualShares, quarterlyIncome) {
+function fillSharesFromStableAnnual(quarterlyShares, annualShares, quarterlyIncome, quarterlyCashFlow = []) {
   const have = new Set(quarterlyShares.map((p) => p.end));
   const annual = [...(annualShares || [])].filter((a) => a.value > 0).sort((a, b) => a.end.localeCompare(b.end));
   if (!annual.length) return quarterlyShares;
   const DAY = 86400000;
   const added = [];
-  for (const q of quarterlyIncome || []) {
+  const incomeEnds = new Set((quarterlyIncome || []).map((q) => q.end));
+  for (const q of [...(quarterlyIncome || []), ...quarterlyCashFlow.filter((c) => !incomeEnds.has(c.end))]) {
     if (have.has(q.end)) continue;
     const t = Date.parse(q.end);
     const before = [...annual].reverse().find((a) => Date.parse(a.end) <= t);
     const after = annual.find((a) => Date.parse(a.end) >= t);
     const nearest = [before, after].filter(Boolean).sort((x, y) => Math.abs(Date.parse(x.end) - t) - Math.abs(Date.parse(y.end) - t))[0];
-    if (!nearest || Math.abs(Date.parse(nearest.end) - t) > 200 * DAY) continue;
+    if (!nearest) continue;
+    if (Math.abs(Date.parse(nearest.end) - t) > 200 * DAY) {
+      // Past the newest annual count, while its annual report is still to
+      // come: carried forward up to ~21 months, but only for a count that
+      // has held within 1% for at least two years. Verified live: PAC's
+      // count sat at 505,277,464 for 2023 and 2024, and its FY2025 20-F
+      // was not yet in its XBRL record, so every 2026 quarter had OCF and
+      // net income but no count, and no P/FCF or P/E.
+      if (after || t - Date.parse(before.end) > 640 * DAY) continue;
+      const recent = annual.filter((a) => Date.parse(before.end) - Date.parse(a.end) <= 2 * 366 * DAY);
+      const spanDays = (Date.parse(before.end) - Date.parse(recent[0].end)) / DAY;
+      const values = recent.map((a) => a.value);
+      if (recent.length < 2 || spanDays < 360 || Math.max(...values) / Math.min(...values) > 1.01) continue;
+      added.push({ start: q.start, end: q.end, value: before.value, fromAnnual: true });
+      have.add(q.end);
+      continue;
+    }
     const bracket = [before, after].filter(Boolean).map((a) => a.value);
+    if (!incomeEnds.has(q.end)) continue; // cash-flow quarters only take the carry-forward above
     if (Math.max(...bracket) / Math.min(...bracket) > 1.05) continue;
     added.push({ start: q.start, end: q.end, value: nearest.value, fromAnnual: true });
+    have.add(q.end);
   }
   if (!added.length) return quarterlyShares;
   return [...quarterlyShares, ...added].sort((a, b) => a.end.localeCompare(b.end));
@@ -1463,7 +1620,7 @@ async function main() {
             : ppeCapexRaw;
         if (concessionCapex) console.log(`  ${symbol}: capex includes concession contract assets (${contractAssetCapexRaw.length} years)`);
         else if (intangibleLed) console.log(`  ${symbol}: capex includes intangible assets (concession-style investment)`);
-        const sharesRaw = extractFactSeries(companyFacts, SHARES_CONCEPTS);
+        const sharesRaw = fixShareScaleBreaks(extractFactSeries(companyFacts, SHARES_CONCEPTS), companyFacts);
         // For P/E -- same raw-XBRL-first, 20-F-recovery, 6-K-text-extraction
         // fallback chain as capex/ocf/shares below, just for net income.
         const netIncomeRaw = await extractFactSeriesIn(companyFacts, NET_INCOME_CONCEPTS, reportingCurrency);
@@ -1745,7 +1902,7 @@ async function main() {
         // quarterly P/E, while its share count has sat at ~683.5M for years.
         // Only where the annual counts on either side agree within 5%: a
         // filer issuing or buying back materially gets no estimate.
-        shares = { ...shares, quarterly: fillSharesFromStableAnnual(shares.quarterly, shares.annual, netIncome.quarterly) };
+        shares = { ...shares, quarterly: fillSharesFromStableAnnual(shares.quarterly, shares.annual, netIncome.quarterly, ocf.quarterly) };
 
         // A negative quarterly capex for an intangible-led filer is a derived
         // quarter (six months minus Q1) whose parts came from inconsistent

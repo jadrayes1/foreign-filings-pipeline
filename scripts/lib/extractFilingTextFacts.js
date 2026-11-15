@@ -4326,7 +4326,12 @@ function extractCompactPeriodTables($, aliasMap) {
           const key = `${col.year}-${col.quarter}`;
           candidates[key] = candidates[key] || {};
           for (const concept of concepts) {
-            (candidates[key][concept] = candidates[key][concept] || []).push({ label, value3mo: value * scale, valueCumulative: cumulative != null ? cumulative * scale : null });
+            // Raw, like every other duration reader: detectScaleMultiplier
+            // picks one scale for all of a filer's 6-K figures. Pre-scaled
+            // here, PAC's 2Q/3Q figures sat 1000x above its 1Q ones (read
+            // raw by the ordinary table path), every year's sum still
+            // matched the annual, and 1Q capex stayed in thousands.
+            (candidates[key][concept] = candidates[key][concept] || []).push({ label, value3mo: value, valueCumulative: cumulative });
           }
         });
       }
