@@ -532,7 +532,11 @@ const LABEL_ALIASES = {
     // fix's own comment on this file for the same shared-template pattern).
     // "income before": CIG's "Income before financial revenue expenses and
     // taxes, Total" is a profit line that only mentions revenue.
-    exclude: /costs? of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on|income before/i,
+    // "general and administrative": NBIS's statement of operations lists
+    // "Sales, general and administrative" (an expense) beside "Revenues";
+    // \bsales\b matched both, and the ambiguity dropped every quarter's
+    // revenue, so NBIS had no quarterly revenue growth, profit or FCF margin.
+    exclude: /costs? of|growth|per share|marketing|deferred|unearned|allowance|\btax\b|discontinued|forecast|guidance|gain on|income before|general and administrative/i,
   },
   netIncome: {
     // "net profit" added -- verified live: Copa Holdings (CPA) labels its
