@@ -5071,7 +5071,21 @@ async function extractQuarterlyFactsFromFilings(cik, neededConcepts, annualByEnd
       // extractReleaseIncomeStatements) are the period's figures; a generic
       // table read of the same release, in whatever unit its caption names
       // or omits, would only read as a conflict beside them.
-      const scoped = list.some((l) => l.prescaled) ? list.filter((l) => l.prescaled) : list;
+      let scoped = list.some((l) => l.prescaled) ? list.filter((l) => l.prescaled) : list;
+      // A year-to-date figure for this same end date that equals a
+      // quarter's own stated year-to-date total is that total again, not a
+      // rival value for the quarter -- verified live: NBIS's interim
+      // statements give six- and nine-month cash flow (4,504.1 / 4,231.1)
+      // while its releases give the quarter plus the same year-to-date
+      // figure, and the two read as a conflict that dropped Q2 and Q3 '26
+      // OCF and capex. A longer figure that matches no stated total still
+      // conflicts.
+      const spanDays = (l) => (l.start ? (Date.parse(l.end || end) - Date.parse(l.start)) / 86400000 : null);
+      const quarters = scoped.filter((l) => spanDays(l) != null && spanDays(l) <= 100);
+      const longer = scoped.filter((l) => spanDays(l) != null && spanDays(l) > 100);
+      if (quarters.length && longer.length && longer.every((y) => quarters.some((q) => q.valueCumulative != null && Math.abs(q.valueCumulative - y.val) <= 0.001 * Math.abs(y.val)))) {
+        scoped = scoped.filter((l) => !longer.includes(l));
+      }
       for (const l of list) {
         if (!accessionToDates.has(l.accessionNumber)) accessionToDates.set(l.accessionNumber, new Set());
         accessionToDates.get(l.accessionNumber).add(end);
